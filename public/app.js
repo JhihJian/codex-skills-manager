@@ -1,0 +1,1030 @@
+const state = {
+  data: null,
+  selected: null,
+  filter: "all",
+  displayMode: "zh",
+  category: "全部",
+  search: "",
+  tab: "meta",
+  installOpen: false,
+  descriptionExpanded: false,
+  descriptionOverflow: false,
+  descriptionSkill: null,
+  previewExpanded: true,
+  previewSkill: null,
+  previewMarkdown: new Map(),
+  contextSkill: null,
+};
+
+const $ = (id) => document.getElementById(id);
+
+function setStatus(text) {
+  $("statusText").textContent = text;
+}
+
+function setStatusBusy(busy) {
+  $("statusSpinner").hidden = !busy;
+  $("statusText").classList.toggle("status-busy-text", busy);
+  $("statusText").setAttribute("aria-busy", busy ? "true" : "false");
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...options,
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || `HTTP ${response.status}`);
+  }
+  return payload;
+}
+
+function sourceLabel(source) {
+  if (!source) return "未知";
+  const type = source.type || "unknown";
+  if (type === "github") return "GitHub";
+  if (type === "local-path") return "本地路径";
+  if (type === "codex-home-adopted") return "本机纳管";
+  if (type === "codex-system") return "系统";
+  if (type === "project-library") return "项目库";
+  return type;
+}
+
+function localization(skill) {
+  return skill?.localized && typeof skill.localized === "object" ? skill.localized : {};
+}
+
+function hasLocalization(skill) {
+  const item = localization(skill);
+  return Boolean((item.zhName || "").trim() && (item.zhTrigger || "").trim());
+}
+
+function displayTitle(skill) {
+  const item = localization(skill);
+  if (state.displayMode === "zh" && item.zhName) return item.zhName;
+  return skill.title || skill.name;
+}
+
+function displayDescription(skill) {
+  const item = localization(skill);
+  if (state.displayMode === "zh" && item.zhTrigger) return item.zhTrigger;
+  return skill.description || "无描述";
+}
+
+function badge(text, tone = "") {
+  const span = document.createElement("span");
+  span.className = `badge ${tone}`.trim();
+  span.textContent = text;
+  return span;
+}
+
+function previewText(text, expanded) {
+  const value = text || "未找到 SKILL.md 预览。";
+  if (expanded) return value;
+  const lines = value.split("\n");
+  const limit = 8;
+  const excerpt = lines.slice(0, limit).join("\n");
+  const trimmed = excerpt.length > 900 ? `${excerpt.slice(0, 900).trimEnd()}\n...` : excerpt;
+  if (lines.length <= limit && value.length <= 900) return value;
+  return `${trimmed}\n\n...`;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function slugify(value) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s-]/gu, "")
+    .replace(/\s+/g, "-")
+    .slice(0, 80);
+}
+
+function isSafeUrl(value) {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (/^(https?:|mailto:|#|\/|\.\.?\/)/i.test(trimmed)) return true;
+  return /^[^:]+$/i.test(trimmed);
+}
+
+function inlineMarkdown(value) {
+  const placeholders = [];
+  let html = escapeHtml(value);
+  html = html.replace(/`([^`]+)`/g, (_, code) => {
+    const token = `\u0000${placeholders.length}\u0000`;
+    placeholders.push(`<code>${code}</code>`);
+    return token;
+  });
+  html = html.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, label, href) => {
+    const safeHref = href.replaceAll("&amp;", "&");
+    if (!isSafeUrl(safeHref)) return label;
+    return `<a href="${escapeHtml(safeHref)}" target="_blank" rel="noreferrer">${label}</a>`;
+  });
+  html = html
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/__([^_]+)__/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/(^|[^_])_([^_\n]+)_/g, "$1<em>$2</em>");
+  return placeholders.reduce((output, replacement, index) => output.replaceAll(`\u0000${index}\u0000`, replacement), html);
+}
+
+function parseTable(lines, start) {
+  const header = splitTableRow(lines[start]);
+  const align = splitTableRow(lines[start + 1]);
+  if (!header.length || !align.length || align.some((cell) => !/^:?-{3,}:?$/.test(cell.trim()))) {
+    return null;
+  }
+  const rows = [];
+  let index = start + 2;
+  while (index < lines.length && /^\s*\|.+\|\s*$/.test(lines[index])) {
+    rows.push(splitTableRow(lines[index]));
+    index += 1;
+  }
+  return { header, rows, next: index };
+}
+
+function splitTableRow(line) {
+  return line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function renderMarkdown(markdown) {
+  const source = (markdown || "未找到 SKILL.md 预览。").replace(/\r\n?/g, "\n");
+  const lines = source.split("\n");
+  const html = [];
+  let index = 0;
+
+  const renderParagraph = (paragraphLines) => {
+    html.push(`<p>${inlineMarkdown(paragraphLines.join(" ").trim())}</p>`);
+  };
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const fence = line.match(/^\s*```([\w-]*)\s*$/);
+    if (fence) {
+      const language = fence[1] ? ` data-language="${escapeHtml(fence[1])}"` : "";
+      const code = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
+        code.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      html.push(`<pre${language}><code>${escapeHtml(code.join("\n"))}</code></pre>`);
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1].length;
+      const text = heading[2].trim();
+      const id = slugify(text);
+      html.push(`<h${level} id="${escapeHtml(id)}">${inlineMarkdown(text)}</h${level}>`);
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*>/.test(line)) {
+      const quoteLines = [];
+      while (index < lines.length && /^\s*>/.test(lines[index])) {
+        quoteLines.push(lines[index].replace(/^\s*>\s?/, ""));
+        index += 1;
+      }
+      html.push(`<blockquote>${renderMarkdown(quoteLines.join("\n"))}</blockquote>`);
+      continue;
+    }
+
+    const table = index + 1 < lines.length ? parseTable(lines, index) : null;
+    if (table) {
+      html.push("<table><thead><tr>");
+      for (const cell of table.header) html.push(`<th>${inlineMarkdown(cell)}</th>`);
+      html.push("</tr></thead>");
+      if (table.rows.length) {
+        html.push("<tbody>");
+        for (const row of table.rows) {
+          html.push("<tr>");
+          for (let cellIndex = 0; cellIndex < table.header.length; cellIndex += 1) {
+            html.push(`<td>${inlineMarkdown(row[cellIndex] || "")}</td>`);
+          }
+          html.push("</tr>");
+        }
+        html.push("</tbody>");
+      }
+      html.push("</table>");
+      index = table.next;
+      continue;
+    }
+
+    const list = line.match(/^(\s*)([-*+]|\d+\.)\s+(.+)$/);
+    if (list) {
+      const ordered = /\d+\./.test(list[2]);
+      html.push(ordered ? "<ol>" : "<ul>");
+      while (index < lines.length) {
+        const item = lines[index].match(/^(\s*)([-*+]|\d+\.)\s+(.+)$/);
+        if (!item || /\d+\./.test(item[2]) !== ordered) break;
+        html.push(`<li>${inlineMarkdown(item[3].trim())}</li>`);
+        index += 1;
+      }
+      html.push(ordered ? "</ol>" : "</ul>");
+      continue;
+    }
+
+    if (/^\s*---+\s*$/.test(line)) {
+      html.push("<hr>");
+      index += 1;
+      continue;
+    }
+
+    const paragraph = [line];
+    index += 1;
+    while (
+      index < lines.length &&
+      lines[index].trim() &&
+      !/^\s*```/.test(lines[index]) &&
+      !/^(#{1,4})\s+/.test(lines[index]) &&
+      !/^(\s*)([-*+]|\d+\.)\s+/.test(lines[index]) &&
+      !/^\s*>/.test(lines[index])
+    ) {
+      if (index + 1 < lines.length && parseTable(lines, index)) break;
+      paragraph.push(lines[index]);
+      index += 1;
+    }
+    renderParagraph(paragraph);
+  }
+
+  return html.join("");
+}
+
+function renderPreview(markdown, expanded) {
+  const preview = $("skillPreview");
+  preview.innerHTML = renderMarkdown(previewText(markdown, expanded));
+  preview.classList.toggle("expanded", expanded);
+}
+
+async function ensureFullPreview(skill) {
+  if (!skill || !state.previewExpanded || state.previewMarkdown.has(skill.name)) return;
+  try {
+    const payload = await api(`/api/skills/${encodeURIComponent(skill.name)}/markdown`);
+    state.previewMarkdown.set(skill.name, payload.markdown || skill.skillMdPreview || "");
+    if (selectedSkill()?.name === skill.name) {
+      renderPreview(state.previewMarkdown.get(skill.name), true);
+    }
+  } catch (error) {
+    setStatus(error.message);
+  }
+}
+
+function visibleSkills() {
+  if (!state.data) return [];
+  const search = state.search.trim().toLowerCase();
+  return state.data.skills.filter((skill) => {
+    const usage = skillUsage(skill);
+    if (state.filter === "enabled" && !skill.enabled) return false;
+    if (state.filter === "managed" && !skill.managed) return false;
+    if (state.filter === "system" && !skill.system) return false;
+    if (state.category !== "全部" && skill.category !== state.category) return false;
+    if (!search) return true;
+    const haystack = [
+      skill.name,
+      skill.title,
+      skill.description,
+      localization(skill).zhName,
+      localization(skill).zhTrigger,
+      localization(skill).notes,
+      skill.category,
+      usageStatusLabel(usage.status),
+      usageCountText(usage),
+      usage.lastUsedAt,
+      (skill.tags || []).join(" "),
+      (skill.dependencies || []).join(" "),
+      JSON.stringify(skill.source || {}),
+    ].join(" ").toLowerCase();
+    return haystack.includes(search);
+  });
+}
+
+function selectedSkill() {
+  return state.data?.skills.find((skill) => skill.name === state.selected) || null;
+}
+
+function filterLabel() {
+  return {
+    all: "全部",
+    enabled: "启用",
+    managed: "项目库",
+    system: "系统",
+  }[state.filter] || state.filter;
+}
+
+function classificationStatusText(classification, fallback = "完成") {
+  if (!classification) return fallback;
+  const parts = [];
+  if (classification.classified?.length) parts.push(`自动分类 ${classification.classified.length} 个`);
+  if (classification.skipped?.length) parts.push(`跳过 ${classification.skipped.length} 个`);
+  if (classification.errors?.length) parts.push(`失败 ${classification.errors.length} 批`);
+  return parts.length ? parts.join("，") : fallback;
+}
+
+function localizationStatusText(localizationResult, fallback = "中文信息已检查") {
+  if (!localizationResult) return fallback;
+  const parts = [];
+  if (localizationResult.localized?.length) parts.push(`生成中文 ${localizationResult.localized.length} 个`);
+  if (localizationResult.skipped?.length) parts.push(`跳过 ${localizationResult.skipped.length} 个`);
+  if (localizationResult.errors?.length) parts.push(`失败 ${localizationResult.errors.length} 批`);
+  return parts.length ? parts.join("，") : fallback;
+}
+
+function usageStatusLabel(status) {
+  return {
+    active: "近期使用",
+    stale: "长期未用",
+    "never-used": "未确认使用",
+    "declared-only": "仅有声明",
+    unknown: "未统计",
+  }[status] || status;
+}
+
+function usageStatusTone(status) {
+  return {
+    active: "green",
+    stale: "orange",
+    "never-used": "red",
+    "declared-only": "orange",
+  }[status] || "";
+}
+
+function formatRelativeUsage(item) {
+  if (!item || item.status === "unknown") return "尚未统计";
+  if (item.daysSinceLastUsed === null || item.daysSinceLastUsed === undefined) return item.lastUsedAt || "无确认使用证据";
+  if (item.daysSinceLastUsed === 0) return "今天";
+  return `${item.daysSinceLastUsed} 天前`;
+}
+
+function skillUsage(skill) {
+  return skill?.usage && typeof skill.usage === "object" ? skill.usage : { status: "unknown" };
+}
+
+function formatDateTime(value) {
+  if (!value) return "";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString("zh-CN", { hour12: false });
+}
+
+function usageCountText(usage) {
+  const count = Number(usage?.confirmedEvidenceCount || 0);
+  return count ? `${count} 次` : "无";
+}
+
+function usageStatsUpdatedText() {
+  const usageStats = state.data?.usageStats || {};
+  if (!usageStats.reviewedAt) return "使用统计尚未生成";
+  const age = usageStats.ageHours;
+  const ageText = typeof age === "number" ? `，约 ${age} 小时前` : "";
+  return `使用统计 ${formatDateTime(usageStats.reviewedAt)}${ageText}`;
+}
+
+function emptyListMessage() {
+  const parts = [];
+  if (state.search.trim()) parts.push(`搜索：${state.search.trim()}`);
+  if (state.filter !== "all") parts.push(`筛选：${filterLabel()}`);
+  if (state.category !== "全部") parts.push(`分类：${state.category}`);
+  return parts.length ? `没有匹配的技能（${parts.join("；")}）` : "没有匹配的技能";
+}
+
+function syncSelectionWithVisible(skills = visibleSkills()) {
+  if (!skills.length) {
+    state.selected = null;
+    return null;
+  }
+  if (!skills.some((skill) => skill.name === state.selected)) {
+    state.selected = skills[0].name;
+  }
+  return state.selected;
+}
+
+function renderCategories() {
+  const counts = new Map();
+  for (const skill of state.data.skills) {
+    counts.set(skill.category || "未分类", (counts.get(skill.category || "未分类") || 0) + 1);
+  }
+  const categories = ["全部", ...state.data.categories];
+  $("categoryList").replaceChildren(
+    ...categories.map((category) => {
+      const option = document.createElement("option");
+      option.value = category;
+      return option;
+    }),
+  );
+  $("categoryListView").replaceChildren(
+    ...categories.map((category) => {
+      const item = document.createElement("div");
+      item.className = `category-item ${state.category === category ? "active" : ""}`;
+      item.setAttribute("role", "button");
+      item.setAttribute("tabindex", "0");
+      item.setAttribute("aria-pressed", state.category === category ? "true" : "false");
+      const label = document.createElement("span");
+      label.textContent = category;
+      const count = document.createElement("code");
+      count.textContent = category === "全部" ? state.data.skills.length : counts.get(category) || 0;
+      item.replaceChildren(label, count);
+      const selectCategory = () => {
+        state.category = category;
+        render();
+      };
+      item.addEventListener("click", selectCategory);
+      item.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          selectCategory();
+        }
+      });
+      return item;
+    }),
+  );
+}
+
+function renderRows() {
+  const skills = visibleSkills();
+  syncSelectionWithVisible(skills);
+  $("emptyList").hidden = skills.length > 0;
+  $("emptyListMessage").textContent = emptyListMessage();
+  $("clearSearchButton").hidden = !state.search.trim();
+  $("resetFiltersButton").hidden = state.filter === "all" && state.category === "全部";
+  $("skillTable").replaceChildren(
+    ...skills.map((skill) => {
+      const usage = skillUsage(skill);
+      const row = document.createElement("div");
+      row.className = `row ${state.selected === skill.name ? "active" : ""}`;
+      row.setAttribute("role", "listitem");
+      const dotTone = skill.status === "missing" ? "missing" : skill.enabled ? "enabled" : "";
+      const rowMain = document.createElement("div");
+      rowMain.className = "row-main";
+      const rowTitle = document.createElement("div");
+      rowTitle.className = "row-title";
+      const dot = document.createElement("span");
+      dot.className = `status-dot ${dotTone}`.trim();
+      const title = document.createElement("strong");
+      title.title = skill.name;
+      title.textContent = displayTitle(skill);
+      rowTitle.append(dot, title);
+      if (state.displayMode === "zh" && displayTitle(skill) !== skill.name) {
+        const originalName = document.createElement("code");
+        originalName.className = "row-original-name";
+        originalName.textContent = skill.name;
+        rowTitle.appendChild(originalName);
+      }
+      const rowDesc = document.createElement("div");
+      rowDesc.className = "row-desc";
+      rowDesc.textContent = displayDescription(skill);
+      const meta = document.createElement("div");
+      meta.className = "row-meta";
+      rowMain.append(rowTitle, rowDesc, meta);
+      const rowSide = document.createElement("div");
+      rowSide.className = "row-side";
+      const sideCount = document.createElement("strong");
+      sideCount.textContent = String(usage.confirmedEvidenceCount || 0);
+      const sideLabel = document.createElement("span");
+      sideLabel.textContent = formatRelativeUsage(usage);
+      rowSide.replaceChildren(sideCount, sideLabel);
+      row.append(rowMain, rowSide);
+      meta.appendChild(badge(skill.category || "未分类"));
+      meta.appendChild(badge(usageStatusLabel(usage.status), usageStatusTone(usage.status)));
+      if (skill.enabled) meta.appendChild(badge("启用", "green"));
+      if (skill.system) meta.appendChild(badge("系统", "orange"));
+      if (skill.managed) meta.appendChild(badge("纳管", "blue"));
+      if (hasLocalization(skill)) meta.appendChild(badge("中文", "green"));
+      if (skill.status === "missing") meta.appendChild(badge("缺失", "red"));
+      row.addEventListener("click", () => {
+        state.selected = skill.name;
+        render();
+      });
+      return row;
+    }),
+  );
+}
+
+function resetContextPanel() {
+  state.contextSkill = null;
+  $("contextQuery").value = "";
+  $("contextSummary").textContent = "未选择技能，无法检索上下文。";
+  $("contextResults").replaceChildren();
+  $("emptyContexts").hidden = true;
+}
+
+function clearDetailDom() {
+  state.descriptionExpanded = false;
+  state.descriptionOverflow = false;
+  state.descriptionSkill = null;
+  state.previewExpanded = true;
+  state.previewSkill = null;
+  $("detailTitle").textContent = "";
+  $("detailDescription").textContent = "";
+  $("detailDescription").classList.remove("expanded");
+  $("descriptionToggle").hidden = true;
+  $("descriptionToggle").setAttribute("aria-expanded", "false");
+  $("descriptionToggle").textContent = "显示完整描述";
+  $("detailCategory").value = "";
+  $("detailTags").value = "";
+  $("detailDependencies").value = "";
+  $("detailNotes").value = "";
+  $("localizedName").value = "";
+  $("localizedTrigger").value = "";
+  $("localizedNotes").value = "";
+  $("localizedMeta").value = "";
+  $("skillPreview").replaceChildren();
+  $("skillPreview").classList.remove("expanded");
+  $("previewToggle").setAttribute("aria-expanded", "false");
+  $("previewToggle").textContent = "展开预览";
+  $("enableButton").disabled = true;
+  $("disableButton").disabled = true;
+  $("enableButton").setAttribute("aria-disabled", "true");
+  $("disableButton").setAttribute("aria-disabled", "true");
+  $("detailBadges").replaceChildren();
+  $("sourceList").replaceChildren();
+  $("dependencyGraph").replaceChildren();
+  resetContextPanel();
+}
+
+function renderDetail() {
+  const skill = selectedSkill();
+  $("emptyDetail").hidden = Boolean(skill);
+  $("emptyDetail").setAttribute("aria-live", "polite");
+  $("detailView").hidden = !skill;
+  if (!skill) {
+    clearDetailDom();
+    return;
+  }
+  const usage = skillUsage(skill);
+
+  if (state.descriptionSkill !== skill.name) {
+    state.descriptionExpanded = false;
+    state.descriptionSkill = skill.name;
+  }
+  if (state.previewSkill !== skill.name) {
+    state.previewExpanded = true;
+    state.previewSkill = skill.name;
+  }
+  if (state.contextSkill !== skill.name) {
+    state.contextSkill = skill.name;
+    $("contextSummary").textContent = "点击“检索上下文”后读取本机 Codex 会话记录。";
+    $("contextResults").replaceChildren();
+    $("emptyContexts").hidden = true;
+  }
+  $("detailTitle").textContent = displayTitle(skill);
+  $("detailDescription").textContent = displayDescription(skill);
+  $("detailDescription").classList.toggle("expanded", state.descriptionExpanded);
+  $("descriptionToggle").setAttribute("aria-expanded", state.descriptionExpanded ? "true" : "false");
+  $("descriptionToggle").textContent = state.descriptionExpanded ? "收起描述" : "显示完整描述";
+  $("detailCategory").value = skill.category || "未分类";
+  $("detailTags").value = (skill.tags || []).join(", ");
+  $("detailDependencies").value = (skill.dependencies || []).join(", ");
+  $("detailNotes").value = skill.notes || "";
+  const localized = localization(skill);
+  $("localizedName").value = localized.zhName || "";
+  $("localizedTrigger").value = localized.zhTrigger || "";
+  $("localizedNotes").value = localized.notes || "";
+  const sourceLanguage = localized.sourceLanguage ? `原文：${localized.sourceLanguage}` : "原文：待判断";
+  const generatedAt = localized.updatedAt || localized.generatedAt || skill.localizedAt || "";
+  $("localizedMeta").value = hasLocalization(skill)
+    ? `${sourceLanguage}${generatedAt ? ` · ${generatedAt}` : ""}`
+    : "尚未生成中文名称和中文触发条件。";
+  renderPreview(state.previewMarkdown.get(skill.name) || skill.skillMdPreview, state.previewExpanded);
+  $("previewToggle").setAttribute("aria-expanded", state.previewExpanded ? "true" : "false");
+  $("previewToggle").textContent = state.previewExpanded ? "收起预览" : "展开预览";
+  ensureFullPreview(skill);
+  $("enableButton").disabled = skill.system || skill.enabled || skill.status === "missing";
+  $("disableButton").disabled = skill.system || !skill.enabled;
+  $("enableButton").setAttribute("aria-disabled", $("enableButton").disabled ? "true" : "false");
+  $("disableButton").setAttribute("aria-disabled", $("disableButton").disabled ? "true" : "false");
+
+  const badges = [];
+  badges.push(badge(skill.enabled ? "已启用" : "未启用", skill.enabled ? "green" : ""));
+  badges.push(badge(sourceLabel(skill.source), skill.system ? "orange" : "blue"));
+  badges.push(badge(usageStatusLabel(usage.status), usageStatusTone(usage.status)));
+  if (hasLocalization(skill)) badges.push(badge("中文视图", "green"));
+  if (skill.dependencies?.length) badges.push(badge(`${skill.dependencies.length} 依赖`));
+  $("detailBadges").replaceChildren(...badges);
+
+  const sourceRows = [
+    ["使用次数", usageCountText(usage)],
+    ["涉及会话", `${usage.confirmedSessionCount || 0} 个`],
+    ["使用天数", `${usage.confirmedDayCount || 0} 天`],
+    ["最近使用", formatRelativeUsage(usage)],
+    ["统计时间", usageStatsUpdatedText()],
+    ["名称", skill.name],
+    ["来源", sourceLabel(skill.source)],
+    ["来源地址", skill.source?.source || skill.source?.path || ""],
+    ["项目库", skill.libraryPath || ""],
+    ["Codex", skill.codexPath || ""],
+    ["同步时间", skill.lastSyncedAt || ""],
+  ];
+  $("sourceList").replaceChildren(
+    ...sourceRows.flatMap(([key, value]) => {
+      const dt = document.createElement("dt");
+      const dd = document.createElement("dd");
+      dt.textContent = key;
+      dd.textContent = value || "无";
+      return [dt, dd];
+    }),
+  );
+
+  const graph = $("dependencyGraph");
+  const deps = skill.dependencies || [];
+  graph.replaceChildren(
+    badge(skill.name, "blue"),
+    ...deps.map((dep) => badge(`→ ${dep}`, state.data.skills.some((item) => item.name === dep) ? "green" : "orange")),
+  );
+
+  document.querySelectorAll(".tab-panel").forEach((panel) => {
+    panel.hidden = panel.id !== `tab${state.tab[0].toUpperCase()}${state.tab.slice(1)}`;
+  });
+  document.querySelectorAll(".tabs button").forEach((button) => {
+    button.classList.toggle("active", button.dataset.tab === state.tab);
+    button.setAttribute("aria-pressed", button.dataset.tab === state.tab ? "true" : "false");
+  });
+
+  requestAnimationFrame(updateDescriptionToggle);
+}
+
+function renderStats() {
+  const stats = state.data.stats;
+  const usageStats = state.data.usageStats || {};
+  const usageSummary = usageStats.stats || {};
+  $("totalCount").textContent = stats.total;
+  $("enabledCount").textContent = stats.enabled;
+  $("managedCount").textContent = stats.managed;
+  $("systemCount").textContent = stats.system;
+  $("usedCount").textContent = (usageSummary.active || 0) + (usageSummary.stale || 0);
+  $("libraryPath").textContent = state.data.paths.library;
+  $("codexPath").textContent = state.data.paths.codexSkills;
+  const usageText = usageStats.refreshing ? "使用统计刷新中" : usageStatsUpdatedText();
+  $("updatedAt").textContent = state.data.updatedAt ? `同步 ${state.data.updatedAt} · ${usageText}` : usageText;
+  const codex = state.data.codex;
+  $("codexStatus").textContent = codex.available ? codex.version : "codex 不可用";
+}
+
+function render() {
+  if (!state.data) return;
+  syncSelectionWithVisible();
+  renderStats();
+  renderCategories();
+  renderRows();
+  renderDetail();
+  renderInstallPanel();
+}
+
+function renderInstallPanel() {
+  $("installPanel").hidden = !state.installOpen;
+  $("installToggleButton").setAttribute("aria-expanded", state.installOpen ? "true" : "false");
+  $("installToggleButton").querySelector("use").setAttribute("href", state.installOpen ? "#icon-minus" : "#icon-plus");
+}
+
+function updateDescriptionToggle() {
+  const description = $("detailDescription");
+  const toggle = $("descriptionToggle");
+  const hasOverflow = description.scrollHeight > description.clientHeight + 2;
+  state.descriptionOverflow = hasOverflow || state.descriptionExpanded;
+  toggle.hidden = !state.descriptionOverflow;
+}
+
+function toggleDescription() {
+  state.descriptionExpanded = !state.descriptionExpanded;
+  $("detailDescription").classList.toggle("expanded", state.descriptionExpanded);
+  $("descriptionToggle").setAttribute("aria-expanded", state.descriptionExpanded ? "true" : "false");
+  $("descriptionToggle").textContent = state.descriptionExpanded ? "收起描述" : "显示完整描述";
+}
+
+function showInstallSourceError(message) {
+  const input = $("installSource");
+  const error = $("installSourceError");
+  input.classList.toggle("field-invalid", Boolean(message));
+  input.setAttribute("aria-invalid", message ? "true" : "false");
+  error.textContent = message || "";
+  error.hidden = !message;
+  if (message) input.focus();
+}
+
+async function togglePreview() {
+  state.previewExpanded = !state.previewExpanded;
+  const skill = selectedSkill();
+  renderPreview(state.previewMarkdown.get(skill?.name) || skill?.skillMdPreview, state.previewExpanded);
+  $("previewToggle").setAttribute("aria-expanded", state.previewExpanded ? "true" : "false");
+  $("previewToggle").textContent = state.previewExpanded ? "收起预览" : "展开预览";
+  await ensureFullPreview(skill);
+}
+
+async function refresh() {
+  setStatus("同步中");
+  const payload = await api("/api/state");
+  state.data = payload;
+  syncSelectionWithVisible();
+  render();
+  setStatus("准备就绪");
+}
+
+async function sync() {
+  setStatus("正在扫描 .codex/skills");
+  const payload = await api("/api/sync", { method: "POST", body: "{}" });
+  state.data = payload.state;
+  syncSelectionWithVisible();
+  render();
+  setStatus(
+    `同步完成，${classificationStatusText(payload.classification, "没有新增分类")}，${localizationStatusText(payload.localization, "没有新增中文信息")}`,
+  );
+}
+
+async function classifySkills(force = false) {
+  $("classifyButton").disabled = true;
+  setStatus(force ? "正在重新分类" : "正在自动分类未分类技能");
+  try {
+    const payload = await api("/api/classify", {
+      method: "POST",
+      body: JSON.stringify({ force }),
+    });
+    state.data = payload.state;
+    syncSelectionWithVisible();
+    render();
+    setStatus(classificationStatusText(payload, payload.message || "自动分类完成"));
+  } finally {
+    $("classifyButton").disabled = false;
+  }
+}
+
+async function localizeSkills(force = false) {
+  $("localizeButton").disabled = true;
+  setStatusBusy(true);
+  setStatus(force ? "正在重新生成中文信息" : "正在生成中文名称和触发条件");
+  try {
+    const payload = await api("/api/localize", {
+      method: "POST",
+      body: JSON.stringify({ force }),
+    });
+    state.data = payload.state;
+    syncSelectionWithVisible();
+    render();
+    setStatus(localizationStatusText(payload, payload.message || "中文信息生成完成"));
+  } finally {
+    setStatusBusy(false);
+    $("localizeButton").disabled = false;
+  }
+}
+
+async function refreshUsageStats() {
+  $("usageRefreshButton").disabled = true;
+  setStatusBusy(true);
+  setStatus("正在刷新技能使用频率");
+  try {
+    const payload = await api("/api/usage-stats/refresh", {
+      method: "POST",
+      body: "{}",
+    });
+    state.data = await api("/api/state");
+    syncSelectionWithVisible();
+    render();
+    const stats = payload.stats || {};
+    setStatus(`使用统计已刷新：确认使用 ${(stats.active || 0) + (stats.stale || 0)} 个，需关注 ${stats.issues || 0} 个`);
+  } finally {
+    setStatusBusy(false);
+    $("usageRefreshButton").disabled = false;
+  }
+}
+
+async function localizeSelectedSkill(force = true) {
+  const skill = selectedSkill();
+  if (!skill) return;
+  $("localizeCurrentButton").disabled = true;
+  setStatusBusy(true);
+  setStatus("正在生成当前技能中文信息");
+  try {
+    const payload = await api(`/api/skills/${encodeURIComponent(skill.name)}/localize`, {
+      method: "POST",
+      body: JSON.stringify({ force }),
+    });
+    state.data = payload.state;
+    syncSelectionWithVisible();
+    render();
+    setStatus(localizationStatusText(payload, payload.message || "当前技能中文信息已生成"));
+  } finally {
+    setStatusBusy(false);
+    $("localizeCurrentButton").disabled = false;
+  }
+}
+
+async function install() {
+  const source = $("installSource").value.trim();
+  const path = $("installPath").value.trim();
+  const ref = $("installRef").value.trim();
+  const category = $("installCategory").value.trim();
+  if (!source) {
+    setStatus("需要填写来源");
+    showInstallSourceError("请填写 GitHub tree URL、owner/repo 或本地技能目录。");
+    return;
+  }
+  showInstallSourceError("");
+  $("installButton").disabled = true;
+  setStatus("安装中");
+  try {
+    const body = { source, path, ref, category };
+    if (/^[\w.-]+\/[\w.-]+$/.test(source)) {
+      body.repo = source;
+      delete body.source;
+    }
+    const payload = await api("/api/install", { method: "POST", body: JSON.stringify(body) });
+    state.data = payload.state;
+    state.selected = payload.installed[0] || state.selected;
+    syncSelectionWithVisible();
+    render();
+    const classification = classificationStatusText(payload.classification, "没有新增分类");
+    const localization = localizationStatusText(payload.localization, "没有新增中文信息");
+    setStatus(`已安装 ${payload.installed.join(", ")}，${classification}，${localization}`);
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    $("installButton").disabled = false;
+  }
+}
+
+async function saveSkill() {
+  const skill = selectedSkill();
+  if (!skill) return;
+  const localized = localization(skill);
+  const body = {
+    category: $("detailCategory").value.trim() || "未分类",
+    tags: $("detailTags").value,
+    dependencies: $("detailDependencies").value,
+    notes: $("detailNotes").value,
+    localized: {
+      zhName: $("localizedName").value.trim(),
+      zhTrigger: $("localizedTrigger").value.trim(),
+      notes: $("localizedNotes").value.trim(),
+      sourceLanguage: localized.sourceLanguage || "",
+    },
+  };
+  setStatus("保存中");
+  const payload = await api(`/api/skills/${encodeURIComponent(skill.name)}`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+  state.data = payload.state;
+  syncSelectionWithVisible();
+  render();
+  setStatus("已保存");
+}
+
+function confirmSkillToggle(action, skill) {
+  if (action === "enable") {
+    return window.confirm(
+      `确认启用技能“${skill.name}”？\n\n这会把项目库中的技能复制到 .codex/skills。新的 Codex 会话会加载该技能，当前已打开的会话通常需要重启后才会看到变化。`,
+    );
+  }
+  return window.confirm(
+    `确认停用技能“${skill.name}”？\n\n这只会删除 .codex/skills 下的启用副本，项目库中的技能仍会保留。新的 Codex 会话将不再加载该启用副本。`,
+  );
+}
+
+async function toggleSkill(action) {
+  const skill = selectedSkill();
+  if (!skill) return;
+  if (skill.system) return;
+  if (!confirmSkillToggle(action, skill)) {
+    setStatus("已取消");
+    return;
+  }
+  setStatus(action === "enable" ? "启用中" : "停用中");
+  const payload = await api(`/api/skills/${encodeURIComponent(skill.name)}/${action}`, {
+    method: "POST",
+    body: "{}",
+  });
+  state.data = payload.state;
+  syncSelectionWithVisible();
+  render();
+  setStatus(payload.message || "完成");
+}
+
+async function loadContexts() {
+  const skill = selectedSkill();
+  if (!skill) return;
+  $("contextButton").disabled = true;
+  $("contextSummary").textContent = "检索中";
+  $("contextResults").replaceChildren();
+  try {
+    const params = new URLSearchParams();
+    const q = $("contextQuery").value.trim();
+    if (q) params.set("q", q);
+    const payload = await api(`/api/skills/${encodeURIComponent(skill.name)}/contexts?${params}`);
+    $("contextSummary").textContent = `命中 ${payload.matchedSessionCount} 个会话，展示 ${payload.results.length} 条记录。${payload.summary || "仅展示用户/助手正文。"}`;
+    $("emptyContexts").hidden = payload.results.length > 0;
+    $("contextResults").replaceChildren(
+      ...payload.results.map((item) => {
+        const node = document.createElement("article");
+        node.className = "context-item";
+        const title = document.createElement("h3");
+        title.title = item.title;
+        title.textContent = item.title;
+        const path = document.createElement("code");
+        path.textContent = `${item.updatedAt} · ${item.path}`;
+        node.append(title, path);
+        for (const snippet of item.snippets) {
+          const div = document.createElement("div");
+          div.className = "snippet";
+          const marker = document.createElement("span");
+          marker.textContent = `${snippet.roleLabel || snippet.role} L${snippet.line}`;
+          div.append(marker, document.createTextNode(snippet.text));
+          node.appendChild(div);
+        }
+        return node;
+      }),
+    );
+  } catch (error) {
+    $("contextSummary").textContent = error.message;
+    $("emptyContexts").hidden = false;
+  } finally {
+    $("contextButton").disabled = false;
+  }
+}
+
+async function showAudit() {
+  const payload = await api("/api/audit");
+  const lines = payload.events.map((event) => `${event.time} ${event.action} ${event.skill || (event.skills || []).join(", ") || ""}`);
+  setStatus(lines.slice(0, 4).join(" | ") || "暂无操作记录");
+}
+
+function bindEvents() {
+  $("installToggleButton").addEventListener("click", () => {
+    state.installOpen = !state.installOpen;
+    renderInstallPanel();
+  });
+  $("syncButton").addEventListener("click", () => sync().catch((error) => setStatus(error.message)));
+  $("classifyButton").addEventListener("click", (event) => classifySkills(event.shiftKey).catch((error) => setStatus(error.message)));
+  $("localizeButton").addEventListener("click", (event) => localizeSkills(event.shiftKey).catch((error) => setStatus(error.message)));
+  $("usageRefreshButton").addEventListener("click", () => refreshUsageStats().catch((error) => setStatus(error.message)));
+  $("localizeCurrentButton").addEventListener("click", (event) =>
+    localizeSelectedSkill(!event.shiftKey).catch((error) => setStatus(error.message)),
+  );
+  $("saveLocalizedButton").addEventListener("click", () => saveSkill().catch((error) => setStatus(error.message)));
+  $("installButton").addEventListener("click", install);
+  $("installSource").addEventListener("input", () => showInstallSourceError(""));
+  $("saveButton").addEventListener("click", () => saveSkill().catch((error) => setStatus(error.message)));
+  $("enableButton").addEventListener("click", () => toggleSkill("enable").catch((error) => setStatus(error.message)));
+  $("disableButton").addEventListener("click", () => toggleSkill("disable").catch((error) => setStatus(error.message)));
+  $("descriptionToggle").addEventListener("click", toggleDescription);
+  $("previewToggle").addEventListener("click", togglePreview);
+  $("contextButton").addEventListener("click", loadContexts);
+  $("auditButton").addEventListener("click", () => showAudit().catch((error) => setStatus(error.message)));
+  $("searchInput").addEventListener("input", (event) => {
+    state.search = event.target.value;
+    render();
+  });
+  document.querySelectorAll("#filterSegments button").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.filter = button.dataset.filter;
+      document.querySelectorAll("#filterSegments button").forEach((item) => item.classList.toggle("active", item === button));
+      render();
+    });
+  });
+  document.querySelectorAll("#displayModeSegments button").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.displayMode = button.dataset.mode || "zh";
+      document.querySelectorAll("#displayModeSegments button").forEach((item) => item.classList.toggle("active", item === button));
+      render();
+    });
+  });
+  document.querySelectorAll(".tabs button").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.tab = button.dataset.tab;
+      renderDetail();
+    });
+  });
+  $("clearSearchButton").addEventListener("click", () => {
+    state.search = "";
+    $("searchInput").value = "";
+    render();
+  });
+  $("resetFiltersButton").addEventListener("click", () => {
+    state.filter = "all";
+    state.category = "全部";
+    document.querySelectorAll("#filterSegments button").forEach((item) => item.classList.toggle("active", item.dataset.filter === "all"));
+    render();
+  });
+}
+
+bindEvents();
+refresh().catch((error) => setStatus(error.message));

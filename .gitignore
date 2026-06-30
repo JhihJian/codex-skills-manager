@@ -1,0 +1,12 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+data/audit-log.jsonl
+data/usage-stats.json
+skills-library/**/node_modules/
+work/
+work/*.log
+work/*.pid
+work/*.png
+.DS_Store
+Thumbs.db

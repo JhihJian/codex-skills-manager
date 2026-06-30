@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Skills Manager</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <svg class="icon-sprite" aria-hidden="true">
+      <symbol id="icon-plus" viewBox="0 0 24 24">
+        <path d="M12 5v14M5 12h14" />
+      </symbol>
+      <symbol id="icon-minus" viewBox="0 0 24 24">
+        <path d="M5 12h14" />
+      </symbol>
+      <symbol id="icon-refresh" viewBox="0 0 24 24">
+        <path d="M21 12a9 9 0 0 1-15.3 6.4M3 12A9 9 0 0 1 18.3 5.6" />
+        <path d="M21 4v6h-6M3 20v-6h6" />
+      </symbol>
+      <symbol id="icon-history" viewBox="0 0 24 24">
+        <path d="M3 12a9 9 0 1 0 3-6.7" />
+        <path d="M3 4v6h6M12 7v6l4 2" />
+      </symbol>
+      <symbol id="icon-power" viewBox="0 0 24 24">
+        <path d="M12 2v10" />
+        <path d="M18.4 6.6a9 9 0 1 1-12.8 0" />
+      </symbol>
+      <symbol id="icon-slash" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M5.7 5.7 18.3 18.3" />
+      </symbol>
+      <symbol id="icon-search" viewBox="0 0 24 24">
+        <circle cx="11" cy="11" r="7" />
+        <path d="M16.5 16.5 21 21" />
+      </symbol>
+      <symbol id="icon-sparkles" viewBox="0 0 24 24">
+        <path d="M12 3l1.7 5.1L19 10l-5.3 1.9L12 17l-1.7-5.1L5 10l5.3-1.9L12 3Z" />
+        <path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8L19 15Z" />
+        <path d="M5 14l.6 1.6L7 16l-1.4.4L5 18l-.6-1.6L3 16l1.4-.4L5 14Z" />
+      </symbol>
+      <symbol id="icon-shield-alert" viewBox="0 0 24 24">
+        <path d="M12 3 20 6v6c0 5-3.2 7.7-8 9-4.8-1.3-8-4-8-9V6l8-3Z" />
+        <path d="M12 8v5" />
+        <path d="M12 17h.01" />
+      </symbol>
+      <symbol id="icon-languages" viewBox="0 0 24 24">
+        <path d="M5 4h8" />
+        <path d="M9 4v3" />
+        <path d="M4 7h10" />
+        <path d="M6 7c.7 2.4 2.4 4.5 5.2 6.2" />
+        <path d="M12 7c-.5 1.9-1.7 3.5-3.6 4.9" />
+        <path d="M16 20l3.5-9 3.5 9" />
+        <path d="M17.2 17h4.6" />
+      </symbol>
+      <symbol id="icon-chart" viewBox="0 0 24 24">
+        <path d="M4 19V5" />
+        <path d="M4 19h16" />
+        <path d="M8 16V9" />
+        <path d="M12 16V7" />
+        <path d="M16 16v-5" />
+      </symbol>
+    </svg>
+    <div class="window">
+      <header class="titlebar">
+        <div class="traffic" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div class="title">
+          <strong>Codex Skills</strong>
+          <span id="codexStatus">检测中</span>
+        </div>
+        <div class="toolbar">
+          <button class="icon-button" id="installToggleButton" title="打开或收起安装面板" aria-label="打开或收起安装面板" aria-expanded="false"><svg><use href="#icon-plus"></use></svg></button>
+          <button class="icon-button" id="syncButton" title="同步 .codex/skills 并自动纳管新增技能" aria-label="同步技能"><svg><use href="#icon-refresh"></use></svg></button>
+          <button class="icon-button" id="classifyButton" title="使用本机 Codex 自动分类未分类技能" aria-label="自动分类技能"><svg><use href="#icon-sparkles"></use></svg></button>
+          <button class="icon-button" id="localizeButton" title="使用本机 Codex 生成中文名称和中文触发条件" aria-label="生成中文名称和触发条件"><svg><use href="#icon-languages"></use></svg></button>
+          <button class="icon-button" id="usageRefreshButton" title="刷新技能使用频率统计" aria-label="刷新技能使用频率统计"><svg><use href="#icon-chart"></use></svg></button>
+          <a class="icon-button" id="reviewPageLink" href="/reviews.html" title="打开技能问题审查页" aria-label="打开技能问题审查页"><svg><use href="#icon-shield-alert"></use></svg></a>
+          <button class="icon-button" id="auditButton" title="查看最近管理操作" aria-label="查看操作记录"><svg><use href="#icon-history"></use></svg></button>
+        </div>
+      </header>
+
+      <section class="installbar" id="installPanel" hidden>
+        <div class="install-grid">
+          <label>
+            <span>来源</span>
+            <input id="installSource" placeholder="GitHub tree URL、owner/repo 或本地目录" aria-describedby="installSourceError" />
+            <small id="installSourceError" class="field-error" hidden></small>
+          </label>
+          <label>
+            <span>路径</span>
+            <input id="installPath" placeholder="repo 内 skill 路径，可逗号分隔" />
+          </label>
+          <label>
+            <span>ref</span>
+            <input id="installRef" placeholder="main" />
+          </label>
+          <label>
+            <span>分类</span>
+            <input id="installCategory" placeholder="未分类" list="categoryList" />
+          </label>
+          <button id="installButton" class="primary-button">安装到项目库</button>
+        </div>
+      </section>
+
+      <main class="shell">
+        <aside class="sidebar">
+          <div class="search">
+            <svg class="search-icon" aria-hidden="true"><use href="#icon-search"></use></svg>
+            <input id="searchInput" placeholder="搜索技能、来源、说明" />
+          </div>
+          <div class="segments" id="filterSegments">
+            <button data-filter="all" class="active">全部</button>
+            <button data-filter="enabled">启用</button>
+            <button data-filter="managed">项目库</button>
+            <button data-filter="system">系统</button>
+          </div>
+          <div class="segments mode-segments" id="displayModeSegments">
+            <button data-mode="zh" class="active">中文</button>
+            <button data-mode="raw">原文</button>
+          </div>
+          <div class="category-list" id="categoryListView"></div>
+          <div class="path-box">
+            <div><span>项目库</span><code id="libraryPath"></code></div>
+            <div><span>Codex</span><code id="codexPath"></code></div>
+          </div>
+        </aside>
+
+        <section class="list-pane">
+          <div class="list-header">
+            <div class="metric"><strong id="totalCount">0</strong><span>Skills</span></div>
+            <div class="metric"><strong id="enabledCount">0</strong><span>启用</span></div>
+            <div class="metric"><strong id="managedCount">0</strong><span>纳管</span></div>
+            <div class="metric"><strong id="systemCount">0</strong><span>系统</span></div>
+            <div class="metric"><strong id="usedCount">0</strong><span>使用</span></div>
+          </div>
+          <div class="table" id="skillTable" role="list"></div>
+          <div class="empty-state empty-list-state" id="emptyList" hidden>
+            <span id="emptyListMessage">没有匹配的技能</span>
+            <div class="empty-actions">
+              <button class="link-button" id="clearSearchButton" type="button">清除搜索</button>
+              <button class="link-button" id="resetFiltersButton" type="button">重置筛选</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="detail-pane">
+          <div class="empty" id="emptyDetail">选择一个技能</div>
+          <div class="detail" id="detailView" hidden>
+            <div class="detail-head">
+              <div>
+                <h1 id="detailTitle"></h1>
+                <p id="detailDescription"></p>
+                <button class="link-button" id="descriptionToggle" type="button" aria-expanded="false">显示完整描述</button>
+              </div>
+              <div class="detail-actions">
+                <button class="icon-button" id="enableButton" title="复制到 .codex/skills 并启用" aria-label="启用当前技能"><svg><use href="#icon-power"></use></svg></button>
+                <button class="icon-button danger" id="disableButton" title="从 .codex/skills 停用" aria-label="停用当前技能"><svg><use href="#icon-slash"></use></svg></button>
+              </div>
+            </div>
+            <div class="badges" id="detailBadges"></div>
+
+            <div class="tabs">
+              <button class="active" data-tab="meta">资料</button>
+              <button data-tab="localized">中文</button>
+              <button data-tab="contexts">上下文</button>
+              <button data-tab="source">来源</button>
+            </div>
+
+            <div class="tab-panel" id="tabMeta">
+              <div class="form-grid">
+                <label>
+                  <span>分类</span>
+                  <input id="detailCategory" list="categoryList" />
+                </label>
+                <label>
+                  <span>标签</span>
+                  <input id="detailTags" placeholder="逗号分隔" />
+                </label>
+                <label class="wide">
+                  <span>依赖技能</span>
+                  <input id="detailDependencies" placeholder="逗号分隔，例如 pdf-to-markdown, documents:documents" />
+                </label>
+                <label class="wide">
+                  <span>评估备注</span>
+                  <textarea id="detailNotes" rows="5"></textarea>
+                </label>
+              </div>
+              <button class="primary-button" id="saveButton">保存资料</button>
+              <div class="preview-shell" id="previewShell">
+                <div class="preview-head">
+                  <span>SKILL.md</span>
+                  <button class="link-button" id="previewToggle" type="button" aria-expanded="false">展开预览</button>
+                </div>
+                <article class="preview markdown-preview" id="skillPreview" aria-label="SKILL.md Markdown 预览"></article>
+              </div>
+            </div>
+
+            <div class="tab-panel" id="tabLocalized" hidden>
+              <div class="form-grid">
+                <label>
+                  <span>中文名称</span>
+                  <input id="localizedName" placeholder="例如：PDF 转 Markdown" />
+                </label>
+                <label>
+                  <span>生成状态</span>
+                  <input id="localizedMeta" disabled />
+                </label>
+                <label class="wide">
+                  <span>中文触发条件</span>
+                  <textarea id="localizedTrigger" rows="5" placeholder="用中文说明什么时候应该使用这个 skill"></textarea>
+                </label>
+                <label class="wide">
+                  <span>生成备注</span>
+                  <textarea id="localizedNotes" rows="3"></textarea>
+                </label>
+              </div>
+              <div class="inline-actions">
+                <button class="primary-button" id="localizeCurrentButton">生成当前技能中文信息</button>
+                <button class="primary-button" id="saveLocalizedButton">保存中文信息</button>
+              </div>
+            </div>
+
+            <div class="tab-panel" id="tabContexts" hidden>
+              <div class="context-toolbar">
+                <input id="contextQuery" placeholder="附加关键词" />
+                <button id="contextButton" class="primary-button">检索上下文</button>
+              </div>
+              <div id="contextSummary" class="context-summary">点击“检索上下文”后读取本机 Codex 会话记录。</div>
+              <div id="contextResults" class="context-results"></div>
+              <div class="empty-state" id="emptyContexts" hidden>没有找到相关会话上下文</div>
+            </div>
+
+            <div class="tab-panel" id="tabSource" hidden>
+              <dl class="source-list" id="sourceList"></dl>
+              <h2>依赖关系</h2>
+              <div id="dependencyGraph" class="dependency-graph"></div>
+            </div>
+          </div>
+        </section>
+      </main>
+      <footer class="statusbar">
+        <span class="status-left">
+          <span class="status-spinner" id="statusSpinner" aria-hidden="true" hidden></span>
+          <span id="statusText">准备就绪</span>
+        </span>
+        <span id="updatedAt"></span>
+      </footer>
+    </div>
+
+    <datalist id="categoryList"></datalist>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
