@@ -2,6 +2,8 @@ const state = {
   data: null,
   selected: null,
   filter: "all",
+  usageFilter: "all",
+  sort: "default",
   displayMode: "zh",
   category: "全部",
   search: "",
@@ -298,11 +300,13 @@ async function ensureFullPreview(skill) {
 function visibleSkills() {
   if (!state.data) return [];
   const search = state.search.trim().toLowerCase();
-  return state.data.skills.filter((skill) => {
+  const unusedDays = usageStatsEnabled() ? unusedFilterDays(state.usageFilter) : null;
+  const skills = state.data.skills.filter((skill) => {
     const usage = skillUsage(skill);
     if (state.filter === "enabled" && !skill.enabled) return false;
     if (state.filter === "managed" && !skill.managed) return false;
     if (state.filter === "system" && !skill.system) return false;
+    if (unusedDays !== null && !isUnusedForDays(usage, unusedDays)) return false;
     if (state.category !== "全部" && skill.category !== state.category) return false;
     if (!search) return true;
     const haystack = [
@@ -322,6 +326,7 @@ function visibleSkills() {
     ].join(" ").toLowerCase();
     return haystack.includes(search);
   });
+  return sortSkills(skills);
 }
 
 function selectedSkill() {
@@ -335,6 +340,27 @@ function filterLabel() {
     managed: "项目库",
     system: "系统",
   }[state.filter] || state.filter;
+}
+
+function usageFilterLabel() {
+  const days = unusedFilterDays(state.usageFilter);
+  return days === null ? "全部使用状态" : `${days} 天未使用`;
+}
+
+function sortLabel() {
+  return {
+    default: "默认",
+    name: "名称 A-Z",
+    category: "分类",
+    recent: "最近使用",
+    count: "使用次数",
+  }[state.sort] || state.sort;
+}
+
+function normalizeListControls() {
+  if (usageStatsEnabled()) return;
+  if (state.usageFilter !== "all") state.usageFilter = "all";
+  if (state.sort === "recent" || state.sort === "count") state.sort = "default";
 }
 
 function classificationStatusText(classification, fallback = "完成") {
@@ -383,6 +409,67 @@ function formatRelativeUsage(item) {
 
 function skillUsage(skill) {
   return skill?.usage && typeof skill.usage === "object" ? skill.usage : { status: "unknown" };
+}
+
+function usageStatsEnabled() {
+  return state.data?.usageStats?.enabled !== false;
+}
+
+function unusedFilterDays(value) {
+  const match = String(value || "").match(/^unused-(3|7|15)$/);
+  return match ? Number(match[1]) : null;
+}
+
+function isUnusedForDays(usage, days) {
+  if (!usage || usage.status === "unknown") return false;
+  if (usage.status === "never-used" || usage.status === "declared-only") return true;
+  const daysSince = Number(usage.daysSinceLastUsed);
+  return Number.isFinite(daysSince) && daysSince >= days;
+}
+
+function usageTimestamp(usage) {
+  const parsed = new Date(usage?.lastUsedAt || 0).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function compareText(a, b) {
+  return String(a || "").localeCompare(String(b || ""), "zh-CN", { sensitivity: "base", numeric: true });
+}
+
+function skillNameForSort(skill) {
+  return displayTitle(skill) || skill.name || "";
+}
+
+function sortSkills(skills) {
+  const items = [...skills];
+  if (state.sort === "name") {
+    return items.sort((a, b) => compareText(skillNameForSort(a), skillNameForSort(b)) || compareText(a.name, b.name));
+  }
+  if (state.sort === "category") {
+    return items.sort(
+      (a, b) =>
+        compareText(a.category || "未分类", b.category || "未分类") ||
+        compareText(skillNameForSort(a), skillNameForSort(b)) ||
+        compareText(a.name, b.name),
+    );
+  }
+  if (state.sort === "recent") {
+    return items.sort(
+      (a, b) =>
+        usageTimestamp(skillUsage(b)) - usageTimestamp(skillUsage(a)) ||
+        compareText(skillNameForSort(a), skillNameForSort(b)) ||
+        compareText(a.name, b.name),
+    );
+  }
+  if (state.sort === "count") {
+    return items.sort(
+      (a, b) =>
+        Number(skillUsage(b).confirmedEvidenceCount || 0) - Number(skillUsage(a).confirmedEvidenceCount || 0) ||
+        compareText(skillNameForSort(a), skillNameForSort(b)) ||
+        compareText(a.name, b.name),
+    );
+  }
+  return items;
 }
 
 function formatDateTime(value) {
@@ -497,7 +584,9 @@ function emptyListMessage() {
   const parts = [];
   if (state.search.trim()) parts.push(`搜索：${state.search.trim()}`);
   if (state.filter !== "all") parts.push(`筛选：${filterLabel()}`);
+  if (state.usageFilter !== "all" && usageStatsEnabled()) parts.push(`使用：${usageFilterLabel()}`);
   if (state.category !== "全部") parts.push(`分类：${state.category}`);
+  if (state.sort !== "default") parts.push(`排序：${sortLabel()}`);
   return parts.length ? `没有匹配的技能（${parts.join("；")}）` : "没有匹配的技能";
 }
 
@@ -559,7 +648,8 @@ function renderRows() {
   $("emptyList").hidden = skills.length > 0;
   $("emptyListMessage").textContent = emptyListMessage();
   $("clearSearchButton").hidden = !state.search.trim();
-  $("resetFiltersButton").hidden = state.filter === "all" && state.category === "全部";
+  $("resetFiltersButton").hidden =
+    state.filter === "all" && state.category === "全部" && state.usageFilter === "all" && state.sort === "default";
   $("skillTable").replaceChildren(
     ...skills.map((skill) => {
       const usage = skillUsage(skill);
@@ -922,6 +1012,13 @@ function renderStats() {
   $("managedCount").textContent = stats.managed;
   $("systemCount").textContent = stats.system;
   $("usedCount").textContent = usageStats.enabled === false ? "关" : (usageSummary.active || 0) + (usageSummary.stale || 0);
+  $("usageFilter").value = state.usageFilter;
+  $("usageFilter").disabled = !usageStatsEnabled();
+  $("usageFilter").title = usageStatsEnabled() ? "按最近确认使用时间筛选技能" : "使用统计已关闭，可在设置页开启";
+  $("sortSelect").value = state.sort;
+  $("sortSelect").querySelectorAll("option").forEach((option) => {
+    option.disabled = !usageStatsEnabled() && ["recent", "count"].includes(option.value);
+  });
   const repositoryUrl = repositoryWebUrl(state.data.paths.remote || state.repository?.remote || state.repository?.skillsRepoUrl);
   const libraryPath = $("libraryPath");
   if (repositoryUrl) {
@@ -945,6 +1042,7 @@ function renderStats() {
 
 function render() {
   if (!state.data) return;
+  normalizeListControls();
   syncSelectionWithVisible();
   renderStats();
   renderCategories();
@@ -1350,6 +1448,14 @@ function bindEvents() {
     state.search = event.target.value;
     render();
   });
+  $("usageFilter").addEventListener("change", (event) => {
+    state.usageFilter = event.target.value;
+    render();
+  });
+  $("sortSelect").addEventListener("change", (event) => {
+    state.sort = event.target.value;
+    render();
+  });
   document.querySelectorAll("#filterSegments button").forEach((button) => {
     button.addEventListener("click", () => {
       state.filter = button.dataset.filter;
@@ -1378,6 +1484,10 @@ function bindEvents() {
   $("resetFiltersButton").addEventListener("click", () => {
     state.filter = "all";
     state.category = "全部";
+    state.usageFilter = "all";
+    state.sort = "default";
+    $("usageFilter").value = state.usageFilter;
+    $("sortSelect").value = state.sort;
     document.querySelectorAll("#filterSegments button").forEach((item) => item.classList.toggle("active", item.dataset.filter === "all"));
     render();
   });

@@ -137,6 +137,27 @@
             <button data-mode="zh" class="active">中文</button>
             <button data-mode="raw">原文</button>
           </div>
+          <div class="list-controls">
+            <label>
+              <span>使用</span>
+              <select id="usageFilter">
+                <option value="all">全部使用状态</option>
+                <option value="unused-3">3 天未使用</option>
+                <option value="unused-7">7 天未使用</option>
+                <option value="unused-15">15 天未使用</option>
+              </select>
+            </label>
+            <label>
+              <span>排序</span>
+              <select id="sortSelect">
+                <option value="default">默认</option>
+                <option value="name">名称 A-Z</option>
+                <option value="category">分类</option>
+                <option value="recent">最近使用</option>
+                <option value="count">使用次数</option>
+              </select>
+            </label>
+          </div>
           <div class="category-list" id="categoryListView"></div>
           <div class="path-box">
             <div><span>Skills 仓库</span><a id="libraryPath" href="#" target="_blank" rel="noreferrer"></a></div>
