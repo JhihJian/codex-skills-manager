@@ -14,6 +14,10 @@ const state = {
   previewSkill: null,
   previewMarkdown: new Map(),
   contextSkill: null,
+  historySkill: null,
+  historyCache: new Map(),
+  historyLoading: false,
+  repository: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -401,6 +405,93 @@ function usageStatsUpdatedText() {
   return `使用统计 ${formatDateTime(usageStats.reviewedAt)}${ageText}`;
 }
 
+function formatDuration(seconds) {
+  const value = Number(seconds || 0);
+  if (!Number.isFinite(value) || value <= 0) return "0 分钟";
+  const minutes = Math.ceil(value / 60);
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours} 小时 ${rest} 分钟` : `${hours} 小时`;
+}
+
+function versioningStatusText() {
+  const versioning = state.data?.versioning || {};
+  if (!versioning.enabled) return "版本自动提交已关闭";
+  if (versioning.committing) return "技能版本提交中";
+  if (!versioning.pending) return "技能版本无待提交变更";
+  const remaining = Math.max(0, Number(versioning.delaySeconds || 0) - Number(versioning.ageSeconds || 0));
+  const count = Number(versioning.changedFiles || 0);
+  return `技能版本待提交 ${count} 个文件，约 ${formatDuration(remaining)} 后自动提交`;
+}
+
+function repositoryStatusText(repository = state.repository) {
+  if (!repository) return "未读取仓库配置";
+  const remote = repository.remote || repository.skillsRepoUrl || "未配置 GitHub remote";
+  const branch = repository.branch ? ` · ${repository.branch}` : "";
+  const pending = repository.versioning?.pending ? ` · 待提交 ${repository.versioning.changedFiles || 0} 个文件` : "";
+  return `${repository.skillsRepoDir || ""}${branch} · ${remote}${pending}`;
+}
+
+function repositoryWebUrl(value) {
+  const remote = String(value || "").trim();
+  if (!remote) return "";
+  const sshMatch = remote.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/i);
+  if (sshMatch) return `https://github.com/${sshMatch[1]}/${sshMatch[2]}`;
+  const httpsMatch = remote.match(/^(https:\/\/github\.com\/[^/]+\/[^/]+?)(?:\.git)?$/i);
+  if (httpsMatch) return httpsMatch[1];
+  return /^https?:\/\//i.test(remote) ? remote : "";
+}
+
+function repositoryLinkLabel(value) {
+  const url = String(value || "").trim();
+  const githubMatch = url.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)$/i);
+  if (githubMatch) return githubMatch[1];
+  return url.replace(/^https?:\/\//i, "");
+}
+
+function historyFileText(file) {
+  const added = file.added === null || file.added === undefined ? "-" : `+${file.added}`;
+  const deleted = file.deleted === null || file.deleted === undefined ? "-" : `-${file.deleted}`;
+  return `${added} ${deleted}`;
+}
+
+function historyChangeSummary(files) {
+  const fileItems = Array.isArray(files) ? files : [];
+  if (!fileItems.length) return "没有文件统计。";
+  const skillFiles = fileItems.filter((file) => file.skill && file.skill !== "registry").length;
+  const registryFiles = fileItems.some((file) => file.skill === "registry");
+  const additions = fileItems.reduce((sum, file) => sum + (Number.isFinite(file.added) ? file.added : 0), 0);
+  const deletions = fileItems.reduce((sum, file) => sum + (Number.isFinite(file.deleted) ? file.deleted : 0), 0);
+  const parts = [`修改 ${fileItems.length} 个文件`];
+  if (skillFiles) parts.push(`技能文件 ${skillFiles} 个`);
+  if (registryFiles) parts.push("包含登记信息");
+  parts.push(`+${additions} / -${deletions}`);
+  return parts.join("，");
+}
+
+function changeStatusLabel(status) {
+  if (status === "??") return "新增";
+  if (status.includes("D")) return "删除";
+  if (status.includes("A")) return "新增";
+  if (status.includes("M")) return "修改";
+  if (status.includes("R")) return "重命名";
+  return status || "变更";
+}
+
+function renderDiffText(diff) {
+  const lines = String(diff || "").split("\n");
+  return lines
+    .map((line) => {
+      const span = document.createElement("span");
+      if (line.startsWith("+") && !line.startsWith("+++")) span.className = "diff-add";
+      if (line.startsWith("-") && !line.startsWith("---")) span.className = "diff-del";
+      if (line.startsWith("@@")) span.className = "diff-hunk";
+      span.textContent = line || " ";
+      return span;
+    });
+}
+
 function emptyListMessage() {
   const parts = [];
   if (state.search.trim()) parts.push(`搜索：${state.search.trim()}`);
@@ -529,6 +620,161 @@ function resetContextPanel() {
   $("emptyContexts").hidden = true;
 }
 
+function resetHistoryPanel() {
+  state.historySkill = null;
+  $("historySummary").textContent = "未选择技能，无法读取版本记录。";
+  $("historyPending").hidden = true;
+  $("historyPending").textContent = "";
+  $("pendingChanges").hidden = true;
+  $("pendingSummary").textContent = "";
+  $("pendingFiles").replaceChildren();
+  $("pendingDiff").hidden = true;
+  $("pendingDiff").querySelector("code").replaceChildren();
+  $("historyList").replaceChildren();
+  $("emptyHistory").hidden = true;
+}
+
+function renderHistoryPending(pending) {
+  const node = $("historyPending");
+  if (!pending?.enabled) {
+    node.hidden = false;
+    node.textContent = pending?.message || "技能版本自动提交已关闭。";
+    return;
+  }
+  if (pending.error) {
+    node.hidden = false;
+    node.textContent = pending.error;
+    return;
+  }
+  if (!pending.pending) {
+    node.hidden = true;
+    node.textContent = "";
+    return;
+  }
+  const remaining = Math.max(0, Number(pending.delaySeconds || 0) - Number(pending.ageSeconds || 0));
+  const skills = (pending.skills || []).map((item) => item.name).filter(Boolean);
+  const skillText = skills.length ? `，涉及 ${skills.slice(0, 5).join("、")}${skills.length > 5 ? " 等" : ""}` : "";
+  node.hidden = false;
+  node.textContent = `检测到 ${pending.changedFiles || 0} 个受管文件待提交${skillText}，静默 ${formatDuration(remaining)} 后自动写入 Git 版本。`;
+}
+
+function renderHistoryPayload(skill, payload) {
+  const versions = payload?.versions || [];
+  $("historyRefreshButton").disabled = false;
+  renderHistoryPending(payload?.pending || state.data?.versioning || {});
+  renderPendingChanges(skill, payload?.pendingChanges || { files: [] });
+  $("historySummary").textContent = payload?.message || `共 ${versions.length} 条 Git 版本记录。`;
+  $("emptyHistory").hidden = versions.length > 0;
+  $("historyList").replaceChildren(
+    ...versions.map((version) => {
+      const item = document.createElement("article");
+      item.className = "history-item";
+
+      const head = document.createElement("div");
+      head.className = "history-item-head";
+      const title = document.createElement("strong");
+      title.textContent = version.subject || "未命名提交";
+      const hash = document.createElement("code");
+      hash.textContent = version.shortHash || "";
+      head.append(title, hash);
+
+      const meta = document.createElement("div");
+      meta.className = "history-meta";
+      meta.textContent = `${formatDateTime(version.date) || version.date || "未知时间"} · ${version.author || "未知作者"}`;
+
+      const summary = document.createElement("div");
+      summary.className = "history-summary";
+      summary.textContent = historyChangeSummary(version.files || []);
+
+      const files = document.createElement("div");
+      files.className = "history-files";
+      const fileItems = version.files || [];
+      if (fileItems.length) {
+        files.replaceChildren(
+          ...fileItems.map((file) => {
+            const row = document.createElement("div");
+            row.className = "history-file";
+            const path = document.createElement("code");
+            path.textContent = file.path || "";
+            const stat = document.createElement("span");
+            stat.textContent = historyFileText(file);
+            row.replaceChildren(path, stat);
+            return row;
+          }),
+        );
+      } else {
+        files.textContent = "该提交没有可展示的文件统计。";
+      }
+
+      item.append(head, meta, summary, files);
+      return item;
+    }),
+  );
+  if (selectedSkill()?.name === skill.name) {
+    state.historySkill = skill.name;
+  }
+}
+
+function renderPendingChanges(skill, pendingChanges) {
+  const files = pendingChanges?.files || [];
+  $("pendingChanges").hidden = files.length === 0;
+  $("pendingSummary").textContent = files.length ? `${files.length} 个文件待提交` : "";
+  $("pendingDiff").hidden = true;
+  $("pendingDiff").querySelector("code").replaceChildren();
+  $("pendingFiles").replaceChildren(
+    ...files.map((file) => {
+      const button = document.createElement("button");
+      button.className = "pending-file";
+      button.type = "button";
+      button.title = file.path;
+      const name = document.createElement("code");
+      name.textContent = file.path;
+      const status = document.createElement("span");
+      status.textContent = changeStatusLabel(file.status);
+      button.replaceChildren(name, status);
+      button.addEventListener("click", () => loadPendingDiff(file.path).catch((error) => setStatus(error.message)));
+      return button;
+    }),
+  );
+}
+
+async function loadPendingDiff(path) {
+  $("pendingDiff").hidden = false;
+  const code = $("pendingDiff").querySelector("code");
+  code.textContent = "读取 diff 中...";
+  const payload = await api(`/api/diff?path=${encodeURIComponent(path)}`);
+  code.replaceChildren(...renderDiffText(payload.diff || ""));
+}
+
+function renderHistoryForSelected() {
+  const skill = selectedSkill();
+  if (!skill) {
+    resetHistoryPanel();
+    return;
+  }
+  if (state.historySkill !== skill.name) {
+    state.historySkill = skill.name;
+    $("historySummary").textContent = "切换到版本页签后读取 Git 提交记录。";
+    $("historyPending").hidden = true;
+    $("pendingChanges").hidden = true;
+    $("pendingFiles").replaceChildren();
+    $("pendingDiff").hidden = true;
+    $("historyList").replaceChildren();
+    $("emptyHistory").hidden = true;
+  }
+  const cached = state.historyCache.get(skill.name);
+  if (cached) {
+    renderHistoryPayload(skill, cached);
+  }
+  if (state.tab === "history" && !cached && !state.historyLoading) {
+    loadHistory().catch((error) => {
+      $("historySummary").textContent = error.message;
+      $("emptyHistory").hidden = false;
+      $("historyRefreshButton").disabled = false;
+    });
+  }
+}
+
 function clearDetailDom() {
   state.descriptionExpanded = false;
   state.descriptionOverflow = false;
@@ -561,6 +807,7 @@ function clearDetailDom() {
   $("sourceList").replaceChildren();
   $("dependencyGraph").replaceChildren();
   resetContextPanel();
+  resetHistoryPanel();
 }
 
 function renderDetail() {
@@ -588,6 +835,7 @@ function renderDetail() {
     $("contextResults").replaceChildren();
     $("emptyContexts").hidden = true;
   }
+  renderHistoryForSelected();
   $("detailTitle").textContent = displayTitle(skill);
   $("detailDescription").textContent = displayDescription(skill);
   $("detailDescription").classList.toggle("expanded", state.descriptionExpanded);
@@ -673,10 +921,21 @@ function renderStats() {
   $("managedCount").textContent = stats.managed;
   $("systemCount").textContent = stats.system;
   $("usedCount").textContent = (usageSummary.active || 0) + (usageSummary.stale || 0);
-  $("libraryPath").textContent = state.data.paths.library;
+  const repositoryUrl = repositoryWebUrl(state.data.paths.remote || state.repository?.remote || state.repository?.skillsRepoUrl);
+  const libraryPath = $("libraryPath");
+  if (repositoryUrl) {
+    libraryPath.textContent = repositoryLinkLabel(repositoryUrl);
+    libraryPath.href = repositoryUrl;
+    libraryPath.title = repositoryUrl;
+  } else {
+    libraryPath.textContent = state.data.paths.library;
+    libraryPath.removeAttribute("href");
+    libraryPath.title = state.data.paths.library;
+  }
   $("codexPath").textContent = state.data.paths.codexSkills;
   const usageText = usageStats.refreshing ? "使用统计刷新中" : usageStatsUpdatedText();
-  $("updatedAt").textContent = state.data.updatedAt ? `同步 ${state.data.updatedAt} · ${usageText}` : usageText;
+  const versionText = versioningStatusText();
+  $("updatedAt").textContent = state.data.updatedAt ? `同步 ${state.data.updatedAt} · ${usageText} · ${versionText}` : `${usageText} · ${versionText}`;
   const codex = state.data.codex;
   $("codexStatus").textContent = codex.available ? codex.version : "codex 不可用";
 }
@@ -695,6 +954,14 @@ function renderInstallPanel() {
   $("installPanel").hidden = !state.installOpen;
   $("installToggleButton").setAttribute("aria-expanded", state.installOpen ? "true" : "false");
   $("installToggleButton").querySelector("use").setAttribute("href", state.installOpen ? "#icon-minus" : "#icon-plus");
+  renderRepositoryPanel();
+}
+
+function renderRepositoryPanel() {
+  if (!state.repository) return;
+  $("repositoryUrl").value = state.repository.skillsRepoUrl || state.repository.remote || "";
+  $("repositoryDir").value = state.repository.skillsRepoDir || "";
+  $("repositoryStatus").textContent = repositoryStatusText();
 }
 
 function updateDescriptionToggle() {
@@ -735,6 +1002,11 @@ async function refresh() {
   setStatus("同步中");
   const payload = await api("/api/state");
   state.data = payload;
+  try {
+    state.repository = await api("/api/repository");
+  } catch {
+    state.repository = null;
+  }
   syncSelectionWithVisible();
   render();
   setStatus("准备就绪");
@@ -744,6 +1016,7 @@ async function sync() {
   setStatus("正在扫描 .codex/skills");
   const payload = await api("/api/sync", { method: "POST", body: "{}" });
   state.data = payload.state;
+  state.historyCache.clear();
   syncSelectionWithVisible();
   render();
   setStatus(
@@ -760,6 +1033,7 @@ async function classifySkills(force = false) {
       body: JSON.stringify({ force }),
     });
     state.data = payload.state;
+    state.historyCache.clear();
     syncSelectionWithVisible();
     render();
     setStatus(classificationStatusText(payload, payload.message || "自动分类完成"));
@@ -778,6 +1052,7 @@ async function localizeSkills(force = false) {
       body: JSON.stringify({ force }),
     });
     state.data = payload.state;
+    state.historyCache.clear();
     syncSelectionWithVisible();
     render();
     setStatus(localizationStatusText(payload, payload.message || "中文信息生成完成"));
@@ -797,6 +1072,7 @@ async function refreshUsageStats() {
       body: "{}",
     });
     state.data = await api("/api/state");
+    state.historyCache.clear();
     syncSelectionWithVisible();
     render();
     const stats = payload.stats || {};
@@ -819,6 +1095,7 @@ async function localizeSelectedSkill(force = true) {
       body: JSON.stringify({ force }),
     });
     state.data = payload.state;
+    state.historyCache.delete(skill.name);
     syncSelectionWithVisible();
     render();
     setStatus(localizationStatusText(payload, payload.message || "当前技能中文信息已生成"));
@@ -849,6 +1126,7 @@ async function install() {
     }
     const payload = await api("/api/install", { method: "POST", body: JSON.stringify(body) });
     state.data = payload.state;
+    state.historyCache.clear();
     state.selected = payload.installed[0] || state.selected;
     syncSelectionWithVisible();
     render();
@@ -859,6 +1137,48 @@ async function install() {
     setStatus(error.message);
   } finally {
     $("installButton").disabled = false;
+  }
+}
+
+async function saveRepositoryConfig() {
+  $("repositorySaveButton").disabled = true;
+  $("repositoryTestButton").disabled = true;
+  setStatus("正在保存 skills 仓库配置");
+  try {
+    const payload = await api("/api/repository", {
+      method: "PUT",
+      body: JSON.stringify({
+        skillsRepoUrl: $("repositoryUrl").value.trim(),
+        skillsRepoDir: $("repositoryDir").value.trim(),
+      }),
+    });
+    state.repository = payload.repository;
+    state.data = payload.state;
+    state.historyCache.clear();
+    render();
+    setStatus(payload.message || "skills 仓库配置已保存");
+  } finally {
+    $("repositorySaveButton").disabled = false;
+    $("repositoryTestButton").disabled = false;
+  }
+}
+
+async function testRepositoryConfig() {
+  $("repositoryTestButton").disabled = true;
+  setStatus("正在测试 skills 仓库提交和推送");
+  try {
+    const payload = await api("/api/repository/test", { method: "POST", body: "{}" });
+    state.repository = payload.repository;
+    state.data = await api("/api/state");
+    state.historyCache.clear();
+    render();
+    const result = payload.result || {};
+    const push = result.push || {};
+    const commitText = result.committed ? `提交 ${result.commit || ""}` : result.message || "没有需要提交的变更";
+    const pushText = push.pushed ? "，已推送" : push.error ? `，推送失败：${push.error}` : "";
+    setStatus(`${commitText}${pushText}`);
+  } finally {
+    $("repositoryTestButton").disabled = false;
   }
 }
 
@@ -884,6 +1204,7 @@ async function saveSkill() {
     body: JSON.stringify(body),
   });
   state.data = payload.state;
+  state.historyCache.delete(skill.name);
   syncSelectionWithVisible();
   render();
   setStatus("已保存");
@@ -914,6 +1235,7 @@ async function toggleSkill(action) {
     body: "{}",
   });
   state.data = payload.state;
+  state.historyCache.delete(skill.name);
   syncSelectionWithVisible();
   render();
   setStatus(payload.message || "完成");
@@ -961,6 +1283,31 @@ async function loadContexts() {
   }
 }
 
+async function loadHistory(force = false) {
+  const skill = selectedSkill();
+  if (!skill || state.historyLoading) return;
+  if (!force && state.historyCache.has(skill.name)) {
+    renderHistoryPayload(skill, state.historyCache.get(skill.name));
+    return;
+  }
+  state.historyLoading = true;
+  $("historyRefreshButton").disabled = true;
+  $("historySummary").textContent = "正在读取 Git 版本记录";
+  $("emptyHistory").hidden = true;
+  try {
+    const payload = await api(`/api/skills/${encodeURIComponent(skill.name)}/history`);
+    state.historyCache.set(skill.name, payload);
+    if (state.data?.versioning && payload.pending) {
+      state.data.versioning = payload.pending;
+    }
+    renderHistoryPayload(skill, payload);
+    renderStats();
+  } finally {
+    state.historyLoading = false;
+    $("historyRefreshButton").disabled = false;
+  }
+}
+
 async function showAudit() {
   const payload = await api("/api/audit");
   const lines = payload.events.map((event) => `${event.time} ${event.action} ${event.skill || (event.skills || []).join(", ") || ""}`);
@@ -981,6 +1328,8 @@ function bindEvents() {
   );
   $("saveLocalizedButton").addEventListener("click", () => saveSkill().catch((error) => setStatus(error.message)));
   $("installButton").addEventListener("click", install);
+  $("repositorySaveButton").addEventListener("click", () => saveRepositoryConfig().catch((error) => setStatus(error.message)));
+  $("repositoryTestButton").addEventListener("click", () => testRepositoryConfig().catch((error) => setStatus(error.message)));
   $("installSource").addEventListener("input", () => showInstallSourceError(""));
   $("saveButton").addEventListener("click", () => saveSkill().catch((error) => setStatus(error.message)));
   $("enableButton").addEventListener("click", () => toggleSkill("enable").catch((error) => setStatus(error.message)));
@@ -988,6 +1337,7 @@ function bindEvents() {
   $("descriptionToggle").addEventListener("click", toggleDescription);
   $("previewToggle").addEventListener("click", togglePreview);
   $("contextButton").addEventListener("click", loadContexts);
+  $("historyRefreshButton").addEventListener("click", () => loadHistory(true).catch((error) => setStatus(error.message)));
   $("auditButton").addEventListener("click", () => showAudit().catch((error) => setStatus(error.message)));
   $("searchInput").addEventListener("input", (event) => {
     state.search = event.target.value;

@@ -3,7 +3,9 @@ __pycache__/
 *.py[cod]
 data/audit-log.jsonl
 data/usage-stats.json
-skills-library/**/node_modules/
+data/settings.json
+data/skills-registry.json
+skills-library/
 work/
 work/*.log
 work/*.pid

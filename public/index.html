@@ -101,6 +101,19 @@
           </label>
           <button id="installButton" class="primary-button">安装到项目库</button>
         </div>
+        <div class="repository-grid">
+          <label>
+            <span>Skills GitHub 仓库</span>
+            <input id="repositoryUrl" placeholder="https://github.com/<owner>/<repo>.git" />
+          </label>
+          <label>
+            <span>本地仓库路径</span>
+            <input id="repositoryDir" placeholder="D:\\tmp\\codex-skills-library" />
+          </label>
+          <button id="repositorySaveButton" class="primary-button">保存仓库</button>
+          <button id="repositoryTestButton" class="primary-button secondary-button">测试提交</button>
+        </div>
+        <div class="repository-status" id="repositoryStatus">未读取仓库配置</div>
       </section>
 
       <main class="shell">
@@ -121,7 +134,7 @@
           </div>
           <div class="category-list" id="categoryListView"></div>
           <div class="path-box">
-            <div><span>项目库</span><code id="libraryPath"></code></div>
+            <div><span>Skills 仓库</span><a id="libraryPath" href="#" target="_blank" rel="noreferrer"></a></div>
             <div><span>Codex</span><code id="codexPath"></code></div>
           </div>
         </aside>
@@ -163,6 +176,7 @@
             <div class="tabs">
               <button class="active" data-tab="meta">资料</button>
               <button data-tab="localized">中文</button>
+              <button data-tab="history">版本</button>
               <button data-tab="contexts">上下文</button>
               <button data-tab="source">来源</button>
             </div>
@@ -219,6 +233,27 @@
                 <button class="primary-button" id="localizeCurrentButton">生成当前技能中文信息</button>
                 <button class="primary-button" id="saveLocalizedButton">保存中文信息</button>
               </div>
+            </div>
+
+            <div class="tab-panel" id="tabHistory" hidden>
+              <div class="history-toolbar">
+                <div>
+                  <strong>版本记录</strong>
+                  <span id="historySummary">读取 Git 提交记录。</span>
+                </div>
+                <button id="historyRefreshButton" class="primary-button">刷新版本</button>
+              </div>
+              <div id="historyPending" class="version-pending" hidden></div>
+              <div id="pendingChanges" class="pending-changes" hidden>
+                <div class="pending-head">
+                  <strong>未提交变更</strong>
+                  <span id="pendingSummary"></span>
+                </div>
+                <div id="pendingFiles" class="pending-files"></div>
+                <pre id="pendingDiff" class="diff-view" hidden><code></code></pre>
+              </div>
+              <div id="historyList" class="history-list"></div>
+              <div class="empty-state" id="emptyHistory" hidden>还没有该技能的版本提交记录</div>
             </div>
 
             <div class="tab-panel" id="tabContexts" hidden>

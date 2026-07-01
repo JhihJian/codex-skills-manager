@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -22,8 +23,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 PUBLIC_DIR = BASE_DIR / "public"
-LIBRARY_DIR = BASE_DIR / "skills-library"
-REGISTRY_FILE = DATA_DIR / "skills-registry.json"
+SETTINGS_FILE = DATA_DIR / "settings.json"
+DEFAULT_SKILLS_REPO_DIR = (BASE_DIR.parent / "codex-skills-library").resolve()
+SKILLS_REPO_DIR = Path(os.environ.get("CODEX_SKILLS_REPO_DIR", DEFAULT_SKILLS_REPO_DIR)).expanduser().resolve()
+SKILLS_REPO_URL = os.environ.get("CODEX_SKILLS_REPO_URL", "").strip()
+LIBRARY_DIR = (SKILLS_REPO_DIR / "skills").resolve()
+SKILLS_DB_FILE = (SKILLS_REPO_DIR / "codex-skills-manager.sqlite3").resolve()
+REGISTRY_KEY = "skills-registry"
+LEGACY_LIBRARY_DIR = BASE_DIR / "skills-library"
+LEGACY_REGISTRY_FILE = DATA_DIR / "skills-registry.json"
 AUDIT_FILE = DATA_DIR / "audit-log.jsonl"
 USAGE_STATS_FILE = DATA_DIR / "usage-stats.json"
 
@@ -99,11 +107,37 @@ USAGE_STATS_INCLUDE_SYSTEM = os.environ.get("CODEX_SKILL_USAGE_STATS_INCLUDE_SYS
     "no",
     "off",
 }
+SKILL_VERSIONING_ENABLED = os.environ.get("CODEX_SKILL_VERSIONING_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+SKILL_VERSION_COMMIT_DELAY_SECONDS = env_int(
+    "CODEX_SKILL_VERSION_COMMIT_DELAY_SECONDS",
+    3600,
+    minimum=60,
+)
+SKILL_VERSION_SCAN_INTERVAL_SECONDS = env_int(
+    "CODEX_SKILL_VERSION_SCAN_INTERVAL_SECONDS",
+    300,
+    minimum=30,
+)
+SKILL_VERSION_AUTO_PUSH_ENABLED = os.environ.get("CODEX_SKILL_VERSION_AUTO_PUSH", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 
 REGISTRY_LOCK = threading.RLock()
 USAGE_STATS_LOCK = threading.RLock()
 USAGE_STATS_REFRESH_LOCK = threading.Lock()
 USAGE_STATS_REFRESHING = threading.Event()
+SKILL_VERSION_LOCK = threading.RLock()
+SKILL_VERSION_PENDING_SINCE: datetime | None = None
+SKILL_VERSION_LAST_SIGNATURE = ""
+SKILL_VERSION_COMMITTING = threading.Event()
 
 
 class ApiError(Exception):
@@ -126,7 +160,7 @@ def now_iso() -> str:
 
 
 def ensure_dirs() -> None:
-    for folder in (DATA_DIR, LIBRARY_DIR, PUBLIC_DIR):
+    for folder in (DATA_DIR, LIBRARY_DIR, SKILLS_DB_FILE.parent, PUBLIC_DIR):
         folder.mkdir(parents=True, exist_ok=True)
     CODEX_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -147,6 +181,81 @@ def write_json(path: Path, value: Any) -> None:
     tmp.replace(path)
 
 
+def ensure_skills_db() -> None:
+    SKILLS_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(SKILLS_DB_FILE) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_state (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS metadata (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def read_registry_from_db(default: dict[str, Any]) -> dict[str, Any]:
+    ensure_skills_db()
+    with sqlite3.connect(SKILLS_DB_FILE) as conn:
+        row = conn.execute("SELECT value FROM app_state WHERE key = ?", (REGISTRY_KEY,)).fetchone()
+    if not row:
+        return default
+    try:
+        payload = json.loads(str(row[0]))
+    except json.JSONDecodeError:
+        return default
+    return payload if isinstance(payload, dict) else default
+
+
+def write_registry_to_db(registry: dict[str, Any]) -> None:
+    ensure_skills_db()
+    payload = json.dumps(registry, ensure_ascii=False, indent=2)
+    with sqlite3.connect(SKILLS_DB_FILE) as conn:
+        conn.execute(
+            """
+            INSERT INTO app_state(key, value, updated_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (REGISTRY_KEY, payload, now_iso()),
+        )
+        conn.commit()
+
+
+def read_settings() -> dict[str, Any]:
+    payload = read_json(SETTINGS_FILE, {})
+    return payload if isinstance(payload, dict) else {}
+
+
+def write_settings(payload: dict[str, Any]) -> None:
+    write_json(SETTINGS_FILE, payload)
+
+
+def apply_repository_settings(settings: dict[str, Any] | None = None) -> None:
+    global SKILLS_REPO_DIR, SKILLS_REPO_URL, LIBRARY_DIR, SKILLS_DB_FILE
+    settings = settings if settings is not None else read_settings()
+    configured_dir = str(settings.get("skillsRepoDir") or os.environ.get("CODEX_SKILLS_REPO_DIR") or DEFAULT_SKILLS_REPO_DIR).strip()
+    configured_url = str(settings.get("skillsRepoUrl") or os.environ.get("CODEX_SKILLS_REPO_URL") or "").strip()
+    SKILLS_REPO_DIR = Path(configured_dir).expanduser().resolve()
+    SKILLS_REPO_URL = configured_url
+    LIBRARY_DIR = (SKILLS_REPO_DIR / "skills").resolve()
+    SKILLS_DB_FILE = (SKILLS_REPO_DIR / "codex-skills-manager.sqlite3").resolve()
+
+
+apply_repository_settings()
+
+
 def append_audit(action: str, payload: dict[str, Any]) -> None:
     AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
     event = {"time": now_iso(), "action": action, **payload}
@@ -156,10 +265,7 @@ def append_audit(action: str, payload: dict[str, Any]) -> None:
 
 def load_registry() -> dict[str, Any]:
     with REGISTRY_LOCK:
-        registry = read_json(
-            REGISTRY_FILE,
-            {"version": 1, "updatedAt": now_iso(), "categories": DEFAULT_CATEGORIES, "skills": {}},
-        )
+        registry = read_registry_from_db({"version": 1, "updatedAt": now_iso(), "categories": DEFAULT_CATEGORIES, "skills": {}})
     registry.setdefault("version", 1)
     registry.setdefault("updatedAt", now_iso())
     registry.setdefault("categories", list(DEFAULT_CATEGORIES))
@@ -173,7 +279,7 @@ def load_registry() -> dict[str, Any]:
 def save_registry(registry: dict[str, Any]) -> None:
     with REGISTRY_LOCK:
         registry["updatedAt"] = now_iso()
-        write_json(REGISTRY_FILE, registry)
+        write_registry_to_db(registry)
 
 
 def is_relative_to(path: Path, root: Path) -> bool:
@@ -212,6 +318,142 @@ def copytree_clean(src: Path, dest: Path) -> None:
         raise ApiError(f"目标目录已存在：{dest}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, dest, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"))
+
+
+def copytree_merge_missing(src: Path, dest: Path) -> int:
+    src = src.resolve()
+    dest = dest.resolve()
+    copied = 0
+    if not src.exists() or not src.is_dir():
+        return copied
+    for child in src.rglob("*"):
+        if ".git" in child.parts or "__pycache__" in child.parts:
+            continue
+        relative = child.relative_to(src)
+        target = dest / relative
+        if child.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        if target.exists():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(child, target)
+        copied += 1
+    return copied
+
+
+def run_git_at(path: Path, args: list[str], *, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(path),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+
+
+def clone_skills_repository_if_needed() -> bool:
+    if not SKILLS_REPO_URL or SKILLS_REPO_DIR.exists():
+        return False
+    SKILLS_REPO_DIR.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["git", "clone", SKILLS_REPO_URL, str(SKILLS_REPO_DIR)],
+        cwd=str(SKILLS_REPO_DIR.parent),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+    )
+    if result.returncode != 0:
+        raise ApiError(f"克隆 skills 仓库失败：{(result.stderr or result.stdout).strip()}")
+    return True
+
+
+def ensure_git_remote(url: str) -> None:
+    if not url:
+        return
+    current = run_git_at(SKILLS_REPO_DIR, ["remote", "get-url", "origin"], timeout=30)
+    if current.returncode == 0:
+        if current.stdout.strip() != url:
+            result = run_git_at(SKILLS_REPO_DIR, ["remote", "set-url", "origin", url], timeout=30)
+            if result.returncode != 0:
+                raise ApiError(f"更新 skills 仓库 origin 失败：{(result.stderr or result.stdout).strip()}")
+        return
+    result = run_git_at(SKILLS_REPO_DIR, ["remote", "add", "origin", url], timeout=30)
+    if result.returncode != 0:
+        raise ApiError(f"设置 skills 仓库 origin 失败：{(result.stderr or result.stdout).strip()}")
+
+
+def write_repository_metadata() -> None:
+    payload = json.dumps(
+        {
+            "remote": SKILLS_REPO_URL,
+            "layout": "skills-plus-sqlite",
+            "skillsDir": str(LIBRARY_DIR),
+            "database": str(SKILLS_DB_FILE),
+        },
+        ensure_ascii=False,
+    )
+    with sqlite3.connect(SKILLS_DB_FILE) as conn:
+        row = conn.execute("SELECT value FROM metadata WHERE key = ?", ("repository",)).fetchone()
+        if row and row[0] == payload:
+            return
+        conn.execute(
+            """
+            INSERT INTO metadata(key, value, updated_at)
+            VALUES(?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            ("repository", payload, now_iso()),
+        )
+        conn.commit()
+
+
+def ensure_skills_repository() -> None:
+    cloned = clone_skills_repository_if_needed()
+    ensure_dirs()
+    migrated_files = 0
+    if LEGACY_LIBRARY_DIR.exists() and not any(LIBRARY_DIR.iterdir()):
+        migrated_files += copytree_merge_missing(LEGACY_LIBRARY_DIR, LIBRARY_DIR)
+    legacy_external_library = SKILLS_REPO_DIR / "skills-library"
+    if legacy_external_library.exists() and not any(LIBRARY_DIR.iterdir()):
+        migrated_files += copytree_merge_missing(legacy_external_library, LIBRARY_DIR)
+
+    ensure_skills_db()
+    if LEGACY_REGISTRY_FILE.exists():
+        existing_registry = read_registry_from_db({})
+        if not existing_registry:
+            legacy_registry = read_json(LEGACY_REGISTRY_FILE, {})
+            if isinstance(legacy_registry, dict) and legacy_registry:
+                write_registry_to_db(legacy_registry)
+                migrated_files += 1
+
+    if not (SKILLS_REPO_DIR / ".git").exists():
+        init_result = run_git_at(SKILLS_REPO_DIR, ["init"], timeout=60)
+        if init_result.returncode != 0:
+            raise ApiError(f"初始化技能库 Git 仓库失败：{(init_result.stderr or init_result.stdout).strip()}")
+    ensure_git_remote(SKILLS_REPO_URL)
+
+    gitignore = SKILLS_REPO_DIR / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text("skills/**/node_modules/\n.DS_Store\nThumbs.db\n", encoding="utf-8", newline="\n")
+
+    write_repository_metadata()
+
+    if migrated_files or cloned:
+        append_audit(
+            "initialize-skills-repository",
+            {
+                "from": str(LEGACY_LIBRARY_DIR),
+                "to": str(SKILLS_REPO_DIR),
+                "files": migrated_files,
+                "remote": SKILLS_REPO_URL,
+                "cloned": cloned,
+            },
+        )
 
 
 def parse_frontmatter(text: str) -> dict[str, Any]:
@@ -482,7 +724,10 @@ def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
         "skills": skills,
         "paths": {
             "projectRoot": str(BASE_DIR),
+            "skillsRepo": str(SKILLS_REPO_DIR),
             "library": str(LIBRARY_DIR),
+            "database": str(SKILLS_DB_FILE),
+            "remote": SKILLS_REPO_URL,
             "codexHome": str(CODEX_HOME),
             "codexSkills": str(CODEX_SKILLS_DIR),
             "sessions": str(CODEX_SESSIONS_DIR),
@@ -500,6 +745,7 @@ def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
             "unlocalized": len(skills) - localized_count,
         },
         "usageStats": usage_stats_summary(usage_stats),
+        "versioning": skill_version_pending_state(),
     }
 
 
@@ -1426,6 +1672,538 @@ def read_skill_markdown(name: str) -> dict[str, Any]:
     raise ApiError("未找到该技能的 SKILL.md。", HTTPStatus.NOT_FOUND)
 
 
+def git_command(args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(SKILLS_REPO_DIR),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+
+
+def normalize_git_path(path: str) -> str:
+    return path.strip().strip('"').replace("\\", "/")
+
+
+def managed_version_paths() -> list[str]:
+    return ["skills", "codex-skills-manager.sqlite3", ".gitignore"]
+
+
+def changed_managed_paths() -> list[dict[str, str]]:
+    completed = git_command(
+        ["status", "--porcelain=v1", "--untracked-files=all", "--", *managed_version_paths()],
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        raise ApiError(f"读取 Git 状态失败：{(completed.stderr or completed.stdout).strip()}")
+    changes: list[dict[str, str]] = []
+    for line in completed.stdout.splitlines():
+        if not line.strip():
+            continue
+        status = line[:2]
+        path_text = line[3:] if len(line) > 3 else ""
+        if " -> " in path_text:
+            path_text = path_text.split(" -> ", 1)[1]
+        path_text = normalize_git_path(path_text)
+        if not path_text:
+            continue
+        changes.append({"status": status.strip() or "M", "path": path_text})
+    return changes
+
+
+def changed_paths_for_skill(name: str) -> list[dict[str, str]]:
+    changes = changed_managed_paths()
+    wanted = safe_skill_name(name)
+    return [change for change in changes if skill_from_managed_path(change["path"]) in {wanted, "registry", "repository"}]
+
+
+def skill_from_managed_path(path: str) -> str:
+    normalized = normalize_git_path(path)
+    prefix = "skills/"
+    if normalized.startswith(prefix):
+        rest = normalized[len(prefix) :]
+        return rest.split("/", 1)[0] if rest else ""
+    if normalized == "codex-skills-manager.sqlite3":
+        return "registry"
+    if normalized == ".gitignore":
+        return "repository"
+    return ""
+
+
+def summarize_managed_changes(changes: list[dict[str, str]]) -> dict[str, Any]:
+    skills: dict[str, dict[str, Any]] = {}
+    registry_changed = False
+    repository_changed = False
+    for change in changes:
+        skill = skill_from_managed_path(change["path"])
+        if skill == "registry":
+            registry_changed = True
+            continue
+        if skill == "repository":
+            repository_changed = True
+            continue
+        if not skill:
+            continue
+        item = skills.setdefault(skill, {"name": skill, "files": 0, "statuses": set()})
+        item["files"] += 1
+        item["statuses"].add(change["status"])
+    items = []
+    for item in skills.values():
+        items.append(
+            {
+                "name": item["name"],
+                "files": item["files"],
+                "statuses": sorted(item["statuses"]),
+            }
+        )
+    items.sort(key=lambda item: item["name"].lower())
+    return {
+        "skills": items,
+        "registryChanged": registry_changed,
+        "repositoryChanged": repository_changed,
+        "changedFiles": len(changes),
+    }
+
+
+def managed_changes_signature(changes: list[dict[str, str]]) -> str:
+    parts: list[str] = []
+    for change in changes:
+        path = normalize_git_path(change["path"])
+        file_path = (SKILLS_REPO_DIR / path).resolve()
+        stat_text = "missing"
+        if is_relative_to(file_path, SKILLS_REPO_DIR) and file_path.exists() and file_path.is_file():
+            stat = file_path.stat()
+            stat_text = f"{stat.st_size}:{stat.st_mtime_ns}"
+        parts.append(f"{change['status']} {path} {stat_text}")
+    return "\n".join(parts)
+
+
+def skill_version_pending_state() -> dict[str, Any]:
+    if not SKILL_VERSIONING_ENABLED:
+        return {
+            "enabled": False,
+            "pending": False,
+            "message": "技能版本自动提交已关闭。",
+            "delaySeconds": SKILL_VERSION_COMMIT_DELAY_SECONDS,
+            "scanIntervalSeconds": SKILL_VERSION_SCAN_INTERVAL_SECONDS,
+        }
+    try:
+        changes = changed_managed_paths()
+    except (ApiError, subprocess.SubprocessError, OSError) as exc:
+        return {
+            "enabled": True,
+            "pending": False,
+            "error": str(exc),
+            "delaySeconds": SKILL_VERSION_COMMIT_DELAY_SECONDS,
+            "scanIntervalSeconds": SKILL_VERSION_SCAN_INTERVAL_SECONDS,
+            "committing": SKILL_VERSION_COMMITTING.is_set(),
+        }
+    summary = summarize_managed_changes(changes)
+    with SKILL_VERSION_LOCK:
+        pending_since = SKILL_VERSION_PENDING_SINCE
+    age_seconds = None
+    due_at = ""
+    if pending_since:
+        now = datetime.now(timezone.utc)
+        age_seconds = max(0, int((now - pending_since).total_seconds()))
+        due_at = (pending_since + timedelta(seconds=SKILL_VERSION_COMMIT_DELAY_SECONDS)).astimezone().isoformat(timespec="seconds")
+    return {
+        "enabled": True,
+        "pending": bool(changes),
+        "pendingSince": pending_since.astimezone().isoformat(timespec="seconds") if pending_since else "",
+        "ageSeconds": age_seconds,
+        "dueAt": due_at,
+        "delaySeconds": SKILL_VERSION_COMMIT_DELAY_SECONDS,
+        "scanIntervalSeconds": SKILL_VERSION_SCAN_INTERVAL_SECONDS,
+        "committing": SKILL_VERSION_COMMITTING.is_set(),
+        **summary,
+    }
+
+
+def build_skill_version_commit_message(summary: dict[str, Any]) -> str:
+    skills = [item["name"] for item in summary.get("skills", []) if item.get("name")]
+    registry_changed = bool(summary.get("registryChanged"))
+    repository_changed = bool(summary.get("repositoryChanged"))
+    if skills:
+        title_names = ", ".join(skills[:3])
+        if len(skills) > 3:
+            title_names += f" 等 {len(skills)} 个"
+        title = f"chore(skills): 记录 {title_names} 的技能版本"
+    elif registry_changed:
+        title = "chore(skills): 记录技能登记信息版本"
+    else:
+        title = "chore(skills): 记录技能版本"
+    lines = [title, ""]
+    if skills:
+        lines.append("变更技能：")
+        for item in summary.get("skills", []):
+            lines.append(f"- {item['name']}（{item['files']} 个文件）")
+    if registry_changed:
+        if skills:
+            lines.append("")
+        lines.append("包含技能登记信息更新。")
+    if repository_changed:
+        if skills or registry_changed:
+            lines.append("")
+        lines.append("包含 skills 仓库配置文件更新。")
+    return "\n".join(lines).strip()
+
+
+def commit_managed_skill_changes(*, reason: str = "auto") -> dict[str, Any]:
+    if not SKILL_VERSIONING_ENABLED:
+        return {"committed": False, "message": "技能版本自动提交已关闭。"}
+    if SKILL_VERSION_COMMITTING.is_set():
+        return {"committed": False, "message": "已有技能版本提交正在执行。"}
+    SKILL_VERSION_COMMITTING.set()
+    try:
+        changes = changed_managed_paths()
+        if not changes:
+            with SKILL_VERSION_LOCK:
+                global SKILL_VERSION_PENDING_SINCE, SKILL_VERSION_LAST_SIGNATURE
+                SKILL_VERSION_PENDING_SINCE = None
+                SKILL_VERSION_LAST_SIGNATURE = ""
+            return {"committed": False, "message": "没有技能变更需要提交。"}
+
+        summary = summarize_managed_changes(changes)
+        add_result = git_command(["add", "--", *managed_version_paths()], timeout=60)
+        if add_result.returncode != 0:
+            raise ApiError(f"暂存技能变更失败：{(add_result.stderr or add_result.stdout).strip()}")
+
+        diff_result = git_command(["diff", "--cached", "--quiet", "--", *managed_version_paths()], timeout=60)
+        if diff_result.returncode == 0:
+            with SKILL_VERSION_LOCK:
+                SKILL_VERSION_PENDING_SINCE = None
+                SKILL_VERSION_LAST_SIGNATURE = ""
+            return {"committed": False, "message": "技能变更暂存后没有实际差异。", **summary}
+        if diff_result.returncode not in {0, 1}:
+            raise ApiError(f"检查暂存差异失败：{(diff_result.stderr or diff_result.stdout).strip()}")
+
+        message = build_skill_version_commit_message(summary)
+        commit_result = git_command(["commit", "-m", message, "--", *managed_version_paths()], timeout=120)
+        if commit_result.returncode != 0:
+            raise ApiError(f"提交技能版本失败：{(commit_result.stderr or commit_result.stdout).strip()}")
+
+        commit_hash_result = git_command(["rev-parse", "--short", "HEAD"], timeout=30)
+        commit_hash = commit_hash_result.stdout.strip() if commit_hash_result.returncode == 0 else ""
+        push_result = push_skill_repository()
+        append_audit(
+            "auto-commit-skill-version",
+            {
+                "reason": reason,
+                "commit": commit_hash,
+                "skills": [item["name"] for item in summary.get("skills", [])],
+                "registryChanged": summary.get("registryChanged", False),
+                "repositoryChanged": summary.get("repositoryChanged", False),
+                "changedFiles": summary.get("changedFiles", 0),
+                "push": push_result,
+            },
+        )
+        with SKILL_VERSION_LOCK:
+            SKILL_VERSION_PENDING_SINCE = None
+            SKILL_VERSION_LAST_SIGNATURE = ""
+        return {
+            "committed": True,
+            "commit": commit_hash,
+            "message": message,
+            "push": push_result,
+            **summary,
+        }
+    finally:
+        SKILL_VERSION_COMMITTING.clear()
+
+
+def inspect_skill_version_changes() -> dict[str, Any]:
+    try:
+        changes = changed_managed_paths()
+    except Exception as exc:  # noqa: BLE001
+        append_audit("skill-version-status-failed", {"error": str(exc)})
+        return {}
+    signature = managed_changes_signature(changes)
+    now = datetime.now(timezone.utc)
+    with SKILL_VERSION_LOCK:
+        global SKILL_VERSION_PENDING_SINCE, SKILL_VERSION_LAST_SIGNATURE
+        if not changes:
+            SKILL_VERSION_PENDING_SINCE = None
+            SKILL_VERSION_LAST_SIGNATURE = ""
+            return {"pending": False}
+        if signature != SKILL_VERSION_LAST_SIGNATURE or SKILL_VERSION_PENDING_SINCE is None:
+            SKILL_VERSION_LAST_SIGNATURE = signature
+            SKILL_VERSION_PENDING_SINCE = now
+            append_audit(
+                "skill-version-change-detected",
+                {
+                    "changedFiles": len(changes),
+                    **summarize_managed_changes(changes),
+                },
+            )
+            return {"pending": True, "reset": True}
+        age = (now - SKILL_VERSION_PENDING_SINCE).total_seconds()
+    if age >= SKILL_VERSION_COMMIT_DELAY_SECONDS:
+        try:
+            return commit_managed_skill_changes(reason="quiet-period")
+        except Exception as exc:  # noqa: BLE001
+            append_audit("auto-commit-skill-version-failed", {"error": str(exc)})
+            return {"committed": False, "error": str(exc)}
+    return {"pending": True}
+
+
+def skill_version_scheduler(stop_event: threading.Event) -> None:
+    while not stop_event.wait(SKILL_VERSION_SCAN_INTERVAL_SECONDS):
+        inspect_skill_version_changes()
+
+
+def git_log_exists() -> bool:
+    completed = git_command(["rev-parse", "--verify", "HEAD"], timeout=30)
+    return completed.returncode == 0
+
+
+def current_git_branch() -> str:
+    result = git_command(["branch", "--show-current"], timeout=30)
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    return "main"
+
+
+def push_skill_repository() -> dict[str, Any]:
+    if not SKILL_VERSION_AUTO_PUSH_ENABLED:
+        return {"pushed": False, "message": "技能仓库自动 push 已关闭。"}
+    remote = git_command(["remote", "get-url", "origin"], timeout=30)
+    if remote.returncode != 0 or not remote.stdout.strip():
+        return {"pushed": False, "message": "技能仓库未配置 origin。"}
+    branch = current_git_branch()
+    result = git_command(["push", "-u", "origin", branch], timeout=180)
+    if result.returncode != 0:
+        return {"pushed": False, "branch": branch, "error": (result.stderr or result.stdout).strip()}
+    return {"pushed": True, "branch": branch, "remote": remote.stdout.strip()}
+
+
+def parse_git_numstat(lines: list[str]) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        added, deleted, path = parts[0], parts[1], normalize_git_path(parts[2])
+        files.append(
+            {
+                "path": path,
+                "skill": skill_from_managed_path(path),
+                "added": None if added == "-" else int(added or 0),
+                "deleted": None if deleted == "-" else int(deleted or 0),
+            }
+        )
+    return files
+
+
+def read_file_for_diff(path: str) -> str:
+    normalized = normalize_git_path(path)
+    candidate = (SKILLS_REPO_DIR / normalized).resolve()
+    if not is_relative_to(candidate, SKILLS_REPO_DIR) or not candidate.exists() or not candidate.is_file():
+        return ""
+    try:
+        return candidate.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return ""
+
+
+def read_pending_diff(path: str) -> dict[str, Any]:
+    normalized = normalize_git_path(path)
+    changes = changed_managed_paths()
+    if normalized not in {change["path"] for change in changes}:
+        raise ApiError("该文件没有未提交变更。", HTTPStatus.NOT_FOUND)
+    if not any(normalized == managed or normalized.startswith(f"{managed}/") for managed in managed_version_paths()):
+        raise ApiError("只能查看受管 skills 仓库文件的 diff。", HTTPStatus.FORBIDDEN)
+
+    status = next((change["status"] for change in changes if change["path"] == normalized), "")
+    diff_text = ""
+    if status[:1] != "?" and status[1:2] != " ":
+        staged = git_command(["diff", "--cached", "--", normalized], timeout=60)
+        if staged.returncode != 0:
+            raise ApiError(f"读取暂存 diff 失败：{(staged.stderr or staged.stdout).strip()}")
+        diff_text = staged.stdout
+    if status[:1] != " " and "??" not in status:
+        result = git_command(["diff", "--", normalized], timeout=60)
+        if result.returncode != 0:
+            raise ApiError(f"读取 diff 失败：{(result.stderr or result.stdout).strip()}")
+        diff_text = f"{diff_text}\n{result.stdout}".strip()
+    if not diff_text:
+        content = read_file_for_diff(normalized)
+        header = f"diff --git a/{normalized} b/{normalized}\nnew file mode 100644\n--- /dev/null\n+++ b/{normalized}\n"
+        body = "".join(f"+{line}\n" for line in content.splitlines())
+        diff_text = header + body
+    return {
+        "path": normalized,
+        "status": status,
+        "skill": skill_from_managed_path(normalized),
+        "diff": diff_text,
+    }
+
+
+def read_skill_pending_changes(name: str) -> dict[str, Any]:
+    name = safe_skill_name(name)
+    changes = changed_paths_for_skill(name)
+    files = []
+    for change in changes:
+        path = change["path"]
+        skill = skill_from_managed_path(path)
+        file_path = (SKILLS_REPO_DIR / path).resolve()
+        size = file_path.stat().st_size if is_relative_to(file_path, SKILLS_REPO_DIR) and file_path.exists() and file_path.is_file() else None
+        files.append(
+            {
+                "path": path,
+                "status": change["status"],
+                "skill": skill,
+                "size": size,
+            }
+        )
+    return {
+        "skill": name,
+        "files": files,
+        "count": len(files),
+        "summary": summarize_managed_changes(changes),
+    }
+
+
+def read_skill_history(name: str, *, limit: int = 40) -> dict[str, Any]:
+    name = safe_skill_name(name)
+    registry = read_registry_state()
+    entry = registry["skills"].get(name)
+    if not entry:
+        raise ApiError("未找到该技能。", HTTPStatus.NOT_FOUND)
+    if not git_log_exists():
+        return {
+            "skill": name,
+            "versions": [],
+            "pending": skill_version_pending_state(),
+            "pendingChanges": read_skill_pending_changes(name),
+            "message": "当前仓库还没有提交记录，首次提交后会显示版本历史。",
+        }
+
+    paths = [f"skills/{name}", "codex-skills-manager.sqlite3"]
+    completed = git_command(
+        [
+            "log",
+            f"--max-count={max(1, min(limit, 200))}",
+            "--date=iso-strict",
+            "--pretty=format:__COMMIT__%x1f%H%x1f%h%x1f%ad%x1f%an%x1f%s",
+            "--numstat",
+            "--",
+            *paths,
+        ],
+        timeout=60,
+    )
+    if completed.returncode != 0:
+        raise ApiError(f"读取技能版本历史失败：{(completed.stderr or completed.stdout).strip()}")
+
+    versions: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    numstat_lines: list[str] = []
+    for line in completed.stdout.splitlines():
+        if line.startswith("__COMMIT__"):
+            if current is not None:
+                current["files"] = parse_git_numstat(numstat_lines)
+                versions.append(current)
+            parts = line.removeprefix("__COMMIT__").split("\x1f")
+            while len(parts) < 6:
+                parts.append("")
+            current = {
+                "hash": parts[1],
+                "shortHash": parts[2],
+                "date": parts[3],
+                "author": parts[4],
+                "subject": parts[5],
+            }
+            numstat_lines = []
+            continue
+        if current is not None and line.strip():
+            numstat_lines.append(line)
+    if current is not None:
+        current["files"] = parse_git_numstat(numstat_lines)
+        versions.append(current)
+
+    return {
+        "skill": name,
+        "versions": versions,
+        "pending": skill_version_pending_state(),
+        "pendingChanges": read_skill_pending_changes(name),
+    }
+
+
+def read_version_status() -> dict[str, Any]:
+    return {
+        "versioning": skill_version_pending_state(),
+        "historyAvailable": git_log_exists(),
+        "repository": {
+            "path": str(SKILLS_REPO_DIR),
+            "skills": str(LIBRARY_DIR),
+            "database": str(SKILLS_DB_FILE),
+            "remote": SKILLS_REPO_URL,
+            "autoPush": SKILL_VERSION_AUTO_PUSH_ENABLED,
+        },
+    }
+
+
+def repository_config_view() -> dict[str, Any]:
+    remote = git_command(["remote", "get-url", "origin"], timeout=30)
+    branch = current_git_branch() if (SKILLS_REPO_DIR / ".git").exists() else ""
+    return {
+        "skillsRepoUrl": SKILLS_REPO_URL,
+        "skillsRepoDir": str(SKILLS_REPO_DIR),
+        "skillsDir": str(LIBRARY_DIR),
+        "database": str(SKILLS_DB_FILE),
+        "remote": remote.stdout.strip() if remote.returncode == 0 else "",
+        "branch": branch,
+        "exists": SKILLS_REPO_DIR.exists(),
+        "git": (SKILLS_REPO_DIR / ".git").exists(),
+        "autoPush": SKILL_VERSION_AUTO_PUSH_ENABLED,
+        "versioning": skill_version_pending_state(),
+    }
+
+
+def update_repository_config(body: dict[str, Any]) -> dict[str, Any]:
+    settings = read_settings()
+    repo_url = str(body.get("skillsRepoUrl") or body.get("url") or "").strip()
+    repo_dir = str(body.get("skillsRepoDir") or body.get("dir") or "").strip()
+    if repo_url:
+        settings["skillsRepoUrl"] = repo_url
+    elif "skillsRepoUrl" in body or "url" in body:
+        settings.pop("skillsRepoUrl", None)
+    if repo_dir:
+        settings["skillsRepoDir"] = repo_dir
+    elif "skillsRepoDir" in body or "dir" in body:
+        settings.pop("skillsRepoDir", None)
+    write_settings(settings)
+    apply_repository_settings(settings)
+    ensure_skills_repository()
+    with SKILL_VERSION_LOCK:
+        global SKILL_VERSION_PENDING_SINCE, SKILL_VERSION_LAST_SIGNATURE
+        SKILL_VERSION_PENDING_SINCE = None
+        SKILL_VERSION_LAST_SIGNATURE = ""
+    append_audit("update-skills-repository-config", repository_config_view())
+    registry = sync_registry(adopt_extra=False, save=False)
+    return {
+        "message": "skills 仓库配置已保存。",
+        "repository": repository_config_view(),
+        "state": registry_view(registry),
+    }
+
+
+def test_repository_config() -> dict[str, Any]:
+    ensure_skills_repository()
+    commit_result = commit_managed_skill_changes(reason="manual-test")
+    if not commit_result.get("committed"):
+        push_result = push_skill_repository()
+        commit_result["push"] = push_result
+    return {
+        "message": "skills 仓库测试完成。",
+        "repository": repository_config_view(),
+        "result": commit_result,
+    }
+
+
 def read_session_index() -> dict[str, dict[str, Any]]:
     index: dict[str, dict[str, Any]] = {}
     if not SESSION_INDEX_FILE.exists():
@@ -1674,7 +2452,7 @@ def function_call_text(payload: dict[str, Any]) -> str:
 
 
 SKILL_PATH_PATTERNS = [
-    re.compile(r"(?i)(?:^|[\\/])skills-library[\\/]([^\\/\s\"'`<>|:]+)[\\/]SKILL\.md"),
+    re.compile(r"(?i)(?:^|[\\/])skills[\\/]([^\\/\s\"'`<>|:]+)[\\/]SKILL\.md"),
     re.compile(r"(?i)(?:^|[\\/])skills[\\/]\.system[\\/]([^\\/\s\"'`<>|:]+)[\\/]SKILL\.md"),
     re.compile(r"(?i)(?:^|[\\/])skills[\\/](?!\.system[\\/])([^\\/\s\"'`<>|:]+)[\\/]SKILL\.md"),
     re.compile(r"(?i)(?:^|[\\/])plugins[\\/]cache[\\/].{1,220}?[\\/]skills[\\/]([^\\/\s\"'`<>|:]+)[\\/]SKILL\.md"),
@@ -2323,6 +3101,22 @@ class Handler(SimpleHTTPRequestHandler):
             if method == "GET" and path == "/api/audit":
                 self.send_json({"events": read_audit()})
                 return True
+            if method == "GET" and path == "/api/versioning":
+                self.send_json(read_version_status())
+                return True
+            if method == "GET" and path == "/api/repository":
+                self.send_json(repository_config_view())
+                return True
+            if method == "PUT" and path == "/api/repository":
+                self.send_json(update_repository_config(self.read_body()))
+                return True
+            if method == "POST" and path == "/api/repository/test":
+                self.send_json(test_repository_config())
+                return True
+            if method == "GET" and path == "/api/diff":
+                diff_path = (query.get("path") or [""])[0]
+                self.send_json(read_pending_diff(diff_path))
+                return True
             if method == "POST" and path == "/api/sync":
                 registry = sync_registry()
                 classification = auto_classify_registry_after_change(registry, reason="sync")
@@ -2348,7 +3142,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(install_skill(self.read_body()))
                 return True
 
-            skill_match = re.match(r"^/api/skills/([^/]+)(?:/(enable|disable|contexts|markdown|classify|localize))?$", path)
+            skill_match = re.match(r"^/api/skills/([^/]+)(?:/(enable|disable|contexts|markdown|history|classify|localize))?$", path)
             if skill_match:
                 skill_name = skill_match.group(1)
                 action = skill_match.group(2)
@@ -2366,6 +3160,10 @@ class Handler(SimpleHTTPRequestHandler):
                     return True
                 if method == "GET" and action == "contexts":
                     self.send_json(search_skill_contexts(skill_name, query))
+                    return True
+                if method == "GET" and action == "history":
+                    limit = int((query.get("limit") or ["40"])[0])
+                    self.send_json(read_skill_history(skill_name, limit=limit))
                     return True
                 if method == "POST" and action == "classify":
                     body = self.read_body()
@@ -2409,9 +3207,10 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
-    ensure_dirs()
+    ensure_skills_repository()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     usage_scheduler_stop = threading.Event()
+    skill_version_scheduler_stop = threading.Event()
     if USAGE_STATS_DAILY_ENABLED:
         threading.Thread(
             target=usage_stats_scheduler,
@@ -2421,6 +3220,14 @@ def main() -> int:
         ).start()
         if usage_stats_needs_startup_refresh():
             start_usage_stats_refresh_thread("startup")
+    if SKILL_VERSIONING_ENABLED:
+        inspect_skill_version_changes()
+        threading.Thread(
+            target=skill_version_scheduler,
+            args=(skill_version_scheduler_stop,),
+            name="skill-version-scheduler",
+            daemon=True,
+        ).start()
     print(f"Codex skills manager: http://{args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()
@@ -2428,6 +3235,7 @@ def main() -> int:
         return 0
     finally:
         usage_scheduler_stop.set()
+        skill_version_scheduler_stop.set()
         server.server_close()
     return 0
 
