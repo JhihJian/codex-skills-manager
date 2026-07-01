@@ -19,6 +19,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from session_logs import (
+    compact_snippet,
+    context_role_label,
+    extract_message_text,
+    normalize_context_text,
+    read_session_index as read_codex_session_index,
+    session_files as list_codex_session_files,
+    session_id_from_path,
+)
+from usage_stats import UsageStatsService
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -88,25 +99,6 @@ AUTO_LOCALIZE_ENABLED = os.environ.get("CODEX_SKILL_AUTO_LOCALIZE", "1").strip()
 LOCALIZE_TIMEOUT_SECONDS = int(os.environ.get("CODEX_SKILL_LOCALIZE_TIMEOUT", "240") or "240")
 LOCALIZE_BATCH_SIZE = max(1, int(os.environ.get("CODEX_SKILL_LOCALIZE_BATCH_SIZE", "24") or "24"))
 LOCALIZE_PREVIEW_CHARS = max(400, int(os.environ.get("CODEX_SKILL_LOCALIZE_PREVIEW_CHARS", "2200") or "2200"))
-DEFAULT_USAGE_STALE_DAYS = max(1, int(os.environ.get("CODEX_SKILL_USAGE_STALE_DAYS", "30") or "30"))
-USAGE_REVIEW_MAX_FILES = max(1, int(os.environ.get("CODEX_SKILL_USAGE_MAX_FILES", "1000") or "1000"))
-USAGE_STATS_DAILY_ENABLED = os.environ.get("CODEX_SKILL_USAGE_DAILY_ENABLED", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
-USAGE_STATS_DAILY_HOUR = env_int("CODEX_SKILL_USAGE_DAILY_HOUR", 3, minimum=0, maximum=23)
-USAGE_STATS_DAILY_MINUTE = env_int("CODEX_SKILL_USAGE_DAILY_MINUTE", 0, minimum=0, maximum=59)
-USAGE_STATS_SCOPE = os.environ.get("CODEX_SKILL_USAGE_STATS_SCOPE", "all").strip().lower()
-if USAGE_STATS_SCOPE not in {"enabled", "managed", "all"}:
-    USAGE_STATS_SCOPE = "all"
-USAGE_STATS_INCLUDE_SYSTEM = os.environ.get("CODEX_SKILL_USAGE_STATS_INCLUDE_SYSTEM", "1").strip().lower() not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
 SKILL_VERSIONING_ENABLED = os.environ.get("CODEX_SKILL_VERSIONING_ENABLED", "1").strip().lower() not in {
     "0",
     "false",
@@ -131,9 +123,6 @@ SKILL_VERSION_AUTO_PUSH_ENABLED = os.environ.get("CODEX_SKILL_VERSION_AUTO_PUSH"
 }
 
 REGISTRY_LOCK = threading.RLock()
-USAGE_STATS_LOCK = threading.RLock()
-USAGE_STATS_REFRESH_LOCK = threading.Lock()
-USAGE_STATS_REFRESHING = threading.Event()
 SKILL_VERSION_LOCK = threading.RLock()
 SKILL_VERSION_PENDING_SINCE: datetime | None = None
 SKILL_VERSION_LAST_SIGNATURE = ""
@@ -307,6 +296,19 @@ def safe_child(root: Path, name: str) -> Path:
     if not is_relative_to(candidate, root.resolve()):
         raise ApiError("目标路径越界，已拒绝操作。", HTTPStatus.FORBIDDEN)
     return candidate
+
+
+usage_stats_service = UsageStatsService(
+    stats_file=USAGE_STATS_FILE,
+    sessions_dir=CODEX_SESSIONS_DIR,
+    archived_sessions_dir=CODEX_ARCHIVED_SESSIONS_DIR,
+    session_index_file=SESSION_INDEX_FILE,
+    read_settings=read_settings,
+    write_settings=write_settings,
+    read_registry_state=lambda: read_registry_state(),
+    append_audit=append_audit,
+    safe_skill_name=safe_skill_name,
+)
 
 
 def copytree_clean(src: Path, dest: Path) -> None:
@@ -703,11 +705,11 @@ def read_registry_state() -> dict[str, Any]:
 def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
     skills = [dict(item) for item in registry.get("skills", {}).values()]
     skills.sort(key=lambda item: (not item.get("enabled", False), item.get("category", ""), item.get("name", "")))
-    usage_stats = read_usage_stats()
+    usage_stats = usage_stats_service.read_stats()
     usage_by_name = {item.get("name"): item for item in usage_stats.get("entries", []) if item.get("name")}
     for skill in skills:
         usage_item = usage_by_name.get(skill.get("name"))
-        skill["usage"] = skill_usage_summary(usage_item)
+        skill["usage"] = usage_stats_service.skill_summary(usage_item)
     localized_count = len(
         [
             s
@@ -744,7 +746,7 @@ def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
             "localized": localized_count,
             "unlocalized": len(skills) - localized_count,
         },
-        "usageStats": usage_stats_summary(usage_stats),
+        "usageStats": usage_stats_service.summary(usage_stats),
         "versioning": skill_version_pending_state(),
     }
 
@@ -2204,744 +2206,38 @@ def test_repository_config() -> dict[str, Any]:
     }
 
 
+def settings_view() -> dict[str, Any]:
+    return {
+        "repository": repository_config_view(),
+        "usageStats": usage_stats_service.config(),
+        "versioning": {
+            "enabled": SKILL_VERSIONING_ENABLED,
+            "autoPush": SKILL_VERSION_AUTO_PUSH_ENABLED,
+            "delaySeconds": SKILL_VERSION_COMMIT_DELAY_SECONDS,
+            "scanIntervalSeconds": SKILL_VERSION_SCAN_INTERVAL_SECONDS,
+        },
+        "paths": {
+            "settings": str(SETTINGS_FILE),
+            "usageStats": str(USAGE_STATS_FILE),
+            "sessions": str(CODEX_SESSIONS_DIR),
+            "archivedSessions": str(CODEX_ARCHIVED_SESSIONS_DIR),
+        },
+    }
+
+
+def update_app_settings(body: dict[str, Any]) -> dict[str, Any]:
+    payload = body.get("usageStats") if isinstance(body.get("usageStats"), dict) else body
+    usage_stats_service.update_config(payload)
+    return {"message": "设置已保存。", **settings_view()}
+
+
+
 def read_session_index() -> dict[str, dict[str, Any]]:
-    index: dict[str, dict[str, Any]] = {}
-    if not SESSION_INDEX_FILE.exists():
-        return index
-    with SESSION_INDEX_FILE.open("r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if item.get("id"):
-                index[item["id"]] = item
-    return index
+    return read_codex_session_index(SESSION_INDEX_FILE)
 
 
 def session_files(limit: int = 400) -> list[Path]:
-    files: list[Path] = []
-    for root in (CODEX_SESSIONS_DIR, CODEX_ARCHIVED_SESSIONS_DIR):
-        if root.exists():
-            files.extend([p for p in root.rglob("*.jsonl") if p.is_file()])
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return files[:limit]
-
-
-def session_id_from_path(path: Path) -> str:
-    match = re.search(r"([0-9a-f]{8}-[0-9a-f-]{27,})", path.name)
-    return match.group(1) if match else path.stem
-
-
-INDEXED_MESSAGE_ROLES = {"user", "assistant"}
-INDEXED_CONTENT_TYPES = {"", "text", "input_text", "output_text"}
-LOW_VALUE_ITEM_TYPES = {
-    "function_call",
-    "function_call_output",
-    "tool_call",
-    "tool_call_output",
-    "custom_tool_call",
-    "custom_tool_call_output",
-    "mcp_call",
-    "mcp_tool_call",
-    "mcp_tool_call_output",
-    "web_search_call",
-    "file_search_call",
-    "computer_call",
-    "computer_call_output",
-    "reasoning",
-}
-LOW_VALUE_TEXT_MARKERS = (
-    "dom snapshot",
-    "aria snapshot",
-    "page snapshot",
-    "browser automation",
-    "### page state",
-    "### ran playwright",
-    "mcp__browser",
-    "tool_call",
-    "tool call",
-    "tool output",
-    "function_call",
-    "function call",
-    "function output",
-    "multi_tool_use.parallel",
-    "exec_command",
-    "chunk id:",
-    "wall time:",
-    "process exited with code",
-    "original token count",
-)
-
-
-def normalize_message_role(role: str) -> str:
-    if role == "user_message":
-        return "user"
-    if role == "agent_message":
-        return "assistant"
-    if role in INDEXED_MESSAGE_ROLES:
-        return role
-    return ""
-
-
-def context_role_label(role: str) -> str:
-    return {"user": "用户", "assistant": "助手"}.get(role, role or "正文")
-
-
-def normalize_context_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip().lower()
-
-
-def text_from_content(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, dict):
-        return text_from_content([content])
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                item_type = str(item.get("type") or "").lower()
-                if item_type not in INDEXED_CONTENT_TYPES:
-                    continue
-                parts.append(str(item.get("text") or item.get("input_text") or item.get("output_text") or ""))
-            else:
-                parts.append(str(item))
-        return "\n".join(part for part in parts if part)
-    return ""
-
-
-def looks_like_json_blob(text: str) -> bool:
-    clean = text.strip()
-    if len(clean) < 800:
-        return False
-    if clean[0] in "{[":
-        try:
-            json.loads(clean)
-            return True
-        except json.JSONDecodeError:
-            pass
-    punctuation = sum(clean.count(ch) for ch in '{}[]":,')
-    return punctuation / max(len(clean), 1) > 0.18 and clean.count('"') > 30
-
-
-def looks_like_dom_snapshot(text: str) -> bool:
-    if len(text) < 500:
-        return False
-    if len(re.findall(r"\[ref=e\d+\]", text)) >= 3:
-        return True
-    snapshot_lines = re.findall(r"(?m)^\s*-\s+[a-z][\w-]*(?:\s+\"[^\"]*\")?\s+\[", text)
-    return len(snapshot_lines) >= 5
-
-
-def is_low_value_context_text(text: str) -> bool:
-    clean = text.strip()
-    if not clean:
-        return True
-    lower = clean.lower()
-    if any(marker in lower for marker in LOW_VALUE_TEXT_MARKERS):
-        return True
-    return looks_like_json_blob(clean) or looks_like_dom_snapshot(clean)
-
-
-def extract_message_text(item: dict[str, Any]) -> tuple[str, str]:
-    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-    item_type = item.get("type", "")
-    if item_type == "session_meta":
-        return "", "meta"
-    if item_type == "turn_context":
-        return "", "context"
-    if item_type == "response_item":
-        payload_type = str(payload.get("type") or "").lower()
-        if payload_type in LOW_VALUE_ITEM_TYPES:
-            return "", payload_type
-        if payload.get("type") == "message":
-            role = normalize_message_role(str(payload.get("role") or ""))
-            if not role:
-                return "", str(payload.get("role") or "message")
-            text = text_from_content(payload.get("content"))
-            if is_low_value_context_text(text):
-                return "", role
-            return text, role
-        return "", str(payload.get("type") or item_type)
-    if item_type == "event_msg":
-        if payload.get("type") in {"user_message", "agent_message"}:
-            role = normalize_message_role(str(payload.get("type") or ""))
-            text = str(payload.get("message") or "")
-            if is_low_value_context_text(text):
-                return "", role
-            return text, role
-        return "", str(payload.get("type") or item_type)
-    return "", item_type
-
-
-def compact_snippet(text: str, keyword: str, width: int = 260) -> str:
-    clean = re.sub(r"\s+", " ", text).strip()
-    if len(clean) <= width:
-        return clean
-    pos = clean.lower().find(keyword.lower())
-    if pos < 0:
-        return clean[: width - 1] + "…"
-    start = max(0, pos - width // 3)
-    end = min(len(clean), start + width)
-    prefix = "…" if start else ""
-    suffix = "…" if end < len(clean) else ""
-    return prefix + clean[start:end] + suffix
-
-
-def parse_positive_int(value: Any, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
-    try:
-        number = int(str(value).strip())
-    except (TypeError, ValueError):
-        number = default
-    number = max(minimum, number)
-    if maximum is not None:
-        number = min(number, maximum)
-    return number
-
-
-def parse_timestamp(value: Any) -> datetime | None:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def collect_string_values(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        parts: list[str] = []
-        for item in value.values():
-            parts.extend(collect_string_values(item))
-        return parts
-    if isinstance(value, list):
-        parts = []
-        for item in value:
-            parts.extend(collect_string_values(item))
-        return parts
-    if value is None:
-        return []
-    return [str(value)]
-
-
-def function_call_text(payload: dict[str, Any]) -> str:
-    parts = [str(payload.get("name") or "")]
-    arguments = payload.get("arguments")
-    if isinstance(arguments, str):
-        try:
-            parsed = json.loads(arguments)
-        except json.JSONDecodeError:
-            parts.append(arguments)
-        else:
-            parts.extend(collect_string_values(parsed))
-    else:
-        parts.extend(collect_string_values(arguments))
-    return "\n".join(part for part in parts if part)
-
-
-SKILL_PATH_PATTERNS = [
-    re.compile(r"(?i)(?:^|[\\/])skills[\\/]([^\\/\s\"'`<>|:]+)[\\/]SKILL\.md"),
-    re.compile(r"(?i)(?:^|[\\/])skills[\\/]\.system[\\/]([^\\/\s\"'`<>|:]+)[\\/]SKILL\.md"),
-    re.compile(r"(?i)(?:^|[\\/])skills[\\/](?!\.system[\\/])([^\\/\s\"'`<>|:]+)[\\/]SKILL\.md"),
-    re.compile(r"(?i)(?:^|[\\/])plugins[\\/]cache[\\/].{1,220}?[\\/]skills[\\/]([^\\/\s\"'`<>|:]+)[\\/]SKILL\.md"),
-]
-SKILL_READ_COMMAND_PATTERN = re.compile(
-    r"(?i)\b(Get-Content|gc|type|cat|rg|Select-String|sed|read_text|readText|readFile|open)\b"
-)
-READ_RESOURCE_TOOLS = {"read_mcp_resource"}
-
-
-def skill_names_from_skill_paths(text: str) -> set[str]:
-    normalized = text.replace("/", "\\")
-    names: set[str] = set()
-    for pattern in SKILL_PATH_PATTERNS:
-        for match in pattern.finditer(normalized):
-            try:
-                names.add(safe_skill_name(match.group(1)))
-            except ApiError:
-                continue
-    return names
-
-
-def build_skill_alias_map(registry: dict[str, Any]) -> dict[str, str]:
-    aliases: dict[str, str] = {}
-    ambiguous: set[str] = set()
-
-    def add_alias(alias: str, name: str) -> None:
-        clean = alias.strip().lower()
-        if not clean:
-            return
-        existing = aliases.get(clean)
-        if existing and existing != name:
-            ambiguous.add(clean)
-            aliases.pop(clean, None)
-            return
-        if clean not in ambiguous:
-            aliases[clean] = name
-
-    for name, entry in registry.get("skills", {}).items():
-        add_alias(name, name)
-        if ":" in name:
-            add_alias(name.rsplit(":", 1)[-1], name)
-        frontmatter_name = str(entry.get("frontmatter", {}).get("name") or "").strip()
-        if frontmatter_name:
-            add_alias(frontmatter_name, name)
-    return aliases
-
-
-def canonical_skill_name(raw_name: str, aliases: dict[str, str]) -> str | None:
-    return aliases.get(raw_name.strip().lower())
-
-
-def skill_aliases_for_entry(name: str, entry: dict[str, Any]) -> list[str]:
-    aliases = [name]
-    if ":" in name:
-        aliases.append(name.rsplit(":", 1)[-1])
-    frontmatter_name = str(entry.get("frontmatter", {}).get("name") or "").strip()
-    if frontmatter_name:
-        aliases.append(frontmatter_name)
-    unique: list[str] = []
-    seen: set[str] = set()
-    for alias in aliases:
-        key = alias.lower()
-        if key not in seen:
-            unique.append(alias)
-            seen.add(key)
-    return unique
-
-
-def looks_like_skill_read_call(payload: dict[str, Any], text: str) -> bool:
-    tool_name = str(payload.get("name") or "").strip()
-    if tool_name in READ_RESOURCE_TOOLS:
-        return True
-    return bool(SKILL_READ_COMMAND_PATTERN.search(text))
-
-
-def extract_skill_read_evidence(item: dict[str, Any]) -> tuple[set[str], str]:
-    if item.get("type") != "response_item":
-        return set(), ""
-    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-    if payload.get("type") != "function_call":
-        return set(), ""
-    text = function_call_text(payload)
-    names = skill_names_from_skill_paths(text)
-    if not names or not looks_like_skill_read_call(payload, text):
-        return set(), ""
-    return names, text
-
-
-def is_skill_announcement(text: str, alias: str) -> bool:
-    alias_pattern = re.escape(alias)
-    patterns = [
-        rf"(?i)\b(?:using|use|used)\s+(?:the\s+)?`?{alias_pattern}`?(?:\s+skill)?\b",
-        rf"(?:使用|调用|应用|采用|按|根据).{{0,40}}`?{alias_pattern}`?.{{0,24}}(?:skill|技能)?",
-        rf"`?{alias_pattern}`?.{{0,24}}(?:skill|技能).{{0,40}}(?:使用|调用|应用|读取)",
-        rf"(?i)`?{alias_pattern}`?\s+(?:skill|skills)\b",
-    ]
-    return any(re.search(pattern, text) for pattern in patterns)
-
-
-def extract_skill_announcements(item: dict[str, Any], registry: dict[str, Any]) -> list[tuple[str, str, str]]:
-    text, role = extract_message_text(item)
-    if role != "assistant" or not text:
-        return []
-    matches: list[tuple[str, str, str]] = []
-    for name, entry in registry.get("skills", {}).items():
-        for alias in skill_aliases_for_entry(name, entry):
-            if alias.lower() not in text.lower():
-                continue
-            if is_skill_announcement(text, alias):
-                matches.append((name, alias, text))
-                break
-    return matches
-
-
-def add_usage_evidence(
-    bucket: dict[str, Any],
-    kind: str,
-    evidence: dict[str, Any],
-    *,
-    max_examples: int = 6,
-) -> None:
-    count_key = f"{kind}Count"
-    list_key = f"{kind}Evidence"
-    bucket[count_key] = int(bucket.get(count_key) or 0) + 1
-    event_time = parse_timestamp(evidence.get("time"))
-    session_id = str(evidence.get("sessionId") or "").strip()
-    if session_id:
-        bucket.setdefault(f"{kind}Sessions", set()).add(session_id)
-    if event_time:
-        bucket.setdefault(f"{kind}Days", set()).add(event_time.astimezone().date().isoformat())
-    last_key = f"last{kind.title()}At"
-    current_last = parse_timestamp(bucket.get(last_key))
-    if event_time and (current_last is None or event_time > current_last):
-        bucket[last_key] = event_time.isoformat()
-    examples = bucket.setdefault(list_key, [])
-    if len(examples) < max_examples:
-        examples.append(evidence)
-
-
-def scoped_usage_skills(registry: dict[str, Any], scope: str, include_system: bool) -> dict[str, dict[str, Any]]:
-    selected: dict[str, dict[str, Any]] = {}
-    for name, entry in registry.get("skills", {}).items():
-        if entry.get("status") == "missing":
-            continue
-        if entry.get("system") and not include_system:
-            continue
-        if scope == "enabled" and not entry.get("enabled"):
-            continue
-        if scope == "managed" and not entry.get("managed"):
-            continue
-        selected[name] = entry
-    return selected
-
-
-def build_usage_entry(
-    name: str,
-    entry: dict[str, Any],
-    usage: dict[str, Any],
-    *,
-    cutoff: datetime,
-    now: datetime,
-) -> dict[str, Any]:
-    confirmed_at = parse_timestamp(usage.get("lastConfirmedAt"))
-    announced_at = parse_timestamp(usage.get("lastAnnouncementAt"))
-    if confirmed_at:
-        days_since = max(0, int((now - confirmed_at).total_seconds() // 86400))
-        status = "stale" if confirmed_at < cutoff else "active"
-    elif usage.get("announcementCount"):
-        days_since = None
-        status = "declared-only"
-    else:
-        days_since = None
-        status = "never-used"
-
-    evidence = list(usage.get("confirmedEvidence") or [])
-    announcements = list(usage.get("announcementEvidence") or [])
-    evidence.sort(key=lambda item: str(item.get("time") or ""), reverse=True)
-    announcements.sort(key=lambda item: str(item.get("time") or ""), reverse=True)
-
-    return {
-        "name": name,
-        "title": entry.get("title") or name,
-        "category": entry.get("category") or "未分类",
-        "enabled": bool(entry.get("enabled")),
-        "system": bool(entry.get("system")),
-        "managed": bool(entry.get("managed")),
-        "status": status,
-        "daysSinceLastUsed": days_since,
-        "lastUsedAt": confirmed_at.isoformat() if confirmed_at else "",
-        "lastAnnouncementAt": announced_at.isoformat() if announced_at else "",
-        "confirmedEvidenceCount": int(usage.get("confirmedCount") or 0),
-        "confirmedSessionCount": len(usage.get("confirmedSessions") or []),
-        "confirmedDayCount": len(usage.get("confirmedDays") or []),
-        "announcementEvidenceCount": int(usage.get("announcementCount") or 0),
-        "announcementSessionCount": len(usage.get("announcementSessions") or []),
-        "evidence": evidence,
-        "announcements": announcements,
-    }
-
-
-def review_skill_usage(
-    body: dict[str, Any] | None = None,
-    *,
-    registry: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    body = body or {}
-    stale_days = parse_positive_int(body.get("staleDays"), DEFAULT_USAGE_STALE_DAYS, minimum=1, maximum=3650)
-    max_files = parse_positive_int(body.get("maxFiles"), USAGE_REVIEW_MAX_FILES, minimum=1, maximum=10000)
-    scope = str(body.get("scope") or "enabled").strip().lower()
-    if scope not in {"enabled", "managed", "all"}:
-        scope = "enabled"
-    include_system = normalize_bool(body.get("includeSystem"), default=True)
-
-    if registry is None:
-        registry = read_registry_state()
-    skills = scoped_usage_skills(registry, scope, include_system)
-    aliases = build_skill_alias_map({"skills": skills})
-    usage: dict[str, dict[str, Any]] = {name: {} for name in skills}
-    index = read_session_index()
-    scanned_files = 0
-    scanned_lines = 0
-
-    for file_path in session_files(limit=max_files):
-        scanned_files += 1
-        fallback_session_id = session_id_from_path(file_path)
-        session_id = fallback_session_id
-        meta = index.get(session_id, {})
-        try:
-            with file_path.open("r", encoding="utf-8", errors="replace") as f:
-                for line_number, line in enumerate(f, 1):
-                    scanned_lines += 1
-                    try:
-                        item = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if item.get("type") == "session_meta":
-                        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-                        session_id = str(payload.get("id") or payload.get("session_id") or session_id)
-                        meta = index.get(session_id, meta)
-                        continue
-
-                    event_time = item.get("timestamp", "")
-                    title = meta.get("thread_name") or file_path.stem
-                    raw_names, call_text = extract_skill_read_evidence(item)
-                    for raw_name in raw_names:
-                        name = canonical_skill_name(raw_name, aliases)
-                        if not name or name not in usage:
-                            continue
-                        add_usage_evidence(
-                            usage[name],
-                            "confirmed",
-                            {
-                                "type": "skill-file-read",
-                                "confidence": "confirmed",
-                                "time": event_time,
-                                "sessionId": session_id,
-                                "title": title,
-                                "path": str(file_path),
-                                "line": line_number,
-                                "snippet": compact_snippet(call_text, raw_name, width=300),
-                            },
-                        )
-
-                    for name, alias, text in extract_skill_announcements(item, {"skills": skills}):
-                        if name not in usage:
-                            continue
-                        add_usage_evidence(
-                            usage[name],
-                            "announcement",
-                            {
-                                "type": "assistant-announcement",
-                                "confidence": "supporting",
-                                "time": event_time,
-                                "sessionId": session_id,
-                                "title": title,
-                                "path": str(file_path),
-                                "line": line_number,
-                                "snippet": compact_snippet(text, alias, width=300),
-                            },
-                        )
-        except OSError:
-            continue
-
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(days=stale_days)
-    entries = [
-        build_usage_entry(name, entry, usage.get(name, {}), cutoff=cutoff, now=now)
-        for name, entry in skills.items()
-    ]
-    status_order = {"never-used": 0, "declared-only": 1, "stale": 2, "active": 3}
-    entries.sort(key=lambda item: (status_order.get(item["status"], 9), item["category"], item["name"].lower()))
-    stats = {
-        "reviewed": len(entries),
-        "active": len([item for item in entries if item["status"] == "active"]),
-        "stale": len([item for item in entries if item["status"] == "stale"]),
-        "neverUsed": len([item for item in entries if item["status"] == "never-used"]),
-        "declaredOnly": len([item for item in entries if item["status"] == "declared-only"]),
-    }
-    stats["issues"] = stats["stale"] + stats["neverUsed"] + stats["declaredOnly"]
-    return {
-        "reviewedAt": now_iso(),
-        "staleDays": stale_days,
-        "scope": scope,
-        "includeSystem": include_system,
-        "stats": stats,
-        "entries": entries,
-        "scan": {
-            "maxFiles": max_files,
-            "scannedFiles": scanned_files,
-            "scannedLines": scanned_lines,
-            "sessions": str(CODEX_SESSIONS_DIR),
-            "archivedSessions": str(CODEX_ARCHIVED_SESSIONS_DIR),
-        },
-        "evidencePolicy": "只把助手执行过程中的 SKILL.md 读取工具调用计为真实使用证据；助手明确使用声明仅作为辅助证据。已排除 session_meta、developer 技能列表、用户普通提及和上下文关键词命中。",
-    }
-
-
-def default_usage_stats_payload() -> dict[str, Any]:
-    return {
-        "version": 1,
-        "reviewedAt": "",
-        "staleDays": DEFAULT_USAGE_STALE_DAYS,
-        "scope": USAGE_STATS_SCOPE,
-        "includeSystem": USAGE_STATS_INCLUDE_SYSTEM,
-        "stats": {
-            "reviewed": 0,
-            "active": 0,
-            "stale": 0,
-            "neverUsed": 0,
-            "declaredOnly": 0,
-            "issues": 0,
-        },
-        "entries": [],
-        "scan": {
-            "maxFiles": USAGE_REVIEW_MAX_FILES,
-            "scannedFiles": 0,
-            "scannedLines": 0,
-            "sessions": str(CODEX_SESSIONS_DIR),
-            "archivedSessions": str(CODEX_ARCHIVED_SESSIONS_DIR),
-        },
-        "evidencePolicy": "尚未生成使用统计缓存。",
-    }
-
-
-def read_usage_stats() -> dict[str, Any]:
-    with USAGE_STATS_LOCK:
-        payload = read_json(USAGE_STATS_FILE, default_usage_stats_payload())
-    if not isinstance(payload, dict):
-        payload = default_usage_stats_payload()
-    payload.setdefault("version", 1)
-    payload.setdefault("reviewedAt", "")
-    payload.setdefault("staleDays", DEFAULT_USAGE_STALE_DAYS)
-    payload.setdefault("scope", USAGE_STATS_SCOPE)
-    payload.setdefault("includeSystem", USAGE_STATS_INCLUDE_SYSTEM)
-    payload.setdefault("stats", {})
-    payload.setdefault("entries", [])
-    payload.setdefault("scan", {})
-    payload.setdefault("evidencePolicy", "")
-    return payload
-
-
-def write_usage_stats(payload: dict[str, Any]) -> None:
-    with USAGE_STATS_LOCK:
-        value = {"version": 1, **payload}
-        write_json(USAGE_STATS_FILE, value)
-
-
-def skill_usage_summary(item: dict[str, Any] | None) -> dict[str, Any]:
-    if not item:
-        return {
-            "status": "unknown",
-            "lastUsedAt": "",
-            "daysSinceLastUsed": None,
-            "confirmedEvidenceCount": 0,
-            "confirmedSessionCount": 0,
-            "confirmedDayCount": 0,
-            "announcementEvidenceCount": 0,
-            "announcementSessionCount": 0,
-        }
-    return {
-        "status": item.get("status") or "unknown",
-        "lastUsedAt": item.get("lastUsedAt") or "",
-        "lastAnnouncementAt": item.get("lastAnnouncementAt") or "",
-        "daysSinceLastUsed": item.get("daysSinceLastUsed"),
-        "confirmedEvidenceCount": int(item.get("confirmedEvidenceCount") or 0),
-        "confirmedSessionCount": int(item.get("confirmedSessionCount") or 0),
-        "confirmedDayCount": int(item.get("confirmedDayCount") or 0),
-        "announcementEvidenceCount": int(item.get("announcementEvidenceCount") or 0),
-        "announcementSessionCount": int(item.get("announcementSessionCount") or 0),
-    }
-
-
-def usage_stats_summary(payload: dict[str, Any]) -> dict[str, Any]:
-    reviewed_at = str(payload.get("reviewedAt") or "")
-    reviewed_dt = parse_timestamp(reviewed_at)
-    now = datetime.now(timezone.utc)
-    age_hours = None
-    if reviewed_dt:
-        age_hours = max(0, round((now - reviewed_dt).total_seconds() / 3600, 1))
-    return {
-        "reviewedAt": reviewed_at,
-        "ageHours": age_hours,
-        "staleDays": payload.get("staleDays", DEFAULT_USAGE_STALE_DAYS),
-        "scope": payload.get("scope") or USAGE_STATS_SCOPE,
-        "includeSystem": bool(payload.get("includeSystem", USAGE_STATS_INCLUDE_SYSTEM)),
-        "stats": payload.get("stats") or {},
-        "scan": payload.get("scan") or {},
-        "refreshing": USAGE_STATS_REFRESHING.is_set(),
-        "dailyEnabled": USAGE_STATS_DAILY_ENABLED,
-        "dailyTime": f"{USAGE_STATS_DAILY_HOUR:02d}:{USAGE_STATS_DAILY_MINUTE:02d}",
-    }
-
-
-def refresh_usage_stats(*, reason: str = "manual", body: dict[str, Any] | None = None) -> dict[str, Any]:
-    if not USAGE_STATS_REFRESH_LOCK.acquire(blocking=False):
-        payload = read_usage_stats()
-        payload["refreshing"] = True
-        payload["message"] = "使用统计正在刷新。"
-        return payload
-    USAGE_STATS_REFRESHING.set()
-    try:
-        request_body = {
-            "staleDays": DEFAULT_USAGE_STALE_DAYS,
-            "maxFiles": USAGE_REVIEW_MAX_FILES,
-            "scope": USAGE_STATS_SCOPE,
-            "includeSystem": USAGE_STATS_INCLUDE_SYSTEM,
-        }
-        if body:
-            request_body.update(body)
-        payload = review_skill_usage(request_body)
-        payload["reason"] = reason
-        write_usage_stats(payload)
-        append_audit(
-            "refresh-usage-stats",
-            {
-                "reason": reason,
-                "reviewed": payload.get("stats", {}).get("reviewed", 0),
-                "active": payload.get("stats", {}).get("active", 0),
-                "issues": payload.get("stats", {}).get("issues", 0),
-                "scannedFiles": payload.get("scan", {}).get("scannedFiles", 0),
-            },
-        )
-        return payload
-    finally:
-        USAGE_STATS_REFRESHING.clear()
-        USAGE_STATS_REFRESH_LOCK.release()
-
-
-def seconds_until_next_usage_refresh() -> float:
-    now = datetime.now().astimezone()
-    target = now.replace(
-        hour=USAGE_STATS_DAILY_HOUR,
-        minute=USAGE_STATS_DAILY_MINUTE,
-        second=0,
-        microsecond=0,
-    )
-    if target <= now:
-        target += timedelta(days=1)
-    return max(60.0, (target - now).total_seconds())
-
-
-def usage_stats_scheduler(stop_event: threading.Event) -> None:
-    while not stop_event.wait(seconds_until_next_usage_refresh()):
-        try:
-            refresh_usage_stats(reason="daily")
-        except Exception as exc:  # noqa: BLE001
-            append_audit("refresh-usage-stats-failed", {"reason": "daily", "error": str(exc)})
-
-
-def usage_stats_needs_startup_refresh() -> bool:
-    if not USAGE_STATS_DAILY_ENABLED:
-        return False
-    if not USAGE_STATS_FILE.exists():
-        return True
-    reviewed_at = parse_timestamp(read_usage_stats().get("reviewedAt"))
-    if not reviewed_at:
-        return True
-    return datetime.now(timezone.utc) - reviewed_at > timedelta(hours=25)
-
-
-def start_usage_stats_refresh_thread(reason: str) -> threading.Thread:
-    thread = threading.Thread(
-        target=lambda: refresh_usage_stats(reason=reason),
-        name=f"usage-stats-{reason}",
-        daemon=True,
-    )
-    thread.start()
-    return thread
+    return list_codex_session_files(CODEX_SESSIONS_DIR, CODEX_ARCHIVED_SESSIONS_DIR, limit=limit)
 
 
 def search_skill_contexts(name: str, query: dict[str, list[str]]) -> dict[str, Any]:
@@ -3104,6 +2400,12 @@ class Handler(SimpleHTTPRequestHandler):
             if method == "GET" and path == "/api/versioning":
                 self.send_json(read_version_status())
                 return True
+            if method == "GET" and path == "/api/settings":
+                self.send_json(settings_view())
+                return True
+            if method == "PUT" and path == "/api/settings":
+                self.send_json(update_app_settings(self.read_body()))
+                return True
             if method == "GET" and path == "/api/repository":
                 self.send_json(repository_config_view())
                 return True
@@ -3130,13 +2432,13 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(localize_skills(self.read_body()))
                 return True
             if method == "POST" and path == "/api/reviews/usage":
-                self.send_json(review_skill_usage(self.read_body()))
+                self.send_json(usage_stats_service.review(self.read_body()))
                 return True
             if method == "GET" and path == "/api/usage-stats":
-                self.send_json(read_usage_stats())
+                self.send_json(usage_stats_service.read_stats())
                 return True
             if method == "POST" and path == "/api/usage-stats/refresh":
-                self.send_json(refresh_usage_stats(reason="manual", body=self.read_body()))
+                self.send_json(usage_stats_service.refresh(reason="manual", body=self.read_body()))
                 return True
             if method == "POST" and path == "/api/install":
                 self.send_json(install_skill(self.read_body()))
@@ -3211,15 +2513,14 @@ def main() -> int:
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     usage_scheduler_stop = threading.Event()
     skill_version_scheduler_stop = threading.Event()
-    if USAGE_STATS_DAILY_ENABLED:
-        threading.Thread(
-            target=usage_stats_scheduler,
-            args=(usage_scheduler_stop,),
-            name="usage-stats-scheduler",
-            daemon=True,
-        ).start()
-        if usage_stats_needs_startup_refresh():
-            start_usage_stats_refresh_thread("startup")
+    threading.Thread(
+        target=usage_stats_service.scheduler,
+        args=(usage_scheduler_stop,),
+        name="usage-stats-scheduler",
+        daemon=True,
+    ).start()
+    if usage_stats_service.needs_startup_refresh():
+        usage_stats_service.start_refresh_thread("startup")
     if SKILL_VERSIONING_ENABLED:
         inspect_skill_version_changes()
         threading.Thread(

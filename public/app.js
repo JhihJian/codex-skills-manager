@@ -399,6 +399,7 @@ function usageCountText(usage) {
 
 function usageStatsUpdatedText() {
   const usageStats = state.data?.usageStats || {};
+  if (usageStats.enabled === false) return "使用统计已关闭";
   if (!usageStats.reviewedAt) return "使用统计尚未生成";
   const age = usageStats.ageHours;
   const ageText = typeof age === "number" ? `，约 ${age} 小时前` : "";
@@ -920,7 +921,7 @@ function renderStats() {
   $("enabledCount").textContent = stats.enabled;
   $("managedCount").textContent = stats.managed;
   $("systemCount").textContent = stats.system;
-  $("usedCount").textContent = (usageSummary.active || 0) + (usageSummary.stale || 0);
+  $("usedCount").textContent = usageStats.enabled === false ? "关" : (usageSummary.active || 0) + (usageSummary.stale || 0);
   const repositoryUrl = repositoryWebUrl(state.data.paths.remote || state.repository?.remote || state.repository?.skillsRepoUrl);
   const libraryPath = $("libraryPath");
   if (repositoryUrl) {
@@ -933,7 +934,9 @@ function renderStats() {
     libraryPath.title = state.data.paths.library;
   }
   $("codexPath").textContent = state.data.paths.codexSkills;
-  const usageText = usageStats.refreshing ? "使用统计刷新中" : usageStatsUpdatedText();
+  const usageText = usageStats.enabled !== false && usageStats.refreshing ? "使用统计刷新中" : usageStatsUpdatedText();
+  $("usageRefreshButton").disabled = usageStats.enabled === false;
+  $("usageRefreshButton").title = usageStats.enabled === false ? "使用统计已关闭，可在设置页开启" : "刷新技能使用频率统计";
   const versionText = versioningStatusText();
   $("updatedAt").textContent = state.data.updatedAt ? `同步 ${state.data.updatedAt} · ${usageText} · ${versionText}` : `${usageText} · ${versionText}`;
   const codex = state.data.codex;
@@ -1063,6 +1066,10 @@ async function localizeSkills(force = false) {
 }
 
 async function refreshUsageStats() {
+  if (state.data?.usageStats?.enabled === false) {
+    setStatus("使用统计已关闭，可在设置页开启");
+    return;
+  }
   $("usageRefreshButton").disabled = true;
   setStatusBusy(true);
   setStatus("正在刷新技能使用频率");
@@ -1079,7 +1086,7 @@ async function refreshUsageStats() {
     setStatus(`使用统计已刷新：确认使用 ${(stats.active || 0) + (stats.stale || 0)} 个，需关注 ${stats.issues || 0} 个`);
   } finally {
     setStatusBusy(false);
-    $("usageRefreshButton").disabled = false;
+    $("usageRefreshButton").disabled = state.data?.usageStats?.enabled === false;
   }
 }
 

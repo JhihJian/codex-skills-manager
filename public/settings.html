@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Skills 设置</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <svg class="icon-sprite" aria-hidden="true">
+      <symbol id="icon-arrow-left" viewBox="0 0 24 24">
+        <path d="M19 12H5" />
+        <path d="m12 19-7-7 7-7" />
+      </symbol>
+      <symbol id="icon-settings" viewBox="0 0 24 24">
+        <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
+        <path d="M19.4 15a1.9 1.9 0 0 0 .4 2.1l.1.1a2.3 2.3 0 0 1-3.2 3.2l-.1-.1a1.9 1.9 0 0 0-2.1-.4 1.9 1.9 0 0 0-1.1 1.7V22a2.3 2.3 0 0 1-4.6 0v-.2a1.9 1.9 0 0 0-1.1-1.7 1.9 1.9 0 0 0-2.1.4l-.1.1a2.3 2.3 0 0 1-3.2-3.2l.1-.1a1.9 1.9 0 0 0 .4-2.1 1.9 1.9 0 0 0-1.7-1.1H2a2.3 2.3 0 0 1 0-4.6h.2a1.9 1.9 0 0 0 1.7-1.1 1.9 1.9 0 0 0-.4-2.1l-.1-.1A2.3 2.3 0 0 1 6.6 3l.1.1a1.9 1.9 0 0 0 2.1.4A1.9 1.9 0 0 0 9.9 1.8V2a2.3 2.3 0 0 1 4.6 0v.2a1.9 1.9 0 0 0 1.1 1.7 1.9 1.9 0 0 0 2.1-.4l.1-.1A2.3 2.3 0 0 1 21 6.6l-.1.1a1.9 1.9 0 0 0-.4 2.1 1.9 1.9 0 0 0 1.7 1.1h.2a2.3 2.3 0 0 1 0 4.6h-.2a1.9 1.9 0 0 0-1.7.9Z" />
+      </symbol>
+    </svg>
+    <div class="window settings-window">
+      <header class="titlebar">
+        <div class="traffic" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div class="title">
+          <strong>Skills 设置</strong>
+          <span id="settingsPageStatus">准备就绪</span>
+        </div>
+        <div class="toolbar">
+          <a class="icon-button" href="/" title="返回技能管理" aria-label="返回技能管理"><svg><use href="#icon-arrow-left"></use></svg></a>
+        </div>
+      </header>
+
+      <main class="settings-shell">
+        <aside class="settings-nav" aria-label="设置分组">
+          <div class="review-nav-head">
+            <span>设置</span>
+            <strong>2</strong>
+          </div>
+          <button class="review-type active" type="button" data-section="usage">
+            <svg aria-hidden="true"><use href="#icon-settings"></use></svg>
+            <span>
+              <strong>使用统计</strong>
+              <small>频率分析与刷新策略</small>
+            </span>
+          </button>
+          <button class="review-type" type="button" data-section="paths">
+            <svg aria-hidden="true"><use href="#icon-settings"></use></svg>
+            <span>
+              <strong>路径</strong>
+              <small>本机文件位置</small>
+            </span>
+          </button>
+        </aside>
+
+        <section class="settings-workspace" aria-live="polite">
+          <div class="settings-head">
+            <div>
+              <h1 id="settingsTitle">使用统计</h1>
+              <p id="settingsDescription">配置 skills 使用频率分析统计是否启用，以及缓存刷新时读取哪些本机会话。</p>
+            </div>
+            <button id="saveSettingsButton" class="primary-button">保存设置</button>
+          </div>
+
+          <div class="settings-panel" id="usageSettingsPanel">
+            <div class="setting-row">
+              <div>
+                <strong>启用使用频率分析</strong>
+                <span>关闭后主页面不再展示使用次数，手动刷新和启动刷新都会跳过。</span>
+              </div>
+              <label class="switch">
+                <input id="usageEnabled" type="checkbox" />
+                <span></span>
+              </label>
+            </div>
+
+            <div class="setting-row">
+              <div>
+                <strong>每日自动刷新</strong>
+                <span>只在本地管理服务运行期间生效，不注册系统计划任务。</span>
+              </div>
+              <label class="switch">
+                <input id="usageDailyEnabled" type="checkbox" />
+                <span></span>
+              </label>
+            </div>
+
+            <div class="settings-grid">
+              <label>
+                <span>每日刷新小时</span>
+                <input id="usageDailyHour" type="number" min="0" max="23" />
+              </label>
+              <label>
+                <span>每日刷新分钟</span>
+                <input id="usageDailyMinute" type="number" min="0" max="59" />
+              </label>
+              <label>
+                <span>长期未用阈值</span>
+                <input id="usageStaleDays" type="number" min="1" max="3650" />
+              </label>
+              <label>
+                <span>最大扫描文件数</span>
+                <input id="usageMaxFiles" type="number" min="1" max="10000" />
+              </label>
+              <label>
+                <span>统计范围</span>
+                <select id="usageScope">
+                  <option value="enabled">已启用</option>
+                  <option value="managed">项目库纳管</option>
+                  <option value="all">全部</option>
+                </select>
+              </label>
+              <label class="checkbox-label settings-checkbox">
+                <input id="usageIncludeSystem" type="checkbox" />
+                <span>包含系统技能</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-panel" id="pathsSettingsPanel" hidden>
+            <dl class="settings-paths" id="settingsPaths"></dl>
+          </div>
+        </section>
+      </main>
+
+      <footer class="statusbar">
+        <span class="status-left">
+          <span class="status-spinner" id="statusSpinner" aria-hidden="true" hidden></span>
+          <span id="statusText">准备就绪</span>
+        </span>
+        <span id="updatedAt"></span>
+      </footer>
+    </div>
+    <script src="/settings.js" type="module"></script>
+  </body>
+</html>

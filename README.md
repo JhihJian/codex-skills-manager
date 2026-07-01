@@ -10,7 +10,7 @@
 - 在独立 skills 仓库根目录的 `codex-skills-manager.sqlite3` 记录技能来源、分类、标签、依赖、启用状态、备注和同步时间。
 - 顶部“自动分类”按钮会对当前未分类技能补跑识别；按住 Shift 点击该按钮可以强制重分已有分类。
 - 顶部“中文信息”按钮会为英文或中英混合的 skill 生成中文名称和中文触发条件，并保存到 registry 的本地化元数据；左侧可以在“中文/原文”视图间切换，详情页“中文”页签支持查看、生成和手动修正。该功能不修改原始 `SKILL.md`。
-- 管理台会常态展示技能使用频率。服务运行期间每天定时扫描一次本机 Codex 会话，结果缓存到 `data/usage-stats.json`；列表右侧显示确认使用次数和最近使用时间，详情页展示使用次数、涉及会话、使用天数和统计时间。顶部“使用统计”按钮可手动刷新。
+- 管理台可以展示技能使用频率。该功能已模块化为独立统计服务，可在“设置”页单独开启或关闭；开启后服务运行期间每天定时扫描一次本机 Codex 会话，结果缓存到 `data/usage-stats.json`。顶部“使用统计”按钮可手动刷新。
 - 用户点击“检索上下文”后读取本机 Codex 会话 JSONL，快速查看某个 skill 在会话中的上下文片段，用于判断技能是否有效；切换到上下文页不会自动扫描会话。检索结果优先展示按会话、角色和正文去重后的用户/助手正文，并过滤工具调用、函数调用输出、DOM 快照、浏览器自动化日志和长 JSON 工具输出等低价值片段。
 - 顶部“技能审查”入口会打开独立问题审查页，用于扩展多个 skills 常见问题审查项；当前支持按需扫描本机 Codex 会话 JSONL，识别长期未真实触发使用的技能。审查不会把系统注入的技能列表、用户普通提及或上下文关键词命中当作使用；默认只有助手执行过程中的 `SKILL.md` 读取工具调用计为真实使用证据，助手明确使用某技能的声明仅作为辅助证据。
 - 详情页“版本”页签会从 Git 提交记录展示当前 skill 的历史版本、提交时间、作者、提交说明和涉及文件的增删统计；如果仓库还没有提交记录，会在首次提交后开始展示。
@@ -111,6 +111,8 @@ C:\Users\user\.codex\skills\.system\skill-installer\scripts\install-skill-from-g
 - `data/audit-log.jsonl`：安装、启用、停用、自动纳管、资料编辑的审计记录。
 - `public/`：管理页面前端。
 - `app.py`：本地 API 与静态文件服务器。
+- `usage_stats.py`：技能使用频率分析、缓存、设置和调度服务。
+- `session_logs.py`：Codex 会话 JSONL 读取、正文抽取和低价值内容过滤等共享逻辑。
 
 ## 技能版本记录
 
@@ -194,22 +196,35 @@ codex exec --ephemeral --output-schema <schema> --output-last-message <file>
 
 ## 使用频率统计
 
-主页面常态展示最近一次使用统计缓存。统计口径与“技能审查”一致：只有助手执行过程中的 `SKILL.md` 读取工具调用计为确认使用证据，助手声明“使用某技能”只作为辅助证据。确认使用次数用于衡量触发频率，涉及会话和使用天数用于避免同一会话内重复读取造成误判。
+主页面在启用后展示最近一次使用统计缓存。统计口径与“技能审查”一致：只有助手执行过程中的 `SKILL.md` 读取工具调用计为确认使用证据，助手声明“使用某技能”只作为辅助证据。确认使用次数用于衡量触发频率，涉及会话和使用天数用于避免同一会话内重复读取造成误判。
 
-服务启动后会创建一个本地后台线程，在每天固定时间刷新 `data/usage-stats.json`。如果缓存不存在或超过 25 小时未更新，服务启动时会自动触发一次后台刷新。该调度只在本地管理服务运行期间生效，不会注册 Windows 计划任务。
+设置页位于：
+
+```text
+http://127.0.0.1:8876/settings.html
+```
+
+在设置页可以单独配置使用频率分析是否开启、是否每日自动刷新、刷新时间、扫描范围、是否包含系统技能、长期未用阈值和最大扫描文件数。页面配置写入 `data/settings.json` 的 `usageStats` 字段。
+
+开启“每日自动刷新”后，服务启动时会创建一个本地后台线程，在每天固定时间刷新 `data/usage-stats.json`。如果缓存不存在或超过 25 小时未更新，服务启动时会自动触发一次后台刷新。该调度只在本地管理服务运行期间生效，不会注册 Windows 计划任务。关闭使用频率分析后，主页面不再展示使用次数，手动刷新接口和后台调度都会跳过扫描。
 
 可用接口：
 
+- `GET /api/settings`：读取设置页使用的配置视图。
+- `PUT /api/settings`：保存使用统计配置；请求体支持 `usageStats`，字段包括 `enabled`、`dailyEnabled`、`dailyHour`、`dailyMinute`、`staleDays`、`maxFiles`、`scope`、`includeSystem`。
 - `GET /api/usage-stats`：读取当前使用统计缓存。
 - `POST /api/usage-stats/refresh`：立即刷新使用统计缓存；请求体可覆盖 `staleDays`、`maxFiles`、`scope`、`includeSystem`。
 
 可用环境变量：
 
+- `CODEX_SKILL_USAGE_STATS_ENABLED=0`：默认关闭使用频率分析；仍可在设置页重新开启。
 - `CODEX_SKILL_USAGE_DAILY_ENABLED=0`：关闭服务内每日自动统计；手动刷新接口仍可使用。
 - `CODEX_SKILL_USAGE_DAILY_HOUR=3`：每日统计小时，取值 0-23。
 - `CODEX_SKILL_USAGE_DAILY_MINUTE=0`：每日统计分钟，取值 0-59。
 - `CODEX_SKILL_USAGE_STATS_SCOPE=all`：主页面统计范围，可选 `enabled`、`managed`、`all`。
 - `CODEX_SKILL_USAGE_STATS_INCLUDE_SYSTEM=1`：主页面统计是否包含系统技能。
+- `CODEX_SKILL_USAGE_STALE_DAYS=30`：默认长期未用阈值，单位天。
+- `CODEX_SKILL_USAGE_MAX_FILES=1000`：一次统计最多扫描的会话 JSONL 文件数。
 
 ## 技能审查
 
