@@ -179,6 +179,9 @@ class UsageStatsService:
             value = {"version": 1, **payload}
             write_json(self.stats_file, value)
 
+    def is_refreshing(self) -> bool:
+        return self._refreshing.is_set()
+
     def skill_summary(self, item: dict[str, Any] | None) -> dict[str, Any]:
         if not item:
             return {
@@ -319,12 +322,28 @@ class UsageStatsService:
             "declaredOnly": len([item for item in entries if item["status"] == "declared-only"]),
         }
         stats["issues"] = stats["stale"] + stats["neverUsed"] + stats["declaredOnly"]
+        warnings: list[dict[str, str]] = []
+        if not entries:
+            warnings.append(
+                {
+                    "code": "empty-scope",
+                    "message": "当前审查范围内没有技能，请切换范围或启用技能后再判断。",
+                }
+            )
+        if scanned_files == 0:
+            warnings.append(
+                {
+                    "code": "no-session-files",
+                    "message": "没有扫描到会话文件，结果只能说明缺少证据，不能证明技能从未使用。",
+                }
+            )
         return {
             "reviewedAt": now_iso(),
             "staleDays": stale_days,
             "scope": scope,
             "includeSystem": include_system,
             "stats": stats,
+            "warnings": warnings,
             "entries": entries,
             "scan": {
                 "maxFiles": max_files,

@@ -41,6 +41,24 @@ function renderUsageSettings() {
   applyUsageEnabledState();
 }
 
+function repositoryStatusText() {
+  const repository = state.settings?.repository || {};
+  const parts = [
+    repository.exists ? "目录已存在" : "目录未创建",
+    repository.git ? "Git 已初始化" : "Git 未初始化",
+  ];
+  if (repository.branch) parts.push(`分支 ${repository.branch}`);
+  if (repository.remote) parts.push(`remote ${repository.remote}`);
+  return parts.join(" · ");
+}
+
+function renderRepositorySettings() {
+  const repository = state.settings?.repository || {};
+  $("repositoryUrl").value = repository.skillsRepoUrl || repository.remote || "";
+  $("repositoryDir").value = repository.skillsRepoDir || "";
+  $("repositoryStatus").textContent = repositoryStatusText();
+}
+
 function renderPaths() {
   const paths = state.settings?.paths || {};
   const repository = state.settings?.repository || {};
@@ -72,12 +90,16 @@ function applyUsageEnabledState() {
 
 function renderSection() {
   const usageActive = state.section === "usage";
-  $("settingsTitle").textContent = usageActive ? "使用统计" : "路径";
+  const repositoryActive = state.section === "repository";
+  $("settingsTitle").textContent = usageActive ? "使用统计" : repositoryActive ? "仓库" : "路径";
   $("settingsDescription").textContent = usageActive
     ? "配置 skills 使用频率分析统计是否启用，以及缓存刷新时读取哪些本机会话。"
-    : "查看当前设置文件、统计缓存和本机会话目录。";
+    : repositoryActive
+      ? "配置独立 skills 仓库地址和本地目录。"
+      : "查看当前设置文件、统计缓存和本机会话目录。";
   $("usageSettingsPanel").hidden = !usageActive;
-  $("pathsSettingsPanel").hidden = usageActive;
+  $("repositorySettingsPanel").hidden = !repositoryActive;
+  $("pathsSettingsPanel").hidden = usageActive || repositoryActive;
   $("saveSettingsButton").hidden = !usageActive;
   document.querySelectorAll(".review-type").forEach((button) => {
     button.classList.toggle("active", button.dataset.section === state.section);
@@ -86,6 +108,7 @@ function renderSection() {
 
 function render() {
   renderUsageSettings();
+  renderRepositorySettings();
   renderPaths();
   renderSection();
 }
@@ -132,6 +155,48 @@ async function saveSettings() {
   }
 }
 
+async function saveRepositorySettings() {
+  $("saveRepositoryButton").disabled = true;
+  $("testRepositoryButton").disabled = true;
+  setStatusBusy(true);
+  setStatus("正在保存仓库配置");
+  try {
+    const payload = await api("/api/repository", {
+      method: "PUT",
+      body: JSON.stringify({
+        skillsRepoUrl: $("repositoryUrl").value.trim(),
+        skillsRepoDir: $("repositoryDir").value.trim(),
+      }),
+    });
+    state.settings = { ...state.settings, repository: payload.repository };
+    render();
+    setStatus(payload.message || "仓库配置已保存");
+  } finally {
+    setStatusBusy(false);
+    $("saveRepositoryButton").disabled = false;
+    $("testRepositoryButton").disabled = false;
+  }
+}
+
+async function testRepositorySettings() {
+  $("testRepositoryButton").disabled = true;
+  setStatusBusy(true);
+  setStatus("正在测试仓库提交和推送");
+  try {
+    const payload = await api("/api/repository/test", { method: "POST", body: "{}" });
+    state.settings = { ...state.settings, repository: payload.repository };
+    render();
+    const result = payload.result || {};
+    const push = result.push || {};
+    const commitText = result.committed ? `提交 ${result.commit || ""}` : result.message || "没有需要提交的变更";
+    const pushText = push.pushed ? "，已推送" : push.error ? `，推送失败：${push.error}` : "";
+    setStatus(`${commitText}${pushText}`);
+  } finally {
+    setStatusBusy(false);
+    $("testRepositoryButton").disabled = false;
+  }
+}
+
 function bindEvents() {
   document.querySelectorAll(".review-type").forEach((button) => {
     button.addEventListener("click", () => {
@@ -141,6 +206,8 @@ function bindEvents() {
   });
   $("usageEnabled").addEventListener("change", applyUsageEnabledState);
   $("saveSettingsButton").addEventListener("click", () => saveSettings().catch((error) => setStatus(error.message)));
+  $("saveRepositoryButton").addEventListener("click", () => saveRepositorySettings().catch((error) => setStatus(error.message)));
+  $("testRepositoryButton").addEventListener("click", () => testRepositorySettings().catch((error) => setStatus(error.message)));
 }
 
 bindEvents();

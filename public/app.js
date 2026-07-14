@@ -19,6 +19,8 @@ const state = {
   historySkill: null,
   historyCache: new Map(),
   historyLoading: false,
+  githubSources: null,
+  githubSourcesLoading: false,
   repository: null,
 };
 
@@ -32,6 +34,10 @@ function setStatusBusy(busy) {
   $("statusSpinner").hidden = !busy;
   $("statusText").classList.toggle("status-busy-text", busy);
   $("statusText").setAttribute("aria-busy", busy ? "true" : "false");
+}
+
+function clearGithubSourcesCache() {
+  state.githubSources = null;
 }
 
 async function api(path, options = {}) {
@@ -303,6 +309,7 @@ function visibleSkills() {
   const unusedDays = usageStatsEnabled() ? unusedFilterDays(state.usageFilter) : null;
   const skills = state.data.skills.filter((skill) => {
     const usage = skillUsage(skill);
+    const lifecycle = skillLifecycle(skill);
     if (state.filter === "enabled" && !skill.enabled) return false;
     if (state.filter === "managed" && !skill.managed) return false;
     if (state.filter === "system" && !skill.system) return false;
@@ -320,6 +327,9 @@ function visibleSkills() {
       usageStatusLabel(usage.status),
       usageCountText(usage),
       usage.lastUsedAt,
+      lifecycle.lastEnabledAt,
+      lifecycle.lastDisabledAt,
+      disabledDurationLabel(skill),
       (skill.tags || []).join(" "),
       (skill.dependencies || []).join(" "),
       JSON.stringify(skill.source || {}),
@@ -409,6 +419,19 @@ function formatRelativeUsage(item) {
 
 function skillUsage(skill) {
   return skill?.usage && typeof skill.usage === "object" ? skill.usage : { status: "unknown" };
+}
+
+function skillLifecycle(skill) {
+  return skill?.lifecycle && typeof skill.lifecycle === "object" ? skill.lifecycle : {};
+}
+
+function disabledDurationLabel(skill) {
+  if (!skill || skill.enabled) return "";
+  const lifecycle = skillLifecycle(skill);
+  if (!lifecycle.lastDisabledAt) return "";
+  return lifecycle.disabledSeconds === null || lifecycle.disabledSeconds === undefined
+    ? "已停用"
+    : `停用 ${formatLifecycleDuration(lifecycle.disabledSeconds)}`;
 }
 
 function usageStatsEnabled() {
@@ -503,6 +526,25 @@ function formatDuration(seconds) {
   return rest ? `${hours} 小时 ${rest} 分钟` : `${hours} 小时`;
 }
 
+function formatLifecycleDuration(seconds) {
+  const value = Number(seconds || 0);
+  if (!Number.isFinite(value) || value <= 0) return "不到 1 分钟";
+  const minutes = Math.floor(value / 60);
+  if (minutes < 60) return `${Math.max(1, minutes)} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时`;
+  const days = Math.floor(hours / 24);
+  const restHours = hours % 24;
+  if (days < 30) return restHours ? `${days} 天 ${restHours} 小时` : `${days} 天`;
+  const months = Math.floor(days / 30);
+  const restDays = days % 30;
+  if (months < 12) return restDays ? `${months} 个月 ${restDays} 天` : `${months} 个月`;
+  const years = Math.floor(days / 365);
+  const yearRestDays = days % 365;
+  const yearRestMonths = Math.floor(yearRestDays / 30);
+  return yearRestMonths ? `${years} 年 ${yearRestMonths} 个月` : `${years} 年`;
+}
+
 function versioningStatusText() {
   const versioning = state.data?.versioning || {};
   if (!versioning.enabled) return "版本自动提交已关闭";
@@ -565,6 +607,23 @@ function changeStatusLabel(status) {
   if (status.includes("M")) return "修改";
   if (status.includes("R")) return "重命名";
   return status || "变更";
+}
+
+function remoteStatusLabel(status) {
+  if (status === "up-to-date") return "已同步";
+  if (status === "updated") return "有更新";
+  if (status === "missing-remote") return "远端缺失";
+  if (status === "not-github") return "非 GitHub";
+  if (status === "unknown") return "待确认";
+  if (status === "error") return "检查失败";
+  return status || "未知";
+}
+
+function remoteStatusTone(status) {
+  if (status === "updated") return "orange";
+  if (status === "up-to-date") return "green";
+  if (["missing-remote", "error"].includes(status)) return "red";
+  return "";
 }
 
 function renderDiffText(diff) {
@@ -690,6 +749,7 @@ function renderRows() {
       meta.appendChild(badge(skill.category || "未分类"));
       meta.appendChild(badge(usageStatusLabel(usage.status), usageStatusTone(usage.status)));
       if (skill.enabled) meta.appendChild(badge("启用", "green"));
+      if (!skill.enabled && skillLifecycle(skill).lastDisabledAt) meta.appendChild(badge(disabledDurationLabel(skill), "orange"));
       if (skill.system) meta.appendChild(badge("系统", "orange"));
       if (skill.managed) meta.appendChild(badge("纳管", "blue"));
       if (hasLocalization(skill)) meta.appendChild(badge("中文", "green"));
@@ -837,6 +897,129 @@ async function loadPendingDiff(path) {
   code.replaceChildren(...renderDiffText(payload.diff || ""));
 }
 
+function resetGithubSourcesPanel() {
+  $("githubSourcesSummary").textContent = "检查 GitHub 来源后展示仓库、技能和更新状态。";
+  $("githubSourcesList").replaceChildren();
+  $("remoteDiff").hidden = true;
+  $("remoteDiff").querySelector("code").replaceChildren();
+  $("githubSourcesRefreshButton").disabled = false;
+}
+
+function renderGithubSources(payload) {
+  const repositories = payload?.repositories || [];
+  const totalSkills = repositories.reduce((sum, repo) => sum + Number(repo.counts?.total || 0), 0);
+  const updatedSkills = repositories.reduce((sum, repo) => sum + Number(repo.counts?.updated || 0), 0);
+  const checkedAt = payload?.checkedAt ? ` · ${formatDateTime(payload.checkedAt)}` : "";
+  $("githubSourcesSummary").textContent = repositories.length
+    ? `${repositories.length} 个 GitHub 仓库，${totalSkills} 个技能，${updatedSkills} 个有更新${checkedAt}`
+    : "当前项目库没有登记 GitHub 来源的技能。";
+  $("remoteDiff").hidden = true;
+  $("remoteDiff").querySelector("code").replaceChildren();
+  $("githubSourcesList").replaceChildren(
+    ...repositories.map((repo) => {
+      const article = document.createElement("article");
+      article.className = "source-group";
+      const head = document.createElement("div");
+      head.className = "source-group-head";
+      const title = document.createElement("div");
+      const strong = document.createElement("strong");
+      strong.textContent = repo.repo || "未知仓库";
+      const meta = document.createElement("span");
+      const pushedAt = repo.remote?.pushedAt ? ` · 最近 push ${formatDateTime(repo.remote.pushedAt)}` : "";
+      meta.textContent = `ref ${repo.ref || "main"} · ${repo.counts?.total || 0} 个技能 · ${repo.counts?.updated || 0} 个有更新${pushedAt}`;
+      title.append(strong, meta);
+      const link = document.createElement("a");
+      link.href = repo.url || "#";
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = "GitHub";
+      if (!repo.url) link.removeAttribute("href");
+      head.append(title, link);
+
+      const skills = document.createElement("div");
+      skills.className = "source-skill-list";
+      skills.replaceChildren(
+        ...(repo.skills || []).map((skill) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = `source-skill ${remoteStatusTone(skill.status)}`.trim();
+          button.disabled = !skill.name || ["missing-remote", "not-github", "unknown", "error"].includes(skill.status);
+          button.title = skill.error || `${skill.path || ""}/SKILL.md`;
+          const main = document.createElement("div");
+          const name = document.createElement("strong");
+          name.textContent = skill.name || "未知技能";
+          const path = document.createElement("code");
+          path.textContent = skill.remotePath || (skill.path ? `${skill.path}/SKILL.md` : "路径未知");
+          main.append(name, path);
+          const side = document.createElement("div");
+          const status = document.createElement("span");
+          status.textContent = remoteStatusLabel(skill.status);
+          const time = document.createElement("small");
+          time.textContent = skill.error || (skill.hasUpdate ? "点击查看 diff" : "本地一致");
+          side.append(status, time);
+          button.replaceChildren(main, side);
+          button.addEventListener("click", () => loadRemoteDiff(skill.name).catch((error) => setStatus(error.message)));
+          return button;
+        }),
+      );
+      article.append(head, skills);
+      return article;
+    }),
+  );
+}
+
+function renderGithubSourcesForSelected() {
+  if (state.githubSources) {
+    renderGithubSources(state.githubSources);
+    return;
+  }
+  resetGithubSourcesPanel();
+  if (state.tab === "source" && !state.githubSourcesLoading) {
+    loadGithubSources().catch((error) => {
+      $("githubSourcesSummary").textContent = error.message;
+      $("githubSourcesRefreshButton").disabled = false;
+    });
+  }
+}
+
+async function loadGithubSources(force = false) {
+  if (state.githubSourcesLoading) return;
+  if (!force && state.githubSources) {
+    renderGithubSources(state.githubSources);
+    return;
+  }
+  state.githubSourcesLoading = true;
+  $("githubSourcesRefreshButton").disabled = true;
+  $("githubSourcesSummary").textContent = "正在检查 GitHub 来源和远端更新";
+  $("githubSourcesList").replaceChildren();
+  $("remoteDiff").hidden = true;
+  $("remoteDiff").querySelector("code").replaceChildren();
+  try {
+    const payload = await api("/api/sources/github");
+    state.githubSources = payload;
+    renderGithubSources(payload);
+    setStatus("GitHub 来源检查完成");
+  } finally {
+    state.githubSourcesLoading = false;
+    $("githubSourcesRefreshButton").disabled = false;
+  }
+}
+
+async function loadRemoteDiff(name) {
+  const diff = $("remoteDiff");
+  const code = diff.querySelector("code");
+  diff.hidden = false;
+  code.textContent = "读取远端 diff 中...";
+  const payload = await api(`/api/skills/${encodeURIComponent(name)}/remote-diff`);
+  const comparison = payload.comparison || {};
+  code.replaceChildren(...renderDiffText(payload.diff || "本地和 GitHub 当前 SKILL.md 一致。"));
+  setStatus(
+    comparison.hasUpdate
+      ? `${name} 有 GitHub 更新：${comparison.remoteUpdatedAt || "未知时间"}`
+      : `${name} 与 GitHub 当前版本一致`,
+  );
+}
+
 function renderHistoryForSelected() {
   const skill = selectedSkill();
   if (!skill) {
@@ -899,6 +1082,7 @@ function clearDetailDom() {
   $("dependencyGraph").replaceChildren();
   resetContextPanel();
   resetHistoryPanel();
+  resetGithubSourcesPanel();
 }
 
 function renderDetail() {
@@ -911,6 +1095,7 @@ function renderDetail() {
     return;
   }
   const usage = skillUsage(skill);
+  const lifecycle = skillLifecycle(skill);
 
   if (state.descriptionSkill !== skill.name) {
     state.descriptionExpanded = false;
@@ -956,6 +1141,7 @@ function renderDetail() {
 
   const badges = [];
   badges.push(badge(skill.enabled ? "已启用" : "未启用", skill.enabled ? "green" : ""));
+  if (!skill.enabled && lifecycle.lastDisabledAt) badges.push(badge(disabledDurationLabel(skill), "orange"));
   badges.push(badge(sourceLabel(skill.source), skill.system ? "orange" : "blue"));
   badges.push(badge(usageStatusLabel(usage.status), usageStatusTone(usage.status)));
   if (hasLocalization(skill)) badges.push(badge("中文视图", "green"));
@@ -973,6 +1159,16 @@ function renderDetail() {
     ["来源地址", skill.source?.source || skill.source?.path || ""],
     ["项目库", skill.libraryPath || ""],
     ["Codex", skill.codexPath || ""],
+    ["最近启用", formatDateTime(lifecycle.lastEnabledAt) || "无记录"],
+    ["最近停用", formatDateTime(lifecycle.lastDisabledAt) || "无记录"],
+    [
+      "停用时长",
+      !skill.enabled && lifecycle.lastDisabledAt
+        ? formatLifecycleDuration(lifecycle.disabledSeconds)
+        : skill.enabled
+          ? "当前已启用"
+          : "无记录",
+    ],
     ["同步时间", skill.lastSyncedAt || ""],
   ];
   $("sourceList").replaceChildren(
@@ -984,6 +1180,7 @@ function renderDetail() {
       return [dt, dd];
     }),
   );
+  renderGithubSourcesForSelected();
 
   const graph = $("dependencyGraph");
   const deps = skill.dependencies || [];
@@ -1118,6 +1315,7 @@ async function sync() {
   const payload = await api("/api/sync", { method: "POST", body: "{}" });
   state.data = payload.state;
   state.historyCache.clear();
+  clearGithubSourcesCache();
   syncSelectionWithVisible();
   render();
   setStatus(
@@ -1135,6 +1333,7 @@ async function classifySkills(force = false) {
     });
     state.data = payload.state;
     state.historyCache.clear();
+    clearGithubSourcesCache();
     syncSelectionWithVisible();
     render();
     setStatus(classificationStatusText(payload, payload.message || "自动分类完成"));
@@ -1154,6 +1353,7 @@ async function localizeSkills(force = false) {
     });
     state.data = payload.state;
     state.historyCache.clear();
+    clearGithubSourcesCache();
     syncSelectionWithVisible();
     render();
     setStatus(localizationStatusText(payload, payload.message || "中文信息生成完成"));
@@ -1178,6 +1378,7 @@ async function refreshUsageStats() {
     });
     state.data = await api("/api/state");
     state.historyCache.clear();
+    clearGithubSourcesCache();
     syncSelectionWithVisible();
     render();
     const stats = payload.stats || {};
@@ -1201,6 +1402,7 @@ async function localizeSelectedSkill(force = true) {
     });
     state.data = payload.state;
     state.historyCache.delete(skill.name);
+    clearGithubSourcesCache();
     syncSelectionWithVisible();
     render();
     setStatus(localizationStatusText(payload, payload.message || "当前技能中文信息已生成"));
@@ -1212,26 +1414,21 @@ async function localizeSelectedSkill(force = true) {
 
 async function install() {
   const source = $("installSource").value.trim();
-  const path = $("installPath").value.trim();
-  const ref = $("installRef").value.trim();
   const category = $("installCategory").value.trim();
   if (!source) {
-    setStatus("需要填写来源");
-    showInstallSourceError("请填写 GitHub tree URL、owner/repo 或本地技能目录。");
+    setStatus("需要填写 GitHub tree 地址");
+    showInstallSourceError("请填写 GitHub tree 地址，例如 https://github.com/iOfficeAI/OfficeCLI/tree/main/skills。");
     return;
   }
   showInstallSourceError("");
   $("installButton").disabled = true;
   setStatus("安装中");
   try {
-    const body = { source, path, ref, category };
-    if (/^[\w.-]+\/[\w.-]+$/.test(source)) {
-      body.repo = source;
-      delete body.source;
-    }
+    const body = { source, category };
     const payload = await api("/api/install", { method: "POST", body: JSON.stringify(body) });
     state.data = payload.state;
     state.historyCache.clear();
+    clearGithubSourcesCache();
     state.selected = payload.installed[0] || state.selected;
     syncSelectionWithVisible();
     render();
@@ -1260,6 +1457,7 @@ async function saveRepositoryConfig() {
     state.repository = payload.repository;
     state.data = payload.state;
     state.historyCache.clear();
+    clearGithubSourcesCache();
     render();
     setStatus(payload.message || "skills 仓库配置已保存");
   } finally {
@@ -1276,6 +1474,7 @@ async function testRepositoryConfig() {
     state.repository = payload.repository;
     state.data = await api("/api/state");
     state.historyCache.clear();
+    clearGithubSourcesCache();
     render();
     const result = payload.result || {};
     const push = result.push || {};
@@ -1310,6 +1509,7 @@ async function saveSkill() {
   });
   state.data = payload.state;
   state.historyCache.delete(skill.name);
+  clearGithubSourcesCache();
   syncSelectionWithVisible();
   render();
   setStatus("已保存");
@@ -1322,7 +1522,7 @@ function confirmSkillToggle(action, skill) {
     );
   }
   return window.confirm(
-    `确认停用技能“${skill.name}”？\n\n这只会删除 .codex/skills 下的启用副本，项目库中的技能仍会保留。新的 Codex 会话将不再加载该启用副本。`,
+    `确认停用技能“${skill.name}”？\n\n这只会删除 .codex/skills 下的启用副本，项目库中的技能仍会保留，并记录本次停用时间。新的 Codex 会话将不再加载该启用副本。`,
   );
 }
 
@@ -1341,6 +1541,7 @@ async function toggleSkill(action) {
   });
   state.data = payload.state;
   state.historyCache.delete(skill.name);
+  clearGithubSourcesCache();
   syncSelectionWithVisible();
   render();
   setStatus(payload.message || "完成");
@@ -1443,6 +1644,7 @@ function bindEvents() {
   $("previewToggle").addEventListener("click", togglePreview);
   $("contextButton").addEventListener("click", loadContexts);
   $("historyRefreshButton").addEventListener("click", () => loadHistory(true).catch((error) => setStatus(error.message)));
+  $("githubSourcesRefreshButton").addEventListener("click", () => loadGithubSources(true).catch((error) => setStatus(error.message)));
   $("auditButton").addEventListener("click", () => showAudit().catch((error) => setStatus(error.message)));
   $("searchInput").addEventListener("input", (event) => {
     state.search = event.target.value;

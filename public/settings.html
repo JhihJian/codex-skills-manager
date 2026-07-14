@@ -34,13 +34,20 @@
         <aside class="settings-nav" aria-label="设置分组">
           <div class="review-nav-head">
             <span>设置</span>
-            <strong>2</strong>
+            <strong>3</strong>
           </div>
           <button class="review-type active" type="button" data-section="usage">
             <svg aria-hidden="true"><use href="#icon-settings"></use></svg>
             <span>
               <strong>使用统计</strong>
               <small>频率分析与刷新策略</small>
+            </span>
+          </button>
+          <button class="review-type" type="button" data-section="repository">
+            <svg aria-hidden="true"><use href="#icon-settings"></use></svg>
+            <span>
+              <strong>仓库</strong>
+              <small>独立 skills 仓库</small>
             </span>
           </button>
           <button class="review-type" type="button" data-section="paths">
@@ -114,6 +121,30 @@
                 <span>包含系统技能</span>
               </label>
             </div>
+          </div>
+
+          <div class="settings-panel" id="repositorySettingsPanel" hidden>
+            <div class="setting-row">
+              <div>
+                <strong>独立 skills 仓库</strong>
+                <span>保存前会校验目录，拒绝磁盘根、Home、.codex、当前项目和已有非 skills 仓库。</span>
+              </div>
+            </div>
+            <div class="settings-grid">
+              <label>
+                <span>Skills GitHub 仓库</span>
+                <input id="repositoryUrl" placeholder="https://github.com/<owner>/<repo>.git" />
+              </label>
+              <label>
+                <span>本地仓库路径</span>
+                <input id="repositoryDir" placeholder="D:\tmp\codex-skills-library" />
+              </label>
+            </div>
+            <div class="settings-actions">
+              <button id="saveRepositoryButton" class="primary-button">保存仓库配置</button>
+              <button id="testRepositoryButton" class="primary-button secondary-button">测试提交</button>
+            </div>
+            <div class="repository-status" id="repositoryStatus">未读取仓库配置</div>
           </div>
 
           <div class="settings-panel" id="pathsSettingsPanel" hidden>

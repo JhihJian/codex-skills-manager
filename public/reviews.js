@@ -54,6 +54,13 @@ function formatRelativeUsage(item) {
   return `${item.daysSinceLastUsed} 天前`;
 }
 
+function warningNode(warning) {
+  const node = document.createElement("div");
+  node.className = "review-warning";
+  node.textContent = warning.message || String(warning);
+  return node;
+}
+
 const reviews = {
   usage: {
     title: "长期未真实使用",
@@ -100,7 +107,15 @@ const reviews = {
 
       const interesting = (payload.entries || []).filter((item) => item.status !== "active");
       const entries = interesting.length ? interesting : payload.entries || [];
-      $("reviewResults").replaceChildren(...entries.map(renderUsageReviewItem));
+      const warnings = (payload.warnings || []).map(warningNode);
+      if (!entries.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty-state";
+        empty.textContent = stats.reviewed ? "当前范围内没有需要展示的技能。" : "当前审查范围内没有技能。";
+        $("reviewResults").replaceChildren(...warnings, empty);
+        return;
+      }
+      $("reviewResults").replaceChildren(...warnings, ...entries.map(renderUsageReviewItem));
     },
   },
 };
@@ -188,7 +203,14 @@ async function runActiveReview() {
   try {
     const payload = await review.run();
     state.results.set(state.activeReview, payload);
-    setStatus(`审查完成，发现 ${payload.stats?.issues || 0} 个需要关注的技能`);
+    const warnings = payload.warnings || [];
+    if (warnings.some((item) => item.code === "empty-scope")) {
+      setStatus("审查完成，当前范围内没有技能");
+    } else if (warnings.some((item) => item.code === "no-session-files")) {
+      setStatus(`审查完成，但没有扫描到会话证据；发现 ${payload.stats?.issues || 0} 个缺少证据的技能`);
+    } else {
+      setStatus(`审查完成，发现 ${payload.stats?.issues || 0} 个需要关注的技能`);
+    }
   } finally {
     state.running = false;
     renderReview();

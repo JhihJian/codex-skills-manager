@@ -74,49 +74,62 @@
           <span id="codexStatus">检测中</span>
         </div>
         <div class="toolbar">
-          <button class="icon-button" id="installToggleButton" title="打开或收起安装面板" aria-label="打开或收起安装面板" aria-expanded="false"><svg><use href="#icon-plus"></use></svg></button>
-          <button class="icon-button" id="syncButton" title="同步 .codex/skills 并自动纳管新增技能" aria-label="同步技能"><svg><use href="#icon-refresh"></use></svg></button>
-          <button class="icon-button" id="classifyButton" title="使用本机 Codex 自动分类未分类技能" aria-label="自动分类技能"><svg><use href="#icon-sparkles"></use></svg></button>
-          <button class="icon-button" id="localizeButton" title="使用本机 Codex 生成中文名称和中文触发条件" aria-label="生成中文名称和触发条件"><svg><use href="#icon-languages"></use></svg></button>
-          <button class="icon-button" id="usageRefreshButton" title="刷新技能使用频率统计" aria-label="刷新技能使用频率统计"><svg><use href="#icon-chart"></use></svg></button>
-          <a class="icon-button" id="reviewPageLink" href="/reviews.html" title="打开技能问题审查页" aria-label="打开技能问题审查页"><svg><use href="#icon-shield-alert"></use></svg></a>
-          <a class="icon-button" id="settingsPageLink" href="/settings.html" title="打开设置页" aria-label="打开设置页"><svg><use href="#icon-settings"></use></svg></a>
-          <button class="icon-button" id="auditButton" title="查看最近管理操作" aria-label="查看操作记录"><svg><use href="#icon-history"></use></svg></button>
+          <div class="toolbar-group">
+            <button class="icon-button icon-button-labeled" id="installToggleButton" title="打开或收起安装面板" aria-label="打开或收起安装面板" aria-expanded="false"><svg><use href="#icon-plus"></use></svg><span>安装</span></button>
+            <button class="icon-button icon-button-labeled" id="syncButton" title="同步 .codex/skills 并自动纳管新增技能" aria-label="同步技能"><svg><use href="#icon-refresh"></use></svg><span>同步</span></button>
+          </div>
+          <div class="toolbar-group">
+            <button class="icon-button" id="classifyButton" title="使用本机 Codex 自动分类未分类技能" aria-label="自动分类技能"><svg><use href="#icon-sparkles"></use></svg></button>
+            <button class="icon-button" id="localizeButton" title="使用本机 Codex 生成中文名称和中文触发条件" aria-label="生成中文名称和触发条件"><svg><use href="#icon-languages"></use></svg></button>
+            <button class="icon-button" id="usageRefreshButton" title="刷新技能使用频率统计" aria-label="刷新技能使用频率统计"><svg><use href="#icon-chart"></use></svg></button>
+          </div>
+          <div class="toolbar-group">
+            <a class="icon-button icon-button-labeled" id="reviewPageLink" href="/reviews.html" title="打开技能问题审查页" aria-label="打开技能问题审查页"><svg><use href="#icon-shield-alert"></use></svg><span>审查</span></a>
+            <a class="icon-button icon-button-labeled" id="settingsPageLink" href="/settings.html" title="打开设置页" aria-label="打开设置页"><svg><use href="#icon-settings"></use></svg><span>设置</span></a>
+            <button class="icon-button icon-button-labeled" id="auditButton" title="查看最近管理操作" aria-label="查看操作记录"><svg><use href="#icon-history"></use></svg><span>审计</span></button>
+          </div>
         </div>
       </header>
 
       <section class="installbar" id="installPanel" hidden>
-        <div class="install-grid">
-          <label>
-            <span>来源</span>
-            <input id="installSource" placeholder="GitHub tree URL、owner/repo 或本地目录" aria-describedby="installSourceError" />
-            <small id="installSourceError" class="field-error" hidden></small>
-          </label>
-          <label>
-            <span>路径</span>
-            <input id="installPath" placeholder="repo 内 skill 路径，可逗号分隔" />
-          </label>
-          <label>
-            <span>ref</span>
-            <input id="installRef" placeholder="main" />
-          </label>
-          <label>
-            <span>分类</span>
-            <input id="installCategory" placeholder="未分类" list="categoryList" />
-          </label>
-          <button id="installButton" class="primary-button">安装到项目库</button>
+        <div class="install-section">
+          <div class="install-section-head">
+            <strong>安装技能</strong>
+            <span>粘贴 GitHub tree 地址即可自动识别仓库、分支和技能路径；父目录会批量安装其下所有 skill。</span>
+          </div>
+          <div class="install-grid">
+            <label>
+              <span>GitHub tree 地址</span>
+              <input id="installSource" placeholder="https://github.com/iOfficeAI/OfficeCLI/tree/main/skills" aria-describedby="installSourceError installExamples" />
+              <small id="installSourceError" class="field-error" hidden></small>
+            </label>
+            <label>
+              <span>分类</span>
+              <input id="installCategory" placeholder="未分类" list="categoryList" />
+            </label>
+            <button id="installButton" class="primary-button">安装到项目库</button>
+          </div>
+          <div class="install-examples" id="installExamples">
+            <code>例如：https://github.com/iOfficeAI/OfficeCLI/tree/main/skills</code>
+          </div>
         </div>
-        <div class="repository-grid">
-          <label>
-            <span>Skills GitHub 仓库</span>
-            <input id="repositoryUrl" placeholder="https://github.com/<owner>/<repo>.git" />
-          </label>
-          <label>
-            <span>本地仓库路径</span>
-            <input id="repositoryDir" placeholder="D:\\tmp\\codex-skills-library" />
-          </label>
-          <button id="repositorySaveButton" class="primary-button">保存仓库</button>
-          <button id="repositoryTestButton" class="primary-button secondary-button">测试提交</button>
+        <div class="install-section repository-section">
+          <div class="install-section-head">
+            <strong>Skills 仓库配置</strong>
+            <span>保存前会校验目录，拒绝磁盘根、Home、.codex、当前项目和非 skills 仓库。</span>
+          </div>
+          <div class="repository-grid">
+            <label>
+              <span>Skills GitHub 仓库</span>
+              <input id="repositoryUrl" placeholder="https://github.com/<owner>/<repo>.git" />
+            </label>
+            <label>
+              <span>本地仓库路径</span>
+              <input id="repositoryDir" placeholder="D:\tmp\codex-skills-library" />
+            </label>
+            <button id="repositorySaveButton" class="primary-button">保存仓库</button>
+            <button id="repositoryTestButton" class="primary-button secondary-button">测试提交</button>
+          </div>
         </div>
         <div class="repository-status" id="repositoryStatus">未读取仓库配置</div>
       </section>
@@ -294,6 +307,15 @@
 
             <div class="tab-panel" id="tabSource" hidden>
               <dl class="source-list" id="sourceList"></dl>
+              <div class="source-toolbar">
+                <div>
+                  <h2>GitHub 来源</h2>
+                  <span id="githubSourcesSummary">检查 GitHub 来源后展示仓库、技能和更新状态。</span>
+                </div>
+                <button id="githubSourcesRefreshButton" class="primary-button">检查更新</button>
+              </div>
+              <div id="githubSourcesList" class="source-groups"></div>
+              <pre id="remoteDiff" class="diff-view" hidden><code></code></pre>
               <h2>依赖关系</h2>
               <div id="dependencyGraph" class="dependency-graph"></div>
             </div>

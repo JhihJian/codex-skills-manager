@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import difflib
+import hashlib
+import io
 import json
 import os
 import re
@@ -11,6 +15,10 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -121,6 +129,10 @@ SKILL_VERSION_AUTO_PUSH_ENABLED = os.environ.get("CODEX_SKILL_VERSION_AUTO_PUSH"
     "no",
     "off",
 }
+MAX_LIFECYCLE_EVENTS = 50
+TOGGLE_AUDIT_ACTIONS = {"enable-skill": "enable", "disable-skill": "disable"}
+GITHUB_API_USER_AGENT = "codex-skills-manager"
+MAX_GITHUB_PARENT_SKILL_SCAN = 200
 
 REGISTRY_LOCK = threading.RLock()
 SKILL_VERSION_LOCK = threading.RLock()
@@ -245,11 +257,270 @@ def apply_repository_settings(settings: dict[str, Any] | None = None) -> None:
 apply_repository_settings()
 
 
-def append_audit(action: str, payload: dict[str, Any]) -> None:
+def repository_values(settings: dict[str, Any]) -> tuple[Path, str]:
+    configured_dir = str(settings.get("skillsRepoDir") or os.environ.get("CODEX_SKILLS_REPO_DIR") or DEFAULT_SKILLS_REPO_DIR).strip()
+    configured_url = str(settings.get("skillsRepoUrl") or os.environ.get("CODEX_SKILLS_REPO_URL") or "").strip()
+    return Path(configured_dir).expanduser().resolve(), configured_url
+
+
+def repository_layout_markers(path: Path) -> set[str]:
+    markers: set[str] = set()
+    if (path / "skills").exists():
+        markers.add("skills")
+    if (path / "skills-library").exists():
+        markers.add("legacy-skills-library")
+    if (path / "codex-skills-manager.sqlite3").exists():
+        markers.add("database")
+    if (path / ".git").exists():
+        markers.add("git")
+    return markers
+
+
+def has_repository_metadata(path: Path) -> bool:
+    db_path = path / "codex-skills-manager.sqlite3"
+    if not db_path.exists():
+        return False
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute("SELECT value FROM metadata WHERE key = ?", ("repository",)).fetchone()
+    except sqlite3.Error:
+        return False
+    if not row:
+        return False
+    try:
+        payload = json.loads(str(row[0]))
+    except json.JSONDecodeError:
+        return False
+    return payload.get("layout") == "skills-plus-sqlite"
+
+
+def directory_child_names(path: Path) -> set[str]:
+    try:
+        return {child.name for child in path.iterdir()}
+    except OSError:
+        return set()
+
+
+def looks_like_skills_repository(path: Path) -> bool:
+    if has_repository_metadata(path):
+        return True
+    names = directory_child_names(path)
+    if not names:
+        return True
+    allowed = {
+        ".git",
+        ".gitignore",
+        "README",
+        "README.md",
+        "LICENSE",
+        "LICENSE.md",
+        "skills",
+        "skills-library",
+        "codex-skills-manager.sqlite3",
+    }
+    if names.issubset(allowed) and ({"skills", "skills-library", "codex-skills-manager.sqlite3"} & names or names <= {".git", ".gitignore", "README", "README.md", "LICENSE", "LICENSE.md"}):
+        return True
+    return False
+
+
+def validate_skills_repository_dir(path: Path) -> None:
+    path = path.expanduser().resolve()
+    if path == path.parent:
+        raise ApiError("skills 仓库路径不能是磁盘根目录。")
+    home = Path.home().resolve()
+    if path == home:
+        raise ApiError("skills 仓库路径不能是用户 Home 目录。")
+    if path == CODEX_HOME or is_relative_to(path, CODEX_HOME):
+        raise ApiError("skills 仓库路径不能位于 .codex 目录内。")
+    if path == BASE_DIR:
+        raise ApiError("skills 仓库路径不能是当前管理器项目根目录。")
+    if path.exists() and not path.is_dir():
+        raise ApiError(f"skills 仓库路径不是目录：{path}")
+    if path.exists() and (path / ".git").exists() and not looks_like_skills_repository(path):
+        raise ApiError("该路径是已有 Git 仓库，但不像 Codex skills 仓库，已拒绝写入。")
+    if path.exists() and not (path / ".git").exists() and directory_child_names(path) and not looks_like_skills_repository(path):
+        raise ApiError("该路径已包含非 skills 仓库文件，已拒绝写入。")
+
+
+def repository_health() -> dict[str, Any]:
+    errors: list[str] = []
+    db_open = False
+    if SKILLS_DB_FILE.exists():
+        try:
+            with sqlite3.connect(SKILLS_DB_FILE) as conn:
+                conn.execute("SELECT 1").fetchone()
+            db_open = True
+        except sqlite3.Error as exc:
+            errors.append(f"SQLite 无法打开：{exc}")
+    else:
+        db_open = False
+    if not SKILLS_REPO_DIR.exists():
+        errors.append("skills 仓库目录不存在")
+    elif not SKILLS_REPO_DIR.is_dir():
+        errors.append("skills 仓库路径不是目录")
+    return {
+        "exists": SKILLS_REPO_DIR.exists(),
+        "git": (SKILLS_REPO_DIR / ".git").exists(),
+        "skillsDir": LIBRARY_DIR.exists(),
+        "database": SKILLS_DB_FILE.exists(),
+        "databaseOpen": db_open,
+        "markers": sorted(repository_layout_markers(SKILLS_REPO_DIR)) if SKILLS_REPO_DIR.exists() else [],
+        "errors": errors,
+    }
+
+
+def parse_iso_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def is_later_timestamp(candidate: Any, current: Any) -> bool:
+    candidate_dt = parse_iso_timestamp(candidate)
+    if candidate_dt is None:
+        return False
+    current_dt = parse_iso_timestamp(current)
+    return current_dt is None or candidate_dt > current_dt
+
+
+def append_audit(action: str, payload: dict[str, Any], *, event_time: str | None = None) -> None:
     AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    event = {"time": now_iso(), "action": action, **payload}
+    event = {"time": event_time or now_iso(), "action": action, **payload}
     with AUDIT_FILE.open("a", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def read_audit_events(limit: int | None = None) -> list[dict[str, Any]]:
+    if not AUDIT_FILE.exists():
+        return []
+    lines = AUDIT_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    if limit is not None and limit > 0:
+        lines = lines[-limit:]
+    events: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def normalize_lifecycle_events(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    events: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action") or "").strip()
+        occurred_at = str(item.get("time") or "").strip()
+        if action not in {"enable", "disable"} or not occurred_at:
+            continue
+        event = dict(item)
+        event["action"] = action
+        event["time"] = occurred_at
+        events.append(event)
+
+    def event_key(item: dict[str, Any]) -> datetime:
+        return parse_iso_timestamp(item.get("time")) or datetime.min.replace(tzinfo=timezone.utc)
+
+    return sorted(events, key=event_key)[-MAX_LIFECYCLE_EVENTS:]
+
+
+def normalize_skill_lifecycle(value: Any) -> dict[str, Any]:
+    lifecycle = dict(value) if isinstance(value, dict) else {}
+    lifecycle["events"] = normalize_lifecycle_events(lifecycle.get("events"))
+    for event in lifecycle["events"]:
+        action = event.get("action")
+        occurred_at = event.get("time")
+        if action == "enable" and is_later_timestamp(occurred_at, lifecycle.get("lastEnabledAt")):
+            lifecycle["lastEnabledAt"] = occurred_at
+        if action == "disable" and is_later_timestamp(occurred_at, lifecycle.get("lastDisabledAt")):
+            lifecycle["lastDisabledAt"] = occurred_at
+        if is_later_timestamp(occurred_at, lifecycle.get("lastActionAt")):
+            lifecycle["lastAction"] = action
+            lifecycle["lastActionAt"] = occurred_at
+    return lifecycle
+
+
+def record_skill_lifecycle(registry: dict[str, Any], name: str, action: str, occurred_at: str, details: dict[str, Any] | None = None) -> None:
+    entry = registry.get("skills", {}).get(name)
+    if not entry or action not in {"enable", "disable"}:
+        return
+    lifecycle = normalize_skill_lifecycle(entry.get("lifecycle"))
+    event: dict[str, Any] = {"time": occurred_at, "action": action}
+    if details:
+        event.update(details)
+    lifecycle["events"] = normalize_lifecycle_events([*lifecycle.get("events", []), event])
+    lifecycle["lastAction"] = action
+    lifecycle["lastActionAt"] = occurred_at
+    if action == "enable":
+        lifecycle["lastEnabledAt"] = occurred_at
+    else:
+        lifecycle["lastDisabledAt"] = occurred_at
+    entry["lifecycle"] = lifecycle
+    entry["updatedAt"] = occurred_at
+
+
+def audit_lifecycle_by_skill() -> dict[str, dict[str, Any]]:
+    lifecycle_by_skill: dict[str, dict[str, Any]] = {}
+    for event in read_audit_events():
+        action = TOGGLE_AUDIT_ACTIONS.get(str(event.get("action") or ""))
+        if not action:
+            continue
+        name = str(event.get("skill") or "").strip()
+        occurred_at = str(event.get("time") or "").strip()
+        if not name or not occurred_at:
+            continue
+        lifecycle = lifecycle_by_skill.setdefault(name, {"events": []})
+        lifecycle["events"].append({"time": occurred_at, "action": action, "source": "audit-log"})
+        if action == "enable" and is_later_timestamp(occurred_at, lifecycle.get("lastEnabledAt")):
+            lifecycle["lastEnabledAt"] = occurred_at
+        if action == "disable" and is_later_timestamp(occurred_at, lifecycle.get("lastDisabledAt")):
+            lifecycle["lastDisabledAt"] = occurred_at
+        if is_later_timestamp(occurred_at, lifecycle.get("lastActionAt")):
+            lifecycle["lastAction"] = action
+            lifecycle["lastActionAt"] = occurred_at
+    return {name: normalize_skill_lifecycle(lifecycle) for name, lifecycle in lifecycle_by_skill.items()}
+
+
+def merge_skill_lifecycle(primary: Any, fallback: Any) -> dict[str, Any]:
+    lifecycle = normalize_skill_lifecycle(primary)
+    audit_lifecycle = normalize_skill_lifecycle(fallback)
+    for key in ("lastEnabledAt", "lastDisabledAt"):
+        if is_later_timestamp(audit_lifecycle.get(key), lifecycle.get(key)):
+            lifecycle[key] = audit_lifecycle[key]
+    if is_later_timestamp(audit_lifecycle.get("lastActionAt"), lifecycle.get("lastActionAt")):
+        lifecycle["lastAction"] = audit_lifecycle.get("lastAction")
+        lifecycle["lastActionAt"] = audit_lifecycle.get("lastActionAt")
+
+    events: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in [*lifecycle.get("events", []), *audit_lifecycle.get("events", [])]:
+        key = (str(event.get("time") or ""), str(event.get("action") or ""))
+        if key[0] and key[1]:
+            events[key] = event
+    lifecycle["events"] = normalize_lifecycle_events(list(events.values()))
+    return lifecycle
+
+
+def disabled_duration_seconds(lifecycle: dict[str, Any], *, enabled: bool) -> int | None:
+    if enabled:
+        return None
+    disabled_at = parse_iso_timestamp(lifecycle.get("lastDisabledAt"))
+    if disabled_at is None:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - disabled_at).total_seconds()))
 
 
 def load_registry() -> dict[str, Any]:
@@ -269,6 +540,106 @@ def save_registry(registry: dict[str, Any]) -> None:
     with REGISTRY_LOCK:
         registry["updatedAt"] = now_iso()
         write_registry_to_db(registry)
+
+
+def merge_categories(target: dict[str, Any], categories: list[Any]) -> None:
+    target.setdefault("categories", list(DEFAULT_CATEGORIES))
+    for category in DEFAULT_CATEGORIES:
+        if category not in target["categories"]:
+            target["categories"].append(category)
+    for category in categories:
+        text = str(category or "").strip()
+        if text and text not in target["categories"]:
+            target["categories"].append(text)
+
+
+def stable_json(value: Any) -> str:
+    return json.dumps(value if value is not None else {}, ensure_ascii=False, sort_keys=True)
+
+
+def merge_classification_registry(
+    source_registry: dict[str, Any],
+    names: list[str],
+    *,
+    force: bool,
+    baseline: dict[str, dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    latest = sync_registry(adopt_extra=False, save=False)
+    merge_categories(latest, list(source_registry.get("categories") or []))
+    baseline = baseline or {}
+    applied: list[str] = []
+    skipped: list[str] = []
+    for name in names:
+        source = source_registry.get("skills", {}).get(name)
+        target = latest.get("skills", {}).get(name)
+        if not source or not target:
+            skipped.append(name)
+            continue
+        initial = baseline.get(name)
+        if initial and str(target.get("category") or "未分类") != str(initial.get("category") or "未分类"):
+            skipped.append(name)
+            continue
+        if not force and target.get("category") and target.get("category") != "未分类":
+            skipped.append(name)
+            continue
+        category = str(source.get("category") or "").strip() or "未分类"
+        if category == "未分类":
+            skipped.append(name)
+            continue
+        target["category"] = category
+        if category not in latest["categories"]:
+            latest["categories"].append(category)
+        for key in ("tags", "dependencies", "autoClassifiedAt", "autoClassification"):
+            if key in source:
+                target[key] = source[key]
+        auto = source.get("autoClassification") if isinstance(source.get("autoClassification"), dict) else {}
+        reason = str(auto.get("reason") or "").strip()
+        if reason:
+            marker = f"[自动分类] {reason}"
+            previous = str(target.get("notes") or "").strip()
+            target["notes"] = marker if not previous else previous if marker in previous else f"{previous}\n{marker}"
+        target["updatedAt"] = now_iso()
+        applied.append(name)
+    if applied:
+        save_registry(latest)
+    return latest, applied, skipped
+
+
+def merge_localization_registry(
+    source_registry: dict[str, Any],
+    names: list[str],
+    *,
+    force: bool,
+    baseline: dict[str, str] | None = None,
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    latest = sync_registry(adopt_extra=False, save=False)
+    baseline = baseline or {}
+    applied: list[str] = []
+    skipped: list[str] = []
+    for name in names:
+        source = source_registry.get("skills", {}).get(name)
+        target = latest.get("skills", {}).get(name)
+        localized = source.get("localized") if isinstance(source, dict) and isinstance(source.get("localized"), dict) else {}
+        if not source or not target or not localized:
+            skipped.append(name)
+            continue
+        current = target.get("localized") if isinstance(target.get("localized"), dict) else {}
+        if name in baseline and stable_json(current) != baseline[name]:
+            skipped.append(name)
+            continue
+        if not force and str(current.get("zhName") or "").strip() and str(current.get("zhTrigger") or "").strip():
+            skipped.append(name)
+            continue
+        if not str(localized.get("zhName") or "").strip() or not str(localized.get("zhTrigger") or "").strip():
+            skipped.append(name)
+            continue
+        target["localized"] = dict(localized)
+        target["localizedAt"] = source.get("localizedAt") or localized.get("updatedAt") or localized.get("generatedAt") or now_iso()
+        target["updatedAt"] = now_iso()
+        applied.append(name)
+    if applied:
+        save_registry(latest)
+    return latest, applied, skipped
 
 
 def is_relative_to(path: Path, root: Path) -> bool:
@@ -581,6 +952,7 @@ def merge_skill_entry(
     existing.setdefault("tags", [])
     existing.setdefault("dependencies", [])
     existing.setdefault("notes", "")
+    existing["lifecycle"] = normalize_skill_lifecycle(existing.get("lifecycle"))
     existing["libraryPath"] = str(library_path) if library_path else ""
     existing["codexPath"] = str(codex_path) if codex_path else ""
     existing["enabled"] = enabled
@@ -707,9 +1079,13 @@ def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
     skills.sort(key=lambda item: (not item.get("enabled", False), item.get("category", ""), item.get("name", "")))
     usage_stats = usage_stats_service.read_stats()
     usage_by_name = {item.get("name"): item for item in usage_stats.get("entries", []) if item.get("name")}
+    audit_lifecycle = audit_lifecycle_by_skill()
     for skill in skills:
         usage_item = usage_by_name.get(skill.get("name"))
         skill["usage"] = usage_stats_service.skill_summary(usage_item)
+        lifecycle = merge_skill_lifecycle(skill.get("lifecycle"), audit_lifecycle.get(str(skill.get("name") or "")))
+        lifecycle["disabledSeconds"] = disabled_duration_seconds(lifecycle, enabled=bool(skill.get("enabled")))
+        skill["lifecycle"] = lifecycle
     localized_count = len(
         [
             s
@@ -1054,6 +1430,12 @@ def classify_skills(
         force=force,
         include_system=include_system,
     )
+    baseline_classification = {
+        item["name"]: {
+            "category": registry.get("skills", {}).get(item["name"], {}).get("category"),
+        }
+        for item in candidates
+    }
     if not candidates:
         view = registry_view(registry)
         return {"message": "没有需要自动分类的技能。", "classified": [], "skipped": [], "errors": [], "state": view}
@@ -1074,7 +1456,14 @@ def classify_skills(
             errors.append(f"{names_text}: {exc}")
 
     if classified and save:
-        save_registry(registry)
+        registry, applied, merge_skipped = merge_classification_registry(
+            registry,
+            classified,
+            force=force,
+            baseline=baseline_classification,
+        )
+        classified = applied
+        skipped.extend(merge_skipped)
     if save and (classified or errors):
         append_audit(
             "auto-classify-skills",
@@ -1359,6 +1748,10 @@ def localize_skills(
         include_system=include_system,
         only_english=only_english,
     )
+    baseline_localization = {
+        item["name"]: stable_json(registry.get("skills", {}).get(item["name"], {}).get("localized"))
+        for item in candidates
+    }
     if not candidates:
         view = registry_view(registry)
         return {
@@ -1384,7 +1777,14 @@ def localize_skills(
             errors.append(f"{names_text}: {exc}")
 
     if localized and save:
-        save_registry(registry)
+        registry, applied, merge_skipped = merge_localization_registry(
+            registry,
+            localized,
+            force=force,
+            baseline=baseline_localization,
+        )
+        localized = applied
+        skipped.extend(merge_skipped)
     if save and (localized or errors):
         append_audit(
             "auto-localize-skills",
@@ -1425,6 +1825,520 @@ def auto_localize_registry_after_change(
         return {"localized": [], "skipped": [], "errors": [str(exc)]}
 
 
+def parse_github_install_url(url: str, default_ref: str) -> tuple[str, str, str | None] | None:
+    parsed = urlparse(url)
+    if parsed.netloc.lower() != "github.com":
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 2:
+        return None
+    owner, repo = parts[0], parts[1]
+    ref = default_ref or "main"
+    repo_path = ""
+    if len(parts) > 2:
+        if parts[2] in {"tree", "blob"}:
+            if len(parts) < 4:
+                return f"{owner}/{repo}", ref, None
+            ref = parts[3]
+            repo_path = "/".join(parts[4:])
+        else:
+            repo_path = "/".join(parts[2:])
+    return f"{owner}/{repo}", ref, repo_path or None
+
+
+def github_install_target(
+    *,
+    source: str,
+    repo: str,
+    paths: list[str],
+    ref: str,
+) -> tuple[str, str, list[str]] | None:
+    effective_ref = ref or "main"
+    if source:
+        parsed = parse_github_install_url(source, effective_ref)
+        if not parsed:
+            return None
+        repo_slug, url_ref, url_path = parsed
+        return repo_slug, url_ref, list(paths) if paths else ([url_path] if url_path else [])
+
+    if not repo:
+        return None
+    if "://" in repo:
+        parsed = parse_github_install_url(repo, effective_ref)
+        if not parsed:
+            return None
+        repo_slug, url_ref, url_path = parsed
+        return repo_slug, url_ref, list(paths) if paths else ([url_path] if url_path else [])
+
+    repo_parts = [part for part in repo.split("/") if part]
+    if len(repo_parts) != 2:
+        return None
+    return f"{repo_parts[0]}/{repo_parts[1]}", effective_ref, list(paths)
+
+
+def normalize_repo_path(path: str) -> str:
+    normalized = str(path or "").strip().replace("\\", "/").strip("/")
+    if not normalized:
+        return ""
+    parts = normalized.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ApiError("repo 内路径必须是相对目录，不能包含 . 或 ..。")
+    return "/".join(parts)
+
+
+def repo_path_basename(path: str) -> str:
+    return normalize_repo_path(path).rsplit("/", 1)[-1]
+
+
+def github_api_json(url: str, *, not_found: Any = None) -> Any:
+    headers = {"User-Agent": GITHUB_API_USER_AGENT}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"token {token}"
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return not_found
+        raise ApiError(f"读取 GitHub 失败：HTTP {exc.code}", HTTPStatus.BAD_GATEWAY) from exc
+    except urllib.error.URLError as exc:
+        raise ApiError(f"读取 GitHub 失败：{exc.reason}", HTTPStatus.BAD_GATEWAY) from exc
+    return json.loads(payload)
+
+
+def github_contents(repo: str, path: str, ref: str) -> Any:
+    encoded_path = urllib.parse.quote(normalize_repo_path(path), safe="/")
+    encoded_ref = urllib.parse.quote(ref or "main", safe="")
+    suffix = f"/{encoded_path}" if encoded_path else ""
+    url = f"https://api.github.com/repos/{repo}/contents{suffix}?ref={encoded_ref}"
+    return github_api_json(url, not_found=None)
+
+
+def github_latest_commit_for_path(repo: str, path: str, ref: str) -> dict[str, Any]:
+    encoded_path = urllib.parse.quote(normalize_repo_path(path), safe="/")
+    encoded_ref = urllib.parse.quote(ref or "main", safe="")
+    url = f"https://api.github.com/repos/{repo}/commits?path={encoded_path}&sha={encoded_ref}&per_page=1"
+    commits = github_api_json(url, not_found=[])
+    if not isinstance(commits, list) or not commits:
+        return {}
+    commit = commits[0] if isinstance(commits[0], dict) else {}
+    commit_body = commit.get("commit") if isinstance(commit.get("commit"), dict) else {}
+    author = commit_body.get("author") if isinstance(commit_body.get("author"), dict) else {}
+    committer = commit_body.get("committer") if isinstance(commit_body.get("committer"), dict) else {}
+    return {
+        "sha": commit.get("sha") or "",
+        "shortSha": str(commit.get("sha") or "")[:7],
+        "date": author.get("date") or committer.get("date") or "",
+        "message": str(commit_body.get("message") or "").splitlines()[0] if commit_body.get("message") else "",
+        "url": commit.get("html_url") or "",
+    }
+
+
+def github_tree_map(repo: str, ref: str) -> dict[str, dict[str, Any]]:
+    encoded_ref = urllib.parse.quote(ref or "main", safe="")
+    url = f"https://api.github.com/repos/{repo}/git/trees/{encoded_ref}?recursive=1"
+    payload = github_api_json(url, not_found={})
+    tree = payload.get("tree") if isinstance(payload, dict) else []
+    result: dict[str, dict[str, Any]] = {}
+    if not isinstance(tree, list):
+        return result
+    for item in tree:
+        if not isinstance(item, dict) or item.get("type") != "blob":
+            continue
+        path = normalize_repo_path(str(item.get("path") or ""))
+        if path:
+            result[path] = item
+    return result
+
+
+def github_repo_metadata(repo: str) -> dict[str, Any]:
+    encoded_repo = "/".join(urllib.parse.quote(part, safe="") for part in repo.split("/", 1))
+    url = f"https://api.github.com/repos/{encoded_repo}"
+    payload = github_api_json(url, not_found={})
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "pushedAt": payload.get("pushed_at") or "",
+        "updatedAt": payload.get("updated_at") or "",
+        "defaultBranch": payload.get("default_branch") or "",
+    }
+
+
+def decode_github_file(item: Any) -> bytes:
+    if not isinstance(item, dict) or item.get("type") != "file":
+        raise ApiError("GitHub 返回的目标不是文件。")
+    content = str(item.get("content") or "")
+    encoding = str(item.get("encoding") or "").lower()
+    if encoding != "base64" or not content:
+        raise ApiError("GitHub 文件内容不可直接读取。")
+    return base64.b64decode(content.replace("\n", "").encode("ascii"))
+
+
+def git_blob_sha(payload: bytes) -> str:
+    header = f"blob {len(payload)}\0".encode("utf-8")
+    return hashlib.sha1(header + payload).hexdigest()
+
+
+def text_from_bytes(payload: bytes) -> str:
+    return payload.decode("utf-8-sig", errors="replace").lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def github_directory_has_skill_md(repo: str, path: str, ref: str) -> bool:
+    contents = github_contents(repo, path, ref)
+    if not isinstance(contents, list):
+        return False
+    return any(
+        str(item.get("type") or "") == "file" and str(item.get("name") or "").lower() == "skill.md"
+        for item in contents
+    )
+
+
+def discover_github_skill_paths_from_api(repo: str, path: str, ref: str) -> tuple[list[str], bool]:
+    normalized = normalize_repo_path(path)
+    contents = github_contents(repo, normalized, ref)
+    if not isinstance(contents, list):
+        return [normalized], False
+    if any(
+        str(item.get("type") or "") == "file" and str(item.get("name") or "").lower() == "skill.md"
+        for item in contents
+    ):
+        return [normalized], False
+
+    child_dirs = [
+        str(item.get("path") or "").strip()
+        for item in contents
+        if str(item.get("type") or "") == "dir" and str(item.get("path") or "").strip()
+    ]
+    discovered: list[str] = []
+    for child_path in child_dirs[:MAX_GITHUB_PARENT_SKILL_SCAN]:
+        if github_directory_has_skill_md(repo, child_path, ref):
+            discovered.append(normalize_repo_path(child_path))
+    return discovered or [normalized], bool(discovered)
+
+
+def archive_skill_paths_from_names(names: list[str], path: str) -> tuple[list[str], bool]:
+    normalized = normalize_repo_path(path)
+    target_skill_file = f"{normalized}/SKILL.md".lower()
+    direct_children: set[str] = set()
+    has_skill_md = False
+    for name in names:
+        parts = [part for part in name.split("/") if part]
+        if len(parts) < 3:
+            continue
+        relative = "/".join(parts[1:])
+        if relative.lower() == target_skill_file:
+            has_skill_md = True
+            continue
+        prefix = f"{normalized}/"
+        if not relative.lower().startswith(prefix.lower()) or not relative.lower().endswith("/skill.md"):
+            continue
+        child_parts = relative[len(prefix) :].split("/")
+        if len(child_parts) == 2 and child_parts[1].lower() == "skill.md":
+            direct_children.add(f"{normalized}/{child_parts[0]}")
+    if has_skill_md:
+        return [normalized], False
+    discovered = sorted(direct_children)
+    return discovered or [normalized], bool(discovered)
+
+
+def discover_github_skill_paths_from_archive(repo: str, path: str, ref: str) -> tuple[list[str], bool]:
+    encoded_repo = "/".join(urllib.parse.quote(part, safe="") for part in repo.split("/", 1))
+    encoded_ref = urllib.parse.quote(ref or "main", safe="")
+    request = urllib.request.Request(
+        f"https://codeload.github.com/{encoded_repo}/zip/{encoded_ref}",
+        headers={"User-Agent": GITHUB_API_USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = response.read()
+    except urllib.error.HTTPError as exc:
+        raise ApiError(f"读取 GitHub 源码归档失败：HTTP {exc.code}", HTTPStatus.BAD_GATEWAY) from exc
+    except urllib.error.URLError as exc:
+        raise ApiError(f"读取 GitHub 源码归档失败：{exc.reason}", HTTPStatus.BAD_GATEWAY) from exc
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            return archive_skill_paths_from_names(archive.namelist(), path)
+    except zipfile.BadZipFile as exc:
+        raise ApiError("GitHub 源码归档格式无效。", HTTPStatus.BAD_GATEWAY) from exc
+
+
+def discover_github_skill_paths(repo: str, path: str, ref: str) -> tuple[list[str], bool, str]:
+    try:
+        paths, is_parent = discover_github_skill_paths_from_api(repo, path, ref)
+        return paths, is_parent, "github-api"
+    except ApiError as exc:
+        if "HTTP 403" not in exc.message:
+            raise
+        paths, is_parent = discover_github_skill_paths_from_archive(repo, path, ref)
+        return paths, is_parent, "github-archive"
+
+
+def expand_github_install_paths(
+    target: tuple[str, str, list[str]] | None,
+) -> tuple[list[str], dict[str, Any]]:
+    if not target:
+        return [], {}
+    repo, ref, paths = target
+    if not paths:
+        return [], {}
+
+    expanded: list[str] = []
+    expanded_from: list[str] = []
+    discovery_methods: set[str] = set()
+    for path in paths:
+        discovered, is_parent, discovery_method = discover_github_skill_paths(repo, path, ref)
+        expanded.extend(discovered)
+        discovery_methods.add(discovery_method)
+        if is_parent:
+            expanded_from.append(normalize_repo_path(path))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for path in expanded:
+        normalized = normalize_repo_path(path)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            deduped.append(normalized)
+
+    details: dict[str, Any] = {"paths": deduped, "discovery": ",".join(sorted(discovery_methods))}
+    if expanded_from:
+        installable: list[str] = []
+        skipped_existing: list[str] = []
+        for path in deduped:
+            skill_name = safe_skill_name(repo_path_basename(path))
+            if safe_child(LIBRARY_DIR, skill_name).exists():
+                skipped_existing.append(skill_name)
+                continue
+            installable.append(path)
+        if not installable and skipped_existing:
+            raise ApiError(f"目录下技能均已安装：{', '.join(skipped_existing)}")
+        details["expandedFrom"] = expanded_from
+        details["skippedExisting"] = skipped_existing
+        details["paths"] = installable
+        return installable, details
+    return deduped, details
+
+
+def github_repo_from_source_value(source_value: str, ref: str) -> tuple[str, str, str | None] | None:
+    value = str(source_value or "").strip()
+    if not value:
+        return None
+    if "://" in value:
+        return parse_github_install_url(value, ref)
+    parts = [part for part in value.split("/") if part]
+    if len(parts) == 2 and all(re.match(r"^[\w.-]+$", part) for part in parts):
+        return f"{parts[0]}/{parts[1]}", ref or "main", None
+    return None
+
+
+def github_source_for_skill(name: str, entry: dict[str, Any]) -> dict[str, Any] | None:
+    source = entry.get("source") if isinstance(entry.get("source"), dict) else {}
+    if source.get("type") != "github":
+        return None
+    ref = str(source.get("ref") or "main").strip() or "main"
+    parsed = github_repo_from_source_value(str(source.get("source") or ""), ref)
+    if not parsed:
+        return None
+    repo, parsed_ref, url_path = parsed
+    ref = str(source.get("ref") or parsed_ref or "main").strip() or "main"
+    paths = normalize_list(source.get("path") or source.get("paths"))
+    if not paths and url_path:
+        paths = [url_path]
+    normalized_paths = [normalize_repo_path(path) for path in paths if normalize_repo_path(path)]
+
+    skill_path = ""
+    for path in normalized_paths:
+        if repo_path_basename(path) == name:
+            skill_path = path
+            break
+    if not skill_path and len(normalized_paths) == 1:
+        skill_path = normalized_paths[0]
+    if not skill_path and url_path and repo_path_basename(url_path) == name:
+        skill_path = normalize_repo_path(url_path)
+    if not skill_path:
+        return {
+            "name": name,
+            "repo": repo,
+            "ref": ref,
+            "path": "",
+            "source": str(source.get("source") or ""),
+            "error": "无法从来源信息推导该 skill 的 repo 内路径。",
+        }
+    return {
+        "name": name,
+        "repo": repo,
+        "ref": ref,
+        "path": skill_path,
+        "source": str(source.get("source") or ""),
+        "installedAt": str(source.get("installedAt") or ""),
+    }
+
+
+def read_local_skill_file_bytes(name: str, entry: dict[str, Any]) -> tuple[bytes, str]:
+    candidates: list[Path] = []
+    if entry.get("libraryPath"):
+        candidates.append(Path(str(entry["libraryPath"])) / "SKILL.md")
+    if entry.get("skillMdPath"):
+        candidates.append(Path(str(entry["skillMdPath"])))
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if not is_relative_to(resolved, LIBRARY_DIR) or not resolved.exists() or not resolved.is_file():
+            continue
+        return resolved.read_bytes(), str(resolved)
+    raise ApiError(f"未找到 {name} 的本地 SKILL.md。", HTTPStatus.NOT_FOUND)
+
+
+def compare_github_skill(
+    name: str,
+    entry: dict[str, Any],
+    *,
+    include_text: bool = False,
+    include_commit: bool = False,
+    remote_tree: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    source = github_source_for_skill(name, entry)
+    if not source:
+        return {"name": name, "status": "not-github", "hasUpdate": False, "error": "该技能不是 GitHub 来源。"}
+    if source.get("error"):
+        return {**source, "status": "unknown", "hasUpdate": False}
+
+    remote_skill_md = f"{source['path']}/SKILL.md"
+    local_bytes, local_path = read_local_skill_file_bytes(name, entry)
+    local_sha = git_blob_sha(local_bytes)
+    remote_item: dict[str, Any] | None = None
+    remote_bytes: bytes | None = None
+    if remote_tree is not None:
+        remote_item = remote_tree.get(remote_skill_md)
+        if not remote_item:
+            return {
+                **source,
+                "status": "missing-remote",
+                "hasUpdate": False,
+                "localPath": local_path,
+                "localSha": local_sha,
+                "remotePath": remote_skill_md,
+                "error": "GitHub 上未找到该技能的 SKILL.md。",
+            }
+    if remote_tree is None or include_text:
+        remote_contents = github_contents(source["repo"], remote_skill_md, source["ref"])
+        if not isinstance(remote_contents, dict):
+            return {
+                **source,
+                "status": "missing-remote",
+                "hasUpdate": False,
+                "localPath": local_path,
+                "localSha": local_sha,
+                "remotePath": remote_skill_md,
+                "error": "GitHub 上未找到该技能的 SKILL.md。",
+            }
+        remote_item = remote_contents
+        remote_bytes = decode_github_file(remote_contents)
+    remote_sha = str((remote_item or {}).get("sha") or (git_blob_sha(remote_bytes) if remote_bytes is not None else ""))
+    same = local_sha == remote_sha if remote_bytes is None else local_bytes == remote_bytes
+    commit = github_latest_commit_for_path(source["repo"], remote_skill_md, source["ref"]) if include_commit else {}
+    result = {
+        **source,
+        "status": "up-to-date" if same else "updated",
+        "hasUpdate": not same,
+        "localPath": local_path,
+        "localSha": local_sha,
+        "remotePath": remote_skill_md,
+        "remoteSha": remote_sha,
+        "remoteUrl": (remote_item or {}).get("html_url") or f"https://github.com/{source['repo']}/blob/{source['ref']}/{remote_skill_md}",
+        "remoteUpdatedAt": commit.get("date") or "",
+        "remoteCommit": commit,
+    }
+    if include_text:
+        result["localText"] = text_from_bytes(local_bytes)
+        result["remoteText"] = text_from_bytes(remote_bytes or b"")
+    return result
+
+
+def github_sources_view() -> dict[str, Any]:
+    registry = read_registry_state()
+    groups: dict[str, dict[str, Any]] = {}
+    for name, entry in sorted(registry.get("skills", {}).items(), key=lambda item: item[0].lower()):
+        source = github_source_for_skill(name, entry)
+        if not source:
+            continue
+        key = f"{source.get('repo') or 'unknown'}@{source.get('ref') or 'main'}"
+        group = groups.setdefault(
+            key,
+            {
+                "key": key,
+                "repo": source.get("repo") or "",
+                "ref": source.get("ref") or "main",
+                "source": source.get("source") or "",
+                "url": f"https://github.com/{source.get('repo')}" if source.get("repo") else "",
+                "skills": [],
+                "_entries": [],
+            },
+        )
+        group["_entries"].append({"name": name, "entry": entry, "source": source})
+
+    for group in groups.values():
+        remote_tree: dict[str, dict[str, Any]] = {}
+        tree_error = ""
+        if group.get("repo"):
+            try:
+                group["remote"] = github_repo_metadata(str(group.get("repo") or ""))
+                remote_tree = github_tree_map(str(group.get("repo") or ""), str(group.get("ref") or "main"))
+            except (ApiError, OSError, ValueError, json.JSONDecodeError) as exc:
+                tree_error = str(exc)
+        for bundled in group.pop("_entries", []):
+            name = bundled["name"]
+            entry = bundled["entry"]
+            source = bundled["source"]
+            if tree_error:
+                item = {**source, "status": "error", "hasUpdate": False, "error": tree_error}
+            else:
+                try:
+                    item = compare_github_skill(name, entry, remote_tree=remote_tree)
+                except (ApiError, OSError, ValueError, json.JSONDecodeError) as exc:
+                    item = {**source, "status": "error", "hasUpdate": False, "error": str(exc)}
+            item["title"] = entry.get("title") or name
+            item["enabled"] = bool(entry.get("enabled"))
+            item["category"] = entry.get("category") or "未分类"
+            group["skills"].append(item)
+
+    repositories = list(groups.values())
+    for group in repositories:
+        skills = group.get("skills", [])
+        group["counts"] = {
+            "total": len(skills),
+            "updated": len([item for item in skills if item.get("status") == "updated"]),
+            "ok": len([item for item in skills if item.get("status") == "up-to-date"]),
+            "issues": len([item for item in skills if item.get("status") not in {"updated", "up-to-date"}]),
+        }
+    repositories.sort(key=lambda item: str(item.get("repo") or "").lower())
+    return {"checkedAt": now_iso(), "repositories": repositories}
+
+
+def read_skill_remote_diff(name: str) -> dict[str, Any]:
+    name = safe_skill_name(name)
+    registry = read_registry_state()
+    entry = registry["skills"].get(name)
+    if not entry:
+        raise ApiError("未找到该技能。", HTTPStatus.NOT_FOUND)
+    comparison = compare_github_skill(name, entry, include_text=True)
+    if comparison.get("status") in {"not-github", "unknown", "missing-remote", "error"}:
+        raise ApiError(str(comparison.get("error") or "该技能无法读取 GitHub 远端内容。"), HTTPStatus.BAD_REQUEST)
+    diff_lines = difflib.unified_diff(
+        str(comparison.pop("localText", "")).splitlines(),
+        str(comparison.pop("remoteText", "")).splitlines(),
+        fromfile=f"local/skills/{name}/SKILL.md",
+        tofile=f"github/{comparison['repo']}/{comparison['remotePath']}",
+        lineterm="",
+    )
+    return {
+        "skill": name,
+        "comparison": comparison,
+        "diff": "\n".join(diff_lines),
+    }
+
+
 def install_from_local_path(source_path: Path, preferred_name: str | None = None) -> list[str]:
     source_path = source_path.expanduser().resolve()
     if not source_path.exists() or not source_path.is_dir():
@@ -1458,26 +2372,22 @@ def run_installer(body: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
     cmd = [sys.executable, str(INSTALLER_SCRIPT), "--dest", str(LIBRARY_DIR)]
 
     source = str(body.get("source") or body.get("url") or "").strip()
-    repo = str(body.get("repo") or "").strip()
-    paths = normalize_list(body.get("path") or body.get("paths"))
-    ref = str(body.get("ref") or "").strip()
     name = str(body.get("name") or "").strip()
     method = str(body.get("method") or "auto").strip()
+    install_details: dict[str, Any] = {}
 
-    if source:
-        if re.match(r"^[a-zA-Z]:\\|^\\\\|^/|^\.", source):
-            installed = install_from_local_path(Path(source), preferred_name=name or None)
-            return installed, {"mode": "local-path", "codex": health}
-        cmd.extend(["--url", source])
-    elif repo:
-        cmd.extend(["--repo", repo])
-    else:
-        raise ApiError("需要提供 GitHub URL、repo/path 或本地技能目录。")
+    target = github_install_target(source=source, repo="", paths=[], ref="") if source else None
+    if not target:
+        raise ApiError("请提供 GitHub tree 地址，例如 https://github.com/iOfficeAI/OfficeCLI/tree/main/skills。")
+    repo, ref, paths = target
+    if "/tree/" not in urlparse(source).path or not paths:
+        raise ApiError("GitHub 地址必须指向包含技能目录的 tree 路径，例如 https://github.com/iOfficeAI/OfficeCLI/tree/main/skills。")
 
-    for skill_path in paths:
-        cmd.extend(["--path", skill_path])
-    if ref:
-        cmd.extend(["--ref", ref])
+    expanded_paths, install_details = expand_github_install_paths((repo, ref, paths))
+    if not expanded_paths:
+        raise ApiError("GitHub tree 地址未指向可安装的技能目录。")
+    install_details.update({"repo": repo, "ref": ref, "paths": expanded_paths})
+    cmd.extend(["--repo", repo, "--path", *expanded_paths, "--ref", ref])
     if name:
         safe_skill_name(name)
         cmd.extend(["--name", name])
@@ -1507,7 +2417,9 @@ def run_installer(body: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
         installed.append(name)
     if not installed:
         installed = sorted(after)
-    return installed, {"mode": "github", "command": cmd, "stdout": stdout, "stderr": stderr, "codex": health}
+    details = {"mode": "github", "command": cmd, "stdout": stdout, "stderr": stderr, "codex": health}
+    details.update(install_details)
+    return installed, details
 
 
 def install_skill(body: dict[str, Any]) -> dict[str, Any]:
@@ -1516,11 +2428,15 @@ def install_skill(body: dict[str, Any]) -> dict[str, Any]:
     source_payload = {
         "type": details["mode"],
         "source": body.get("source") or body.get("url") or body.get("repo") or "",
-        "path": body.get("path") or body.get("paths") or "",
-        "ref": body.get("ref") or "",
+        "path": details.get("paths") or "",
+        "ref": details.get("ref") or "",
         "installedAt": now_iso(),
         "via": "local-codex-skill-installer",
     }
+    if details.get("expandedFrom"):
+        source_payload["expandedFrom"] = details["expandedFrom"]
+    if details.get("skippedExisting"):
+        source_payload["skippedExisting"] = details["skippedExisting"]
     category = str(body.get("category") or "").strip()
     notes = str(body.get("notes") or "").strip()
     for name in installed:
@@ -1565,8 +2481,11 @@ def enable_skill(name: str) -> dict[str, Any]:
         registry = sync_registry()
         return {"message": "该技能已经存在于 .codex/skills。", "state": registry_view(registry)}
     copytree_clean(source, dest)
-    append_audit("enable-skill", {"skill": name, "from": str(source), "to": str(dest)})
+    toggle_at = now_iso()
+    append_audit("enable-skill", {"skill": name, "from": str(source), "to": str(dest)}, event_time=toggle_at)
     registry = sync_registry()
+    record_skill_lifecycle(registry, name, "enable", toggle_at, {"from": str(source), "to": str(dest)})
+    save_registry(registry)
     return {"message": "已启用。重启 Codex 后新技能会被会话加载。", "state": registry_view(registry)}
 
 
@@ -1583,7 +2502,12 @@ def disable_skill(name: str) -> dict[str, Any]:
         if not is_relative_to(dest, CODEX_SKILLS_DIR):
             raise ApiError("目标路径越界，已拒绝操作。", HTTPStatus.FORBIDDEN)
         shutil.rmtree(dest)
-        append_audit("disable-skill", {"skill": name, "removed": str(dest)})
+        toggle_at = now_iso()
+        append_audit("disable-skill", {"skill": name, "removed": str(dest)}, event_time=toggle_at)
+        registry = sync_registry()
+        record_skill_lifecycle(registry, name, "disable", toggle_at, {"removed": str(dest)})
+        save_registry(registry)
+        return {"message": "已停用。项目技能库中的副本仍然保留。", "state": registry_view(registry)}
     registry = sync_registry()
     return {"message": "已停用。项目技能库中的副本仍然保留。", "state": registry_view(registry)}
 
@@ -2169,17 +3093,31 @@ def update_repository_config(body: dict[str, Any]) -> dict[str, Any]:
     settings = read_settings()
     repo_url = str(body.get("skillsRepoUrl") or body.get("url") or "").strip()
     repo_dir = str(body.get("skillsRepoDir") or body.get("dir") or "").strip()
+    previous_dir = SKILLS_REPO_DIR
+    previous_url = SKILLS_REPO_URL
+    previous_library = LIBRARY_DIR
+    previous_db = SKILLS_DB_FILE
+    candidate_settings = dict(settings)
     if repo_url:
-        settings["skillsRepoUrl"] = repo_url
+        candidate_settings["skillsRepoUrl"] = repo_url
     elif "skillsRepoUrl" in body or "url" in body:
-        settings.pop("skillsRepoUrl", None)
+        candidate_settings.pop("skillsRepoUrl", None)
     if repo_dir:
-        settings["skillsRepoDir"] = repo_dir
+        candidate_settings["skillsRepoDir"] = repo_dir
     elif "skillsRepoDir" in body or "dir" in body:
-        settings.pop("skillsRepoDir", None)
-    write_settings(settings)
-    apply_repository_settings(settings)
-    ensure_skills_repository()
+        candidate_settings.pop("skillsRepoDir", None)
+    candidate_dir, _ = repository_values(candidate_settings)
+    validate_skills_repository_dir(candidate_dir)
+    try:
+        apply_repository_settings(candidate_settings)
+        ensure_skills_repository()
+    except Exception:
+        globals()["SKILLS_REPO_DIR"] = previous_dir
+        globals()["SKILLS_REPO_URL"] = previous_url
+        globals()["LIBRARY_DIR"] = previous_library
+        globals()["SKILLS_DB_FILE"] = previous_db
+        raise
+    write_settings(candidate_settings)
     with SKILL_VERSION_LOCK:
         global SKILL_VERSION_PENDING_SINCE, SKILL_VERSION_LAST_SIGNATURE
         SKILL_VERSION_PENDING_SINCE = None
@@ -2203,6 +3141,25 @@ def test_repository_config() -> dict[str, Any]:
         "message": "skills 仓库测试完成。",
         "repository": repository_config_view(),
         "result": commit_result,
+    }
+
+
+def health_view() -> dict[str, Any]:
+    repo = repository_health()
+    ok = not repo["errors"]
+    return {
+        "ok": ok,
+        "status": "ok" if ok else "degraded",
+        "version": "0.1",
+        "projectRoot": str(BASE_DIR),
+        "skillsRepo": str(SKILLS_REPO_DIR),
+        "repository": repo,
+        "background": {
+            "usageStatsRefreshing": usage_stats_service.is_refreshing(),
+            "versionCommitPending": SKILL_VERSION_PENDING_SINCE is not None,
+            "versionCommitting": SKILL_VERSION_COMMITTING.is_set(),
+        },
+        "time": now_iso(),
     }
 
 
@@ -2333,15 +3290,7 @@ def search_skill_contexts(name: str, query: dict[str, list[str]]) -> dict[str, A
 
 
 def read_audit(limit: int = 100) -> list[dict[str, Any]]:
-    if not AUDIT_FILE.exists():
-        return []
-    lines = AUDIT_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
-    events: list[dict[str, Any]] = []
-    for line in lines[-limit:]:
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
+    events = read_audit_events(limit=limit)
     events.reverse()
     return events
 
@@ -2376,7 +3325,7 @@ class Handler(SimpleHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or "0")
         if length <= 0:
             return {}
-        raw = self.rfile.read(length).decode("utf-8")
+        raw = self.rfile.read(length).decode("utf-8-sig")
         if not raw.strip():
             return {}
         try:
@@ -2391,6 +3340,9 @@ class Handler(SimpleHTTPRequestHandler):
         if not path.startswith("/api/"):
             return False
         try:
+            if method == "GET" and path == "/api/health":
+                self.send_json(health_view())
+                return True
             if method == "GET" and path == "/api/state":
                 self.send_json(registry_view(read_registry_state()))
                 return True
@@ -2419,6 +3371,9 @@ class Handler(SimpleHTTPRequestHandler):
                 diff_path = (query.get("path") or [""])[0]
                 self.send_json(read_pending_diff(diff_path))
                 return True
+            if method == "GET" and path == "/api/sources/github":
+                self.send_json(github_sources_view())
+                return True
             if method == "POST" and path == "/api/sync":
                 registry = sync_registry()
                 classification = auto_classify_registry_after_change(registry, reason="sync")
@@ -2444,7 +3399,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(install_skill(self.read_body()))
                 return True
 
-            skill_match = re.match(r"^/api/skills/([^/]+)(?:/(enable|disable|contexts|markdown|history|classify|localize))?$", path)
+            skill_match = re.match(r"^/api/skills/([^/]+)(?:/(enable|disable|contexts|markdown|history|remote-diff|classify|localize))?$", path)
             if skill_match:
                 skill_name = skill_match.group(1)
                 action = skill_match.group(2)
@@ -2466,6 +3421,9 @@ class Handler(SimpleHTTPRequestHandler):
                 if method == "GET" and action == "history":
                     limit = int((query.get("limit") or ["40"])[0])
                     self.send_json(read_skill_history(skill_name, limit=limit))
+                    return True
+                if method == "GET" and action == "remote-diff":
+                    self.send_json(read_skill_remote_diff(skill_name))
                     return True
                 if method == "POST" and action == "classify":
                     body = self.read_body()

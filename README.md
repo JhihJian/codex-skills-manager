@@ -4,16 +4,17 @@
 
 ## 功能
 
-- 通过本地 Codex 自带的 `skill-installer` 脚本安装 GitHub 或本地目录中的 skill。
+- 通过本地 Codex 自带的 `skill-installer` 脚本安装 GitHub tree URL 中的 skill。
 - 将技能安装到独立 skills Git 仓库根目录下的 `skills/`，再按需复制到 `C:\Users\user\.codex\skills` 启用。
 - 点击同步时扫描 `C:\Users\user\.codex\skills`，发现不在独立 skills 仓库中的额外技能会自动复制到 `skills/` 并登记为“本机纳管”；普通页面加载和 `GET /api/state` 只读取状态，不执行纳管写入。同步和安装完成后，未填写分类的技能会自动调用本机 `codex exec` 识别分类。
-- 在独立 skills 仓库根目录的 `codex-skills-manager.sqlite3` 记录技能来源、分类、标签、依赖、启用状态、备注和同步时间。
+- 在独立 skills 仓库根目录的 `codex-skills-manager.sqlite3` 记录技能来源、分类、标签、依赖、启用状态、启停记录、备注和同步时间。
 - 顶部“自动分类”按钮会对当前未分类技能补跑识别；按住 Shift 点击该按钮可以强制重分已有分类。
 - 顶部“中文信息”按钮会为英文或中英混合的 skill 生成中文名称和中文触发条件，并保存到 registry 的本地化元数据；左侧可以在“中文/原文”视图间切换，详情页“中文”页签支持查看、生成和手动修正。该功能不修改原始 `SKILL.md`。
 - 管理台可以展示技能使用频率。该功能已模块化为独立统计服务，可在“设置”页单独开启或关闭；开启后服务运行期间每天定时扫描一次本机 Codex 会话，结果缓存到 `data/usage-stats.json`。顶部“使用统计”按钮可手动刷新。
 - 用户点击“检索上下文”后读取本机 Codex 会话 JSONL，快速查看某个 skill 在会话中的上下文片段，用于判断技能是否有效；切换到上下文页不会自动扫描会话。检索结果优先展示按会话、角色和正文去重后的用户/助手正文，并过滤工具调用、函数调用输出、DOM 快照、浏览器自动化日志和长 JSON 工具输出等低价值片段。
 - 顶部“技能审查”入口会打开独立问题审查页，用于扩展多个 skills 常见问题审查项；当前支持按需扫描本机 Codex 会话 JSONL，识别长期未真实触发使用的技能。审查不会把系统注入的技能列表、用户普通提及或上下文关键词命中当作使用；默认只有助手执行过程中的 `SKILL.md` 读取工具调用计为真实使用证据，助手明确使用某技能的声明仅作为辅助证据。
 - 详情页“版本”页签会从 Git 提交记录展示当前 skill 的历史版本、提交时间、作者、提交说明和涉及文件的增删统计；如果仓库还没有提交记录，会在首次提交后开始展示。
+- 详情页“来源”页签可以按 GitHub 仓库聚合展示从哪些仓库安装了哪些 skills，并按需检查远端 `SKILL.md` 是否有更新；发现差异时可直接查看本地版本与 GitHub 当前版本的 diff。
 - 服务运行期间会监测独立 skills 仓库中的 `skills/` 和 `codex-skills-manager.sqlite3`。检测到受管技能变更后，如果 1 小时内没有继续变化，就自动执行一次限定路径的 Git 提交，提交信息会列出涉及的 skill 和文件数量；配置了 GitHub remote 时会尝试 push。
 - 管理台默认折叠安装面板，桌面端保留三栏工作台，移动端优先展示技能列表和详情；图标按钮使用一致的线性图标和可访问名称，`SKILL.md` 预览会渲染 Markdown，默认展开完整文档并可收起为摘要。
 - 搜索、筛选、切换分类、使用状态筛选或排序后，如果当前详情不在可见结果中，页面会自动选中第一条可见技能；没有可见结果时会清空详情并展示空态。
@@ -85,15 +86,27 @@ $env:CODEX_SKILLS_REPO_DIR = "D:\tmp\codex-skills-library"
 
 也可以在页面顶部展开安装面板，在“Skills GitHub 仓库”和“本地仓库路径”中保存配置。页面配置会写入本机 `data/settings.json`，该文件不进入 Git；点击“测试提交”会立即提交并推送当前独立 skills 仓库中的待提交变更。
 
+仓库配置也可以在设置页的“仓库”分组中修改：
+
+```text
+http://127.0.0.1:8876/settings.html
+```
+
+保存仓库配置前，服务会先校验本地目录。目录不能是磁盘根、用户 Home、`.codex` 目录、当前管理器项目根目录，也不能是已有的非 skills Git 仓库或包含非 skills 仓库文件的目录。验证通过并完成初始化后，才会写入 `data/settings.json`。
+
 历史兼容：如果本项目内已有旧的 `skills-library/` 或 `data/skills-registry.json`，首次初始化外部仓库时会迁移到 `skills/` 和 `codex-skills-manager.sqlite3`。迁移后，本项目内的旧目录不再作为读写位置。
 
 ## 安装技能
 
-页面顶部“来源”支持三类输入：
+页面顶部安装面板只需要填写一个 GitHub tree URL。系统会从 URL 自动识别仓库、分支和 repo 内路径，不再需要单独填写“路径”或“ref”。例如：
 
-- GitHub tree URL：例如 `https://github.com/openai/skills/tree/main/skills/.curated/example-skill`
-- `owner/repo`：需要同时填写 repo 内的 skill 路径，例如 `skills/.curated/example-skill`
-- 本地目录：可以是单个包含 `SKILL.md` 的技能目录，也可以是包含多个技能子目录的父目录
+```text
+https://github.com/iOfficeAI/OfficeCLI/tree/main/skills
+```
+
+URL 可以指向单个 skill，也可以指向父目录；指向父目录时会批量安装其下所有直接包含 `SKILL.md` 的技能子目录。
+
+父目录安装会优先通过 GitHub API 识别技能目录；当公共 API 配额耗尽并返回 403 时，会自动改用 GitHub 源码归档扫描，不需要填写令牌或等待配额恢复。
 
 安装过程会先执行 `codex --version` 确认本地 Codex 可用，再调用：
 
@@ -101,12 +114,12 @@ $env:CODEX_SKILLS_REPO_DIR = "D:\tmp\codex-skills-library"
 C:\Users\user\.codex\skills\.system\skill-installer\scripts\install-skill-from-github.py
 ```
 
-安装完成后，页面会登记来源信息。启用普通技能前需要二次确认，确认后才会复制到 `C:\Users\user\.codex\skills`。新增或启用后的技能需要重启 Codex 会话后才会进入新的技能列表。
+安装完成后，页面会登记来源信息。安装只写入独立 skills 仓库的 `skills/` 目录，不会自动启用；启用普通技能前需要二次确认，确认后才会复制到 `C:\Users\user\.codex\skills` 并记录启用时间。新增或启用后的技能需要重启 Codex 会话后才会进入新的技能列表。
 
 ## 数据目录
 
 - `<skills-repo>/skills/`：独立 Git 仓库中的技能目录。
-- `<skills-repo>/codex-skills-manager.sqlite3`：技能来源、分类、依赖、启用状态、中文信息和备注等管理数据。
+- `<skills-repo>/codex-skills-manager.sqlite3`：技能来源、分类、依赖、启用状态、启停记录、中文信息和备注等管理数据。
 - `data/usage-stats.json`：每日生成的技能使用频率统计缓存。
 - `data/audit-log.jsonl`：安装、启用、停用、自动纳管、资料编辑的审计记录。
 - `public/`：管理页面前端。
@@ -132,6 +145,22 @@ C:\Users\user\.codex\skills\.system\skill-installer\scripts\install-skill-from-g
 - `GET /api/skills/<skill-name>/history`：读取单个技能的 Git 版本记录；支持 `?limit=40`。
 - `GET /api/diff?path=<repo-relative-path>`：读取受管 skills 仓库中文件的未提交 diff。
 
+## GitHub 来源与远端更新
+
+详情页“来源”页签保留当前技能的来源详情，并额外提供“GitHub 来源”检查。点击“检查更新”后，服务只读扫描 registry 中 `source.type = github` 的技能来源，按 `owner/repo + ref` 聚合展示：
+
+- GitHub 仓库、ref、来源地址。
+- 该仓库安装到本地项目库的 skills 列表和 repo 内路径。
+- 每个 skill 的远端 `SKILL.md` 内容 SHA 和状态：已同步、有更新、远端缺失或检查失败；仓库分组会展示 GitHub 最近 push 时间。
+- 点击技能行会调用远端 diff 接口，展示本地 `<skills-repo>/skills/<skill>/SKILL.md` 与 GitHub 当前 `SKILL.md` 的 unified diff。
+
+这些检查不会写入 SQLite、不会自动更新本地文件，也不会启用技能。私有仓库或更高 GitHub API 配额可以通过 `GITHUB_TOKEN` 或 `GH_TOKEN` 环境变量提供访问令牌。
+
+相关接口：
+
+- `GET /api/sources/github`：按 GitHub 仓库聚合读取技能来源并检查远端状态。
+- `GET /api/skills/<skill-name>/remote-diff`：读取单个 GitHub 来源技能的本地/远端 `SKILL.md` diff。
+
 可用环境变量：
 
 - `CODEX_SKILL_VERSIONING_ENABLED=0`：关闭服务内技能版本自动提交；历史页仍可读取已有 Git 提交。
@@ -143,7 +172,9 @@ C:\Users\user\.codex\skills\.system\skill-installer\scripts\install-skill-from-g
 
 ## 状态与同步
 
-`GET /api/state` 用于只读状态展示，会扫描独立 skills 仓库和当前 Codex skills 目录生成页面数据，但不会复制目录、写入 SQLite 或追加审计日志。需要自动纳管 `.codex/skills` 中额外技能时，点击页面顶部同步按钮或调用 `POST /api/sync`；该操作会把额外技能复制到 `<skills-repo>/skills/` 并记录审计日志，并在同步后尝试为仍是“未分类”的技能自动分类。
+`GET /api/state` 用于只读状态展示，会扫描独立 skills 仓库和当前 Codex skills 目录生成页面数据，但不会复制目录、写入 SQLite 或追加审计日志。状态数据会返回每个技能的 `lifecycle`，包含最近启用时间、最近停用时间、最近启停动作和未启用技能的停用时长；旧版本留下的 `data/audit-log.jsonl` 启停审计也会用于补齐最近启停时间。需要自动纳管 `.codex/skills` 中额外技能时，点击页面顶部同步按钮或调用 `POST /api/sync`；该操作会把额外技能复制到 `<skills-repo>/skills/` 并记录审计日志，并在同步后尝试为仍是“未分类”的技能自动分类。
+
+`GET /api/health` 是轻量健康检查接口，只返回项目路径、skills 仓库是否存在、SQLite 是否可打开和后台任务状态，不扫描会话记录，也不触发同步、分类、本地化或 Git 提交。启动脚本和 smoke 测试都使用该接口确认服务可用。
 
 ## 自动分类
 
@@ -258,4 +289,54 @@ http://127.0.0.1:8876/reviews.html
 
 ## 注意事项
 
-系统技能位于 `C:\Users\user\.codex\skills\.system`，页面只展示，不允许停用。停用普通技能前需要二次确认；确认后只会删除 `C:\Users\user\.codex\skills\<skill-name>` 下的启用副本，独立 skills 仓库中的 `skills/<skill-name>` 会保留。
+系统技能位于 `C:\Users\user\.codex\skills\.system`，页面只展示，不允许停用。停用普通技能前需要二次确认；确认后只会删除 `C:\Users\user\.codex\skills\<skill-name>` 下的启用副本，独立 skills 仓库中的 `skills/<skill-name>` 会保留，并在技能详情和审计日志中留下停用时间。未启用技能会在列表和详情里展示最近停用时间及已经停用多久。
+
+## 验收与回滚
+
+启动后先做只读健康检查：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8876/api/health
+```
+
+也可以运行 smoke 测试脚本。该脚本只读取首页、`/api/health`、`/api/settings` 和 `/api/state`，不会触发同步、分类、本地化、使用统计刷新或 Git 提交：
+
+```powershell
+.\scripts\smoke-test.ps1 -HostName 127.0.0.1 -Port 8876
+```
+
+启动脚本会在后台进程创建后轮询 `/api/health`。如果服务未能变为健康状态，会输出 `work/server.err.log` 的末尾内容并返回非零。常用日志位置：
+
+- `work/server.log`：服务标准输出和访问日志。
+- `work/server.err.log`：Python 启动、端口绑定和运行异常。
+- `work/server.pid`：当前后台服务的 PID、端口、项目根目录和启动时间。
+- `data/audit-log.jsonl`：安装、启用、停用、同步、仓库配置和自动提交审计。
+
+升级或大改前建议备份：
+
+- `data/settings.json`
+- `data/audit-log.jsonl`
+- `data/usage-stats.json`
+- 独立 skills 仓库目录，例如 `D:\tmp\codex-skills-library`
+- 独立 skills 仓库中的 `codex-skills-manager.sqlite3`
+
+回滚管理器代码时，先停止服务，再切回旧版本并重新启动：
+
+```powershell
+.\scripts\stop-server.ps1
+git status --short
+git switch <old-branch-or-tag>
+.\scripts\start-server.ps1
+.\scripts\smoke-test.ps1
+```
+
+回滚 skills 数据时，优先使用独立 skills 仓库的 Git 历史：
+
+```powershell
+cd D:\tmp\codex-skills-library
+git status --short
+git log --oneline -- skills codex-skills-manager.sqlite3
+git revert <commit>
+```
+
+如果需要从备份恢复 SQLite 或 settings，先停止服务，再替换对应文件，确认路径仍通过仓库配置校验后重新启动并运行 smoke 测试。
