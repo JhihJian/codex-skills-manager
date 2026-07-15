@@ -507,6 +507,26 @@ function usageCountText(usage) {
   return count ? `${count} 次` : "无";
 }
 
+function formatTokenCount(value) {
+  const count = Number(value || 0);
+  if (count < 1000) return String(count);
+  if (count < 1000000) return `${(count / 1000).toFixed(count < 10000 ? 1 : 0)}k`;
+  return `${(count / 1000000).toFixed(count < 10000000 ? 1 : 0)}m`;
+}
+
+function tokenUsageText(skill) {
+  const usage = skill?.tokenUsage || {};
+  if (!skill?.enabled) return "未启用";
+  if (usage.error) return usage.error;
+  return usage.counted ? `${formatTokenCount(usage.tokens)} 预注入 token` : "未统计";
+}
+
+function tokenUsageMethodLabel(tokenUsage) {
+  const method = tokenUsage?.method || "estimate:unicode";
+  if (method.startsWith("tiktoken:")) return `${method.slice(9)} 编码`;
+  return "本地 Unicode 估算";
+}
+
 function usageStatsUpdatedText() {
   const usageStats = state.data?.usageStats || {};
   if (usageStats.enabled === false) return "使用统计已关闭";
@@ -898,7 +918,7 @@ async function loadPendingDiff(path) {
 }
 
 function resetGithubSourcesPanel() {
-  $("githubSourcesSummary").textContent = "检查 GitHub 来源后展示仓库、技能和更新状态。";
+  $("githubSourcesSummary").textContent = "按仓库展示当前项目库已安装的 skills。";
   $("githubSourcesList").replaceChildren();
   $("remoteDiff").hidden = true;
   $("remoteDiff").querySelector("code").replaceChildren();
@@ -911,13 +931,13 @@ function renderGithubSources(payload) {
   const updatedSkills = repositories.reduce((sum, repo) => sum + Number(repo.counts?.updated || 0), 0);
   const checkedAt = payload?.checkedAt ? ` · ${formatDateTime(payload.checkedAt)}` : "";
   $("githubSourcesSummary").textContent = repositories.length
-    ? `${repositories.length} 个 GitHub 仓库，${totalSkills} 个技能，${updatedSkills} 个有更新${checkedAt}`
-    : "当前项目库没有登记 GitHub 来源的技能。";
+    ? `${repositories.length} 个 GitHub 仓库，${totalSkills} 个已安装 skill，${updatedSkills} 个有更新${checkedAt}`
+    : "当前项目库没有登记 GitHub 来源的已安装 skill。";
   $("remoteDiff").hidden = true;
   $("remoteDiff").querySelector("code").replaceChildren();
   $("githubSourcesList").replaceChildren(
     ...repositories.map((repo) => {
-      const article = document.createElement("article");
+      const article = document.createElement("li");
       article.className = "source-group";
       const head = document.createElement("div");
       head.className = "source-group-head";
@@ -936,10 +956,12 @@ function renderGithubSources(payload) {
       if (!repo.url) link.removeAttribute("href");
       head.append(title, link);
 
-      const skills = document.createElement("div");
+      const skills = document.createElement("ul");
       skills.className = "source-skill-list";
       skills.replaceChildren(
         ...(repo.skills || []).map((skill) => {
+          const item = document.createElement("li");
+          item.className = "source-skill-item";
           const button = document.createElement("button");
           button.type = "button";
           button.className = `source-skill ${remoteStatusTone(skill.status)}`.trim();
@@ -959,7 +981,8 @@ function renderGithubSources(payload) {
           side.append(status, time);
           button.replaceChildren(main, side);
           button.addEventListener("click", () => loadRemoteDiff(skill.name).catch((error) => setStatus(error.message)));
-          return button;
+          item.append(button);
+          return item;
         }),
       );
       article.append(head, skills);
@@ -982,6 +1005,17 @@ function renderGithubSourcesForSelected() {
   }
 }
 
+function openGithubSources() {
+  const skill = selectedSkill() || state.data?.skills?.[0];
+  if (!skill) {
+    setStatus("当前没有可展示的技能来源");
+    return;
+  }
+  state.selected = skill.name;
+  state.tab = "source";
+  render();
+}
+
 async function loadGithubSources(force = false) {
   if (state.githubSourcesLoading) return;
   if (!force && state.githubSources) {
@@ -990,7 +1024,7 @@ async function loadGithubSources(force = false) {
   }
   state.githubSourcesLoading = true;
   $("githubSourcesRefreshButton").disabled = true;
-  $("githubSourcesSummary").textContent = "正在检查 GitHub 来源和远端更新";
+  $("githubSourcesSummary").textContent = "正在读取已安装的 GitHub 来源并检查远端更新";
   $("githubSourcesList").replaceChildren();
   $("remoteDiff").hidden = true;
   $("remoteDiff").querySelector("code").replaceChildren();
@@ -1154,6 +1188,10 @@ function renderDetail() {
     ["使用天数", `${usage.confirmedDayCount || 0} 天`],
     ["最近使用", formatRelativeUsage(usage)],
     ["统计时间", usageStatsUpdatedText()],
+    ["预注入 token", tokenUsageText(skill)],
+    ["按需加载 token", skill.tokenUsage?.lazyCounted ? `${formatTokenCount(skill.tokenUsage.lazyTokens)} token` : "未统计"],
+    ["Token 统计", tokenUsageMethodLabel(state.data.tokenUsage)],
+    ["统计文件", skill.tokenUsage?.path || "无"],
     ["名称", skill.name],
     ["来源", sourceLabel(skill.source)],
     ["来源地址", skill.source?.source || skill.source?.path || ""],
@@ -1202,6 +1240,7 @@ function renderDetail() {
 
 function renderStats() {
   const stats = state.data.stats;
+  const tokenUsage = state.data.tokenUsage || {};
   const usageStats = state.data.usageStats || {};
   const usageSummary = usageStats.stats || {};
   $("totalCount").textContent = stats.total;
@@ -1209,6 +1248,8 @@ function renderStats() {
   $("managedCount").textContent = stats.managed;
   $("systemCount").textContent = stats.system;
   $("usedCount").textContent = usageStats.enabled === false ? "关" : (usageSummary.active || 0) + (usageSummary.stale || 0);
+  $("enabledTokenCount").textContent = formatTokenCount(tokenUsage.totalTokens);
+  $("tokenMetric").title = `当前 ${tokenUsage.enabledSkillCount || 0} 个已启用 skills 的索引，共 ${tokenUsage.totalTokens || 0} 预注入 token；全部按需加载约 ${tokenUsage.totalLazyTokens || 0} token；${tokenUsageMethodLabel(tokenUsage)}`;
   $("usageFilter").value = state.usageFilter;
   $("usageFilter").disabled = !usageStatsEnabled();
   $("usageFilter").title = usageStatsEnabled() ? "按最近确认使用时间筛选技能" : "使用统计已关闭，可在设置页开启";
@@ -1644,6 +1685,7 @@ function bindEvents() {
   $("previewToggle").addEventListener("click", togglePreview);
   $("contextButton").addEventListener("click", loadContexts);
   $("historyRefreshButton").addEventListener("click", () => loadHistory(true).catch((error) => setStatus(error.message)));
+  $("githubSourcesButton").addEventListener("click", openGithubSources);
   $("githubSourcesRefreshButton").addEventListener("click", () => loadGithubSources(true).catch((error) => setStatus(error.message)));
   $("auditButton").addEventListener("click", () => showAudit().catch((error) => setStatus(error.message)));
   $("searchInput").addEventListener("input", (event) => {

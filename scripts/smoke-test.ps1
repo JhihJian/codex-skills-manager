@@ -29,6 +29,7 @@ try {
   $HealthText = $Client.DownloadString("$BaseUrl/api/health")
   $SettingsText = $Client.DownloadString("$BaseUrl/api/settings")
   $StateText = $Client.DownloadString("$BaseUrl/api/state")
+  $TokenUsageText = $Client.DownloadString("$BaseUrl/api/token-usage")
 } finally {
   $Client.Dispose()
 }
@@ -52,5 +53,10 @@ $State = ConvertFrom-Json -InputObject $StateText
 Assert-True -Condition ($StateText.Contains('"skills"')) -Message "/api/state 缺少 skills。"
 Assert-True -Condition ($StateText.Contains('"stats"')) -Message "/api/state 缺少 stats。"
 Assert-True -Condition ($StateText.Contains('"paths"')) -Message "/api/state 缺少 paths。"
+Assert-True -Condition ($StateText.Contains('"tokenUsage"')) -Message "/api/state 缺少 tokenUsage。"
+
+$TokenUsage = ConvertFrom-Json -InputObject $TokenUsageText
+Assert-True -Condition ($TokenUsageText.Contains('"totalTokens"')) -Message "/api/token-usage 缺少 totalTokens。"
+Assert-True -Condition ($TokenUsage.scope -eq "enabled-catalog") -Message "/api/token-usage 范围不是 enabled-catalog。"
 
 Write-Output "Smoke test passed: $BaseUrl"

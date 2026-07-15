@@ -1008,7 +1008,7 @@ input.field-invalid {
 
 .list-header {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   border-bottom: 1px solid var(--hair);
 }
 
@@ -1789,6 +1789,9 @@ input:disabled {
   display: grid;
   gap: 10px;
   margin-bottom: 12px;
+  list-style: none;
+  margin-top: 0;
+  padding: 0;
 }
 
 .source-group {
@@ -1830,6 +1833,18 @@ input:disabled {
 
 .source-skill-list {
   display: grid;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.source-skill-item {
+  min-width: 0;
+  border-bottom: 1px solid var(--hair);
+}
+
+.source-skill-item:last-child {
+  border-bottom: 0;
 }
 
 .source-skill {
@@ -1841,14 +1856,10 @@ input:disabled {
   align-items: center;
   padding: 7px 10px;
   border: 0;
-  border-bottom: 1px solid var(--hair);
+  border: 0;
   background: transparent;
   color: var(--ink);
   text-align: left;
-}
-
-.source-skill:last-child {
-  border-bottom: 0;
 }
 
 .source-skill:hover:not(:disabled) {

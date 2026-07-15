@@ -23,6 +23,12 @@
         <path d="M3 12a9 9 0 1 0 3-6.7" />
         <path d="M3 4v6h6M12 7v6l4 2" />
       </symbol>
+      <symbol id="icon-git-branch" viewBox="0 0 24 24">
+        <circle cx="6" cy="5" r="2.5" />
+        <circle cx="18" cy="19" r="2.5" />
+        <circle cx="18" cy="5" r="2.5" />
+        <path d="M6 7.5v4a7.5 7.5 0 0 0 7.5 7.5H15.5M8.5 5H15.5A2.5 2.5 0 0 1 18 7.5v9" />
+      </symbol>
       <symbol id="icon-power" viewBox="0 0 24 24">
         <path d="M12 2v10" />
         <path d="M18.4 6.6a9 9 0 1 1-12.8 0" />
@@ -84,6 +90,7 @@
             <button class="icon-button" id="usageRefreshButton" title="刷新技能使用频率统计" aria-label="刷新技能使用频率统计"><svg><use href="#icon-chart"></use></svg></button>
           </div>
           <div class="toolbar-group">
+            <button class="icon-button icon-button-labeled" id="githubSourcesButton" title="查看已安装的 GitHub 来源" aria-label="查看已安装的 GitHub 来源"><svg><use href="#icon-git-branch"></use></svg><span>来源</span></button>
             <a class="icon-button icon-button-labeled" id="reviewPageLink" href="/reviews.html" title="打开技能问题审查页" aria-label="打开技能问题审查页"><svg><use href="#icon-shield-alert"></use></svg><span>审查</span></a>
             <a class="icon-button icon-button-labeled" id="settingsPageLink" href="/settings.html" title="打开设置页" aria-label="打开设置页"><svg><use href="#icon-settings"></use></svg><span>设置</span></a>
             <button class="icon-button icon-button-labeled" id="auditButton" title="查看最近管理操作" aria-label="查看操作记录"><svg><use href="#icon-history"></use></svg><span>审计</span></button>
@@ -185,6 +192,7 @@
             <div class="metric"><strong id="managedCount">0</strong><span>纳管</span></div>
             <div class="metric"><strong id="systemCount">0</strong><span>系统</span></div>
             <div class="metric"><strong id="usedCount">0</strong><span>使用</span></div>
+            <div class="metric" id="tokenMetric" title="当前已启用 skills 的索引 token 估算"><strong id="enabledTokenCount">0</strong><span>预注入 token</span></div>
           </div>
           <div class="table" id="skillTable" role="list"></div>
           <div class="empty-state empty-list-state" id="emptyList" hidden>
@@ -309,12 +317,12 @@
               <dl class="source-list" id="sourceList"></dl>
               <div class="source-toolbar">
                 <div>
-                  <h2>GitHub 来源</h2>
-                  <span id="githubSourcesSummary">检查 GitHub 来源后展示仓库、技能和更新状态。</span>
+                  <h2>已安装的 GitHub 来源</h2>
+                  <span id="githubSourcesSummary">按仓库展示当前项目库已安装的 skills。</span>
                 </div>
-                <button id="githubSourcesRefreshButton" class="primary-button">检查更新</button>
+                <button id="githubSourcesRefreshButton" class="primary-button">检查远端更新</button>
               </div>
-              <div id="githubSourcesList" class="source-groups"></div>
+              <ul id="githubSourcesList" class="source-groups" aria-label="GitHub 仓库和已安装技能"></ul>
               <pre id="remoteDiff" class="diff-view" hidden><code></code></pre>
               <h2>依赖关系</h2>
               <div id="dependencyGraph" class="dependency-graph"></div>

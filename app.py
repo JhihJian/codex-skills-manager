@@ -37,6 +37,7 @@ from session_logs import (
     session_id_from_path,
 )
 from usage_stats import UsageStatsService
+from token_usage import calculate_skill_token_usage
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1077,6 +1078,11 @@ def read_registry_state() -> dict[str, Any]:
 def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
     skills = [dict(item) for item in registry.get("skills", {}).values()]
     skills.sort(key=lambda item: (not item.get("enabled", False), item.get("category", ""), item.get("name", "")))
+    token_usage = calculate_skill_token_usage(
+        registry.get("skills", {}),
+        allowed_roots=(LIBRARY_DIR, CODEX_SKILLS_DIR),
+    )
+    token_usage_by_name = token_usage.pop("byName", {})
     usage_stats = usage_stats_service.read_stats()
     usage_by_name = {item.get("name"): item for item in usage_stats.get("entries", []) if item.get("name")}
     audit_lifecycle = audit_lifecycle_by_skill()
@@ -1086,6 +1092,7 @@ def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
         lifecycle = merge_skill_lifecycle(skill.get("lifecycle"), audit_lifecycle.get(str(skill.get("name") or "")))
         lifecycle["disabledSeconds"] = disabled_duration_seconds(lifecycle, enabled=bool(skill.get("enabled")))
         skill["lifecycle"] = lifecycle
+        skill["tokenUsage"] = token_usage_by_name.get(skill.get("name"), {})
     localized_count = len(
         [
             s
@@ -1121,7 +1128,11 @@ def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
             "unclassified": len([s for s in skills if (s.get("category") or "未分类") == "未分类"]),
             "localized": localized_count,
             "unlocalized": len(skills) - localized_count,
+            "enabledSkillTokens": token_usage["totalTokens"],
+            "enabledSkillIndexTokens": token_usage["totalTokens"],
+            "enabledSkillLazyTokens": token_usage["totalLazyTokens"],
         },
+        "tokenUsage": token_usage,
         "usageStats": usage_stats_service.summary(usage_stats),
         "versioning": skill_version_pending_state(),
     }
@@ -3345,6 +3356,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return True
             if method == "GET" and path == "/api/state":
                 self.send_json(registry_view(read_registry_state()))
+                return True
+            if method == "GET" and path == "/api/token-usage":
+                self.send_json(registry_view(read_registry_state())["tokenUsage"])
                 return True
             if method == "GET" and path == "/api/audit":
                 self.send_json({"events": read_audit()})

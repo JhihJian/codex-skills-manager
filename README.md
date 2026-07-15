@@ -11,6 +11,7 @@
 - 顶部“自动分类”按钮会对当前未分类技能补跑识别；按住 Shift 点击该按钮可以强制重分已有分类。
 - 顶部“中文信息”按钮会为英文或中英混合的 skill 生成中文名称和中文触发条件，并保存到 registry 的本地化元数据；左侧可以在“中文/原文”视图间切换，详情页“中文”页签支持查看、生成和手动修正。该功能不修改原始 `SKILL.md`。
 - 管理台可以展示技能使用频率。该功能已模块化为独立统计服务，可在“设置”页单独开启或关闭；开启后服务运行期间每天定时扫描一次本机 Codex 会话，结果缓存到 `data/usage-stats.json`。顶部“使用统计”按钮可手动刷新。
+- 管理台会自动计算当前已启用 skills 的惰性加载 token：顶部“预注入 token”只统计启动时注入的技能索引，详情页“来源”中同时显示索引 token 和触发后按需加载的完整 `SKILL.md` token。统计优先使用本机 `tiktoken` 的 `o200k_base`/`cl100k_base` 编码；未安装时使用中英文 Unicode 估算。
 - 用户点击“检索上下文”后读取本机 Codex 会话 JSONL，快速查看某个 skill 在会话中的上下文片段，用于判断技能是否有效；切换到上下文页不会自动扫描会话。检索结果优先展示按会话、角色和正文去重后的用户/助手正文，并过滤工具调用、函数调用输出、DOM 快照、浏览器自动化日志和长 JSON 工具输出等低价值片段。
 - 顶部“技能审查”入口会打开独立问题审查页，用于扩展多个 skills 常见问题审查项；当前支持按需扫描本机 Codex 会话 JSONL，识别长期未真实触发使用的技能。审查不会把系统注入的技能列表、用户普通提及或上下文关键词命中当作使用；默认只有助手执行过程中的 `SKILL.md` 读取工具调用计为真实使用证据，助手明确使用某技能的声明仅作为辅助证据。
 - 详情页“版本”页签会从 Git 提交记录展示当前 skill 的历史版本、提交时间、作者、提交说明和涉及文件的增删统计；如果仓库还没有提交记录，会在首次提交后开始展示。
@@ -147,7 +148,7 @@ C:\Users\user\.codex\skills\.system\skill-installer\scripts\install-skill-from-g
 
 ## GitHub 来源与远端更新
 
-详情页“来源”页签保留当前技能的来源详情，并额外提供“GitHub 来源”检查。点击“检查更新”后，服务只读扫描 registry 中 `source.type = github` 的技能来源，按 `owner/repo + ref` 聚合展示：
+顶部“来源”入口会直接打开详情页“来源”页签。页面保留当前技能的来源详情，并提供“已安装的 GitHub 来源”二级列表：第一级是 GitHub 仓库，第二级是该仓库安装到当前项目库的 skills。点击“检查远端更新”后，服务只读扫描 registry 中 `source.type = github` 的技能来源，按 `owner/repo + ref` 聚合展示：
 
 - GitHub 仓库、ref、来源地址。
 - 该仓库安装到本地项目库的 skills 列表和 repo 内路径。
@@ -225,6 +226,12 @@ codex exec --ephemeral --output-schema <schema> --output-last-message <file>
 
 详情页的 `SKILL.md` 预览支持标题、列表、引用、代码块、表格、链接和常见行内强调。页面初次加载时会先使用状态接口返回的摘要，再通过 `/api/skills/<skill-name>/markdown` 读取当前技能的完整 `SKILL.md`；用户可以点击“收起预览”切回摘要，避免一次性把所有技能全文塞进主状态接口。
 
+## Skills Token 占用
+
+`GET /api/state` 会返回 `tokenUsage`，并在每个 skill 上返回 `tokenUsage` 明细。统计范围是当前 `enabled = true` 的技能，包括系统技能。`totalTokens` 是启动时注入的技能索引 token 之和，索引按“名称、描述和文件位置”估算；它不包含完整 `SKILL.md`。`totalLazyTokens` 是这些启用技能在全部被触发时，按需加载完整 `SKILL.md` 的 token 总量，仅用于容量评估。
+
+也可以单独调用 `GET /api/token-usage` 获取同一份统计结果。`scope = enabled-catalog` 表示 `totalTokens` 是预注入索引，`lazyLoadScope = enabled-skill-md` 表示 `totalLazyTokens` 是全部触发后的上限估算。`method` 为 `tiktoken:o200k_base` 或 `tiktoken:cl100k_base` 时是对应 tokenizer 的结果；`estimate:unicode` 表示本地估算值。不同模型使用的 tokenizer 可能不同，因此该数值用于评估技能加载成本，不等同于某一次请求最终的完整 prompt token 数。
+
 ## 使用频率统计
 
 主页面在启用后展示最近一次使用统计缓存。统计口径与“技能审查”一致：只有助手执行过程中的 `SKILL.md` 读取工具调用计为确认使用证据，助手声明“使用某技能”只作为辅助证据。确认使用次数用于衡量触发频率，涉及会话和使用天数用于避免同一会话内重复读取造成误判。
@@ -247,6 +254,7 @@ http://127.0.0.1:8876/settings.html
 - `PUT /api/settings`：保存使用统计配置；请求体支持 `usageStats`，字段包括 `enabled`、`dailyEnabled`、`dailyHour`、`dailyMinute`、`staleDays`、`maxFiles`、`scope`、`includeSystem`。
 - `GET /api/usage-stats`：读取当前使用统计缓存。
 - `POST /api/usage-stats/refresh`：立即刷新使用统计缓存；请求体可覆盖 `staleDays`、`maxFiles`、`scope`、`includeSystem`。
+- `GET /api/token-usage`：计算当前已启用 skills 的 `SKILL.md` token 占用。
 
 可用环境变量：
 
