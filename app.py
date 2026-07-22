@@ -3330,7 +3330,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def read_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -3464,6 +3465,11 @@ class Handler(SimpleHTTPRequestHandler):
         if self.handle_api("GET"):
             return
         super().do_GET()
+
+    def do_HEAD(self) -> None:
+        if self.handle_api("GET"):
+            return
+        super().do_HEAD()
 
     def do_POST(self) -> None:
         if self.handle_api("POST"):
