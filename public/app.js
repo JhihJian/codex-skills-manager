@@ -15,6 +15,8 @@ const state = {
   previewExpanded: true,
   previewSkill: null,
   previewMarkdown: new Map(),
+  chineseViewCache: new Map(),
+  chineseViewLoading: new Set(),
   contextSkill: null,
   historySkill: null,
   historyCache: new Map(),
@@ -388,6 +390,15 @@ function localizationStatusText(localizationResult, fallback = "中文信息已�
   if (localizationResult.localized?.length) parts.push(`生成中文 ${localizationResult.localized.length} 个`);
   if (localizationResult.skipped?.length) parts.push(`跳过 ${localizationResult.skipped.length} 个`);
   if (localizationResult.errors?.length) parts.push(`失败 ${localizationResult.errors.length} 批`);
+  return parts.length ? parts.join("，") : fallback;
+}
+
+function chineseViewStatusText(result, fallback = "中文原文视图已检查") {
+  if (!result) return fallback;
+  const parts = [];
+  if (result.generated?.length) parts.push(`生成中文原文 ${result.generated.length} 个`);
+  if (result.skipped?.length) parts.push(`跳过 ${result.skipped.length} 个`);
+  if (result.errors?.length) parts.push(`失败 ${result.errors.length} 个`);
   return parts.length ? parts.join("，") : fallback;
 }
 
@@ -917,6 +928,97 @@ async function loadPendingDiff(path) {
   code.replaceChildren(...renderDiffText(payload.diff || ""));
 }
 
+function resetChineseViewPanel() {
+  $("chineseViewMeta").textContent = "切换到此页签后生成或读取中文视图。";
+  $("chineseSkillPreview").replaceChildren();
+  $("refreshChineseViewButton").disabled = false;
+}
+
+function renderChineseView(payload) {
+  const preview = $("chineseSkillPreview");
+  const meta = $("chineseViewMeta");
+  const skill = selectedSkill();
+  if (!skill) {
+    meta.textContent = "未选择技能。";
+    preview.replaceChildren();
+    return;
+  }
+  if (state.chineseViewLoading.has(skill.name)) {
+    meta.textContent = "正在使用本机 Codex 生成只读中文视图。";
+    preview.replaceChildren();
+    $("refreshChineseViewButton").disabled = true;
+    return;
+  }
+  $("refreshChineseViewButton").disabled = false;
+  if (payload?.status === "ready" && payload.markdown) {
+    meta.textContent = `仅供管理台查看，未写入技能目录或 Codex。生成于 ${formatDateTime(payload.generatedAt) || payload.generatedAt || "未知时间"}。`;
+    preview.innerHTML = renderMarkdown(payload.markdown);
+    return;
+  }
+  if (payload?.error) {
+    meta.textContent = payload.error;
+    preview.replaceChildren();
+    return;
+  }
+  meta.textContent = payload?.status === "stale" ? "原始 SKILL.md 已变更，正在重新生成中文视图。" : "正在准备中文视图。";
+  preview.replaceChildren();
+}
+
+async function ensureChineseView(skill) {
+  if (!skill || state.tab !== "chineseView" || state.chineseViewLoading.has(skill.name)) return;
+  const cached = state.chineseViewCache.get(skill.name);
+  if (cached?.status === "ready" && cached.markdown) {
+    renderChineseView(cached);
+    return;
+  }
+  state.chineseViewLoading.add(skill.name);
+  renderChineseView(cached);
+  try {
+    let payload = await api(`/api/skills/${encodeURIComponent(skill.name)}/chinese-view`);
+    if (payload.status !== "ready") {
+      payload = await api(`/api/skills/${encodeURIComponent(skill.name)}/chinese-view`, {
+        method: "POST",
+        body: "{}",
+      });
+    }
+    state.chineseViewCache.set(skill.name, payload);
+  } catch (error) {
+    state.chineseViewCache.set(skill.name, { status: "error", error: error.message });
+  } finally {
+    state.chineseViewLoading.delete(skill.name);
+    if (selectedSkill()?.name === skill.name && state.tab === "chineseView") {
+      renderChineseView(state.chineseViewCache.get(skill.name));
+    }
+  }
+}
+
+async function regenerateChineseView() {
+  const skill = selectedSkill();
+  if (!skill || state.chineseViewLoading.has(skill.name)) return;
+  state.chineseViewCache.delete(skill.name);
+  state.chineseViewLoading.add(skill.name);
+  renderChineseView();
+  setStatusBusy(true);
+  setStatus("正在重新生成当前技能的中文原文视图");
+  try {
+    const payload = await api(`/api/skills/${encodeURIComponent(skill.name)}/chinese-view`, {
+      method: "POST",
+      body: JSON.stringify({ force: true }),
+    });
+    state.chineseViewCache.set(skill.name, payload);
+    setStatus("当前技能中文原文视图已生成");
+  } catch (error) {
+    state.chineseViewCache.set(skill.name, { status: "error", error: error.message });
+    setStatus(error.message);
+  } finally {
+    state.chineseViewLoading.delete(skill.name);
+    setStatusBusy(false);
+    if (selectedSkill()?.name === skill.name && state.tab === "chineseView") {
+      renderChineseView(state.chineseViewCache.get(skill.name));
+    }
+  }
+}
+
 function resetGithubSourcesPanel() {
   $("githubSourcesSummary").textContent = "按仓库展示当前项目库已安装的 skills。";
   $("githubSourcesList").replaceChildren();
@@ -1107,6 +1209,7 @@ function clearDetailDom() {
   $("skillPreview").classList.remove("expanded");
   $("previewToggle").setAttribute("aria-expanded", "false");
   $("previewToggle").textContent = "展开预览";
+  resetChineseViewPanel();
   $("enableButton").disabled = true;
   $("disableButton").disabled = true;
   $("enableButton").setAttribute("aria-disabled", "true");
@@ -1168,6 +1271,10 @@ function renderDetail() {
   $("previewToggle").setAttribute("aria-expanded", state.previewExpanded ? "true" : "false");
   $("previewToggle").textContent = state.previewExpanded ? "收起预览" : "展开预览";
   ensureFullPreview(skill);
+  if (state.tab === "chineseView") {
+    renderChineseView(state.chineseViewCache.get(skill.name));
+    ensureChineseView(skill);
+  }
   $("enableButton").disabled = skill.system || skill.enabled || skill.status === "missing";
   $("disableButton").disabled = skill.system || !skill.enabled;
   $("enableButton").setAttribute("aria-disabled", $("enableButton").disabled ? "true" : "false");
@@ -1179,6 +1286,7 @@ function renderDetail() {
   badges.push(badge(sourceLabel(skill.source), skill.system ? "orange" : "blue"));
   badges.push(badge(usageStatusLabel(usage.status), usageStatusTone(usage.status)));
   if (hasLocalization(skill)) badges.push(badge("中文视图", "green"));
+  if (skill.chineseView?.status === "ready") badges.push(badge("中文原文", "green"));
   if (skill.dependencies?.length) badges.push(badge(`${skill.dependencies.length} 依赖`));
   $("detailBadges").replaceChildren(...badges);
 
@@ -1356,11 +1464,12 @@ async function sync() {
   const payload = await api("/api/sync", { method: "POST", body: "{}" });
   state.data = payload.state;
   state.historyCache.clear();
+  state.chineseViewCache.clear();
   clearGithubSourcesCache();
   syncSelectionWithVisible();
   render();
   setStatus(
-    `同步完成，${classificationStatusText(payload.classification, "没有新增分类")}，${localizationStatusText(payload.localization, "没有新增中文信息")}`,
+    `同步完成，${classificationStatusText(payload.classification, "没有新增分类")}，${localizationStatusText(payload.localization, "没有新增中文信息")}，${chineseViewStatusText(payload.chineseView, "没有新增中文原文")}`,
   );
 }
 
@@ -1470,12 +1579,14 @@ async function install() {
     state.data = payload.state;
     state.historyCache.clear();
     clearGithubSourcesCache();
+    state.chineseViewCache.clear();
     state.selected = payload.installed[0] || state.selected;
     syncSelectionWithVisible();
     render();
     const classification = classificationStatusText(payload.classification, "没有新增分类");
     const localization = localizationStatusText(payload.localization, "没有新增中文信息");
-    setStatus(`已安装 ${payload.installed.join(", ")}，${classification}，${localization}`);
+    const chineseView = chineseViewStatusText(payload.chineseView, "没有新增中文原文");
+    setStatus(`已安装 ${payload.installed.join(", ")}，${classification}，${localization}，${chineseView}`);
   } catch (error) {
     setStatus(error.message);
   } finally {
@@ -1683,6 +1794,7 @@ function bindEvents() {
   $("disableButton").addEventListener("click", () => toggleSkill("disable").catch((error) => setStatus(error.message)));
   $("descriptionToggle").addEventListener("click", toggleDescription);
   $("previewToggle").addEventListener("click", togglePreview);
+  $("refreshChineseViewButton").addEventListener("click", regenerateChineseView);
   $("contextButton").addEventListener("click", loadContexts);
   $("historyRefreshButton").addEventListener("click", () => loadHistory(true).catch((error) => setStatus(error.message)));
   $("githubSourcesButton").addEventListener("click", openGithubSources);

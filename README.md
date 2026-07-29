@@ -10,6 +10,7 @@
 - 在独立 skills 仓库根目录的 `codex-skills-manager.sqlite3` 记录技能来源、分类、标签、依赖、启用状态、启停记录、备注和同步时间。
 - 顶部“自动分类”按钮会对当前未分类技能补跑识别；按住 Shift 点击该按钮可以强制重分已有分类。
 - 顶部“中文信息”按钮会为英文或中英混合的 skill 生成中文名称和中文触发条件，并保存到 registry 的本地化元数据；左侧可以在“中文/原文”视图间切换，详情页“中文”页签支持查看、生成和手动修正。该功能不修改原始 `SKILL.md`。
+- 安装或同步后会为 `SKILL.md` 自动生成完整中文阅读视图；详情页“中文原文”页签可查看或重新生成。译文只保存在管理器本地缓存，绝不会写入 skills 仓库、`.codex/skills` 或 Codex 实际加载的 skill。
 - 管理台可以展示技能使用频率。该功能已模块化为独立统计服务，可在“设置”页单独开启或关闭；开启后服务运行期间每天定时扫描一次本机 Codex 会话，结果缓存到 `data/usage-stats.json`。顶部“使用统计”按钮可手动刷新。
 - 管理台会自动计算当前已启用 skills 的惰性加载 token：顶部“预注入 token”只统计启动时注入的技能索引，详情页“来源”中同时显示索引 token 和触发后按需加载的完整 `SKILL.md` token。统计优先使用本机 `tiktoken` 的 `o200k_base`/`cl100k_base` 编码；未安装时使用中英文 Unicode 估算。
 - 用户点击“检索上下文”后读取本机 Codex 会话 JSONL，快速查看某个 skill 在会话中的上下文片段，用于判断技能是否有效；切换到上下文页不会自动扫描会话。检索结果优先展示按会话、角色和正文去重后的用户/助手正文，并过滤工具调用、函数调用输出、DOM 快照、浏览器自动化日志和长 JSON 工具输出等低价值片段。
@@ -124,6 +125,7 @@ C:\Users\user\.codex\skills\.system\skill-installer\scripts\install-skill-from-g
 - `<skills-repo>/skills/`：独立 Git 仓库中的技能目录。
 - `<skills-repo>/codex-skills-manager.sqlite3`：技能来源、分类、依赖、启用状态、启停记录、中文信息和备注等管理数据。
 - `data/usage-stats.json`：每日生成的技能使用频率统计缓存。
+- `data/chinese-skill-views.sqlite3`：完整中文阅读视图缓存，不进入 Git，也不属于 skill 文件。
 - `data/audit-log.jsonl`：安装、启用、停用、自动纳管、资料编辑的审计记录。
 - `public/`：管理页面前端。
 - `app.py`：本地 API 与静态文件服务器。
@@ -227,6 +229,23 @@ codex exec --ephemeral --output-schema <schema> --output-last-message <file>
 ## SKILL.md 预览
 
 详情页的 `SKILL.md` 预览支持标题、列表、引用、代码块、表格、链接和常见行内强调。页面初次加载时会先使用状态接口返回的摘要，再通过 `/api/skills/<skill-name>/markdown` 读取当前技能的完整 `SKILL.md`；用户可以点击“收起预览”切回摘要，避免一次性把所有技能全文塞进主状态接口。
+
+## 中文原文视图
+
+安装完成和手动同步后，管理器会对缺失或已过期的技能全文调用本机 `codex exec`，生成完整中文 Markdown 视图。详情页“中文原文”页签也会按需检查缓存，并在原文变更或缓存缺失时生成；“重新生成”可强制刷新。译文保留 Markdown 结构、YAML frontmatter 键、代码块、命令、路径、URL、变量名和标识符，只翻译面向读者的自然语言。
+
+中文原文视图是管理器的只读辅助内容，缓存仅位于 `data/chinese-skill-views.sqlite3`，不写入 `<skills-repo>/skills/`、`<skills-repo>/codex-skills-manager.sqlite3` 或 `.codex/skills/`。因此它不会被复制到启用目录、不会被 Codex 扫描为 skill、不会进入 `SKILL.md` 预览原文，也不会影响 token 或使用频率统计。缓存以原文 SHA-256 绑定，原文变化时旧译文会标为过期且不会作为当前内容返回。
+
+相关接口：
+
+- `GET /api/skills/<skill-name>/chinese-view`：只读返回当前译文或缺失、过期状态，不生成内容。
+- `POST /api/skills/<skill-name>/chinese-view`：生成当前技能的中文原文视图；请求体可传 `{"force": true}` 强制重生成。
+
+可用环境变量：
+
+- `CODEX_SKILL_AUTO_CHINESE_VIEW=0`：关闭安装和同步后的自动全文生成，详情页生成和接口仍可手动使用。
+- `CODEX_SKILL_CHINESE_VIEW_TIMEOUT=360`：单个全文生成超时时间，单位秒。
+- `CODEX_SKILL_CHINESE_VIEW_MAX_CHARS=120000`：允许生成完整译文的原文最大字符数。超出限制会明确报错，不生成截断译文。
 
 ## Skills Token 占用
 

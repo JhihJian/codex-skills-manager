@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 data/audit-log.jsonl
 data/usage-stats.json
+data/chinese-skill-views.sqlite3
+data/chinese-skill-views.sqlite3-shm
+data/chinese-skill-views.sqlite3-wal
 data/settings.json
 data/skills-registry.json
 skills-library/

@@ -1276,10 +1276,12 @@ input.field-invalid {
   gap: 4px;
   padding: 8px 16px;
   border-bottom: 1px solid var(--hair);
+  overflow-x: auto;
 }
 
 .tabs button {
   padding: 0 14px;
+  flex: 0 0 auto;
 }
 
 .tab-panel {
@@ -1338,6 +1340,14 @@ input:disabled {
 
 .preview-head .link-button {
   min-height: 32px;
+}
+
+.chinese-view-meta {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--hair);
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .preview {

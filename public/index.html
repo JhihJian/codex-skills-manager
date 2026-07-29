@@ -223,6 +223,7 @@
             <div class="tabs">
               <button class="active" data-tab="meta">资料</button>
               <button data-tab="localized">中文</button>
+              <button data-tab="chineseView">中文原文</button>
               <button data-tab="history">版本</button>
               <button data-tab="contexts">上下文</button>
               <button data-tab="source">来源</button>
@@ -279,6 +280,17 @@
               <div class="inline-actions">
                 <button class="primary-button" id="localizeCurrentButton">生成当前技能中文信息</button>
                 <button class="primary-button" id="saveLocalizedButton">保存中文信息</button>
+              </div>
+            </div>
+
+            <div class="tab-panel" id="tabChineseView" hidden>
+              <div class="preview-shell">
+                <div class="preview-head">
+                  <span>中文 SKILL.md 视图</span>
+                  <button class="link-button" id="refreshChineseViewButton" type="button">重新生成</button>
+                </div>
+                <div class="chinese-view-meta" id="chineseViewMeta">切换到此页签后生成或读取中文视图。</div>
+                <article class="preview markdown-preview" id="chineseSkillPreview" aria-label="中文 SKILL.md Markdown 视图"></article>
               </div>
             </div>
 
