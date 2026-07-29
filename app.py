@@ -1857,6 +1857,20 @@ def parse_github_install_url(url: str, default_ref: str) -> tuple[str, str, str 
     return f"{owner}/{repo}", ref, repo_path or None
 
 
+def github_blob_skill_directory(url: str) -> str | None:
+    """Return the containing directory for a GitHub blob URL targeting SKILL.md."""
+    parsed = urlparse(url)
+    if parsed.netloc.lower() != "github.com":
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 5 or parts[2].lower() != "blob":
+        return None
+    file_path = "/".join(parts[4:])
+    if not file_path or file_path.rsplit("/", 1)[-1].lower() != "skill.md":
+        return None
+    return file_path.rsplit("/", 1)[0] if "/" in file_path else ""
+
+
 def github_install_target(
     *,
     source: str,
@@ -1870,7 +1884,12 @@ def github_install_target(
         if not parsed:
             return None
         repo_slug, url_ref, url_path = parsed
-        return repo_slug, url_ref, list(paths) if paths else ([url_path] if url_path else [])
+        if paths:
+            return repo_slug, url_ref, list(paths)
+        blob_skill_dir = github_blob_skill_directory(source)
+        if blob_skill_dir is not None:
+            return repo_slug, url_ref, [blob_skill_dir or "."]
+        return repo_slug, url_ref, [url_path] if url_path else []
 
     if not repo:
         return None
@@ -1895,6 +1914,12 @@ def normalize_repo_path(path: str) -> str:
     if any(part in {"", ".", ".."} for part in parts):
         raise ApiError("repo 内路径必须是相对目录，不能包含 . 或 ..。")
     return "/".join(parts)
+
+
+def github_skill_md_repo_path(skill_path: str) -> str:
+    if str(skill_path or "").strip() in {"", "."}:
+        return "SKILL.md"
+    return f"{normalize_repo_path(skill_path)}/SKILL.md"
 
 
 def repo_path_basename(path: str) -> str:
@@ -2149,7 +2174,8 @@ def github_source_for_skill(name: str, entry: dict[str, Any]) -> dict[str, Any] 
     if source.get("type") != "github":
         return None
     ref = str(source.get("ref") or "main").strip() or "main"
-    parsed = github_repo_from_source_value(str(source.get("source") or ""), ref)
+    source_value = str(source.get("source") or "")
+    parsed = github_repo_from_source_value(source_value, ref)
     if not parsed:
         return None
     repo, parsed_ref, url_path = parsed
@@ -2157,18 +2183,20 @@ def github_source_for_skill(name: str, entry: dict[str, Any]) -> dict[str, Any] 
     paths = normalize_list(source.get("path") or source.get("paths"))
     if not paths and url_path:
         paths = [url_path]
-    normalized_paths = [normalize_repo_path(path) for path in paths if normalize_repo_path(path)]
+    normalized_paths = ["" if path == "." else normalize_repo_path(path) for path in paths]
 
-    skill_path = ""
-    for path in normalized_paths:
-        if repo_path_basename(path) == name:
-            skill_path = path
-            break
-    if not skill_path and len(normalized_paths) == 1:
+    blob_skill_dir = github_blob_skill_directory(source_value)
+    skill_path: str | None = blob_skill_dir
+    if skill_path is None:
+        for path in normalized_paths:
+            if repo_path_basename(path) == name:
+                skill_path = path
+                break
+    if skill_path is None and len(normalized_paths) == 1:
         skill_path = normalized_paths[0]
-    if not skill_path and url_path and repo_path_basename(url_path) == name:
+    if skill_path is None and url_path and repo_path_basename(url_path) == name:
         skill_path = normalize_repo_path(url_path)
-    if not skill_path:
+    if skill_path is None:
         return {
             "name": name,
             "repo": repo,
@@ -2215,7 +2243,7 @@ def compare_github_skill(
     if source.get("error"):
         return {**source, "status": "unknown", "hasUpdate": False}
 
-    remote_skill_md = f"{source['path']}/SKILL.md"
+    remote_skill_md = github_skill_md_repo_path(str(source["path"]))
     local_bytes, local_path = read_local_skill_file_bytes(name, entry)
     local_sha = git_blob_sha(local_bytes)
     remote_item: dict[str, Any] | None = None
@@ -2389,16 +2417,30 @@ def run_installer(body: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
 
     target = github_install_target(source=source, repo="", paths=[], ref="") if source else None
     if not target:
-        raise ApiError("请提供 GitHub tree 地址，例如 https://github.com/iOfficeAI/OfficeCLI/tree/main/skills。")
+        raise ApiError(
+            "请提供 GitHub tree 地址或指向 SKILL.md 的 blob 地址，例如 "
+            "https://github.com/iOfficeAI/OfficeCLI/tree/main/skills。"
+        )
     repo, ref, paths = target
-    if "/tree/" not in urlparse(source).path or not paths:
-        raise ApiError("GitHub 地址必须指向包含技能目录的 tree 路径，例如 https://github.com/iOfficeAI/OfficeCLI/tree/main/skills。")
+    blob_skill_dir = github_blob_skill_directory(source)
+    is_tree_url = "/tree/" in urlparse(source).path
+    if not paths or (not is_tree_url and blob_skill_dir is None):
+        raise ApiError(
+            "GitHub 地址必须指向技能目录的 tree 路径或 SKILL.md 文件，例如 "
+            "https://github.com/LiamGvchi/gc-minimal-zine-poster/blob/main/SKILL.md。"
+        )
 
-    expanded_paths, install_details = expand_github_install_paths((repo, ref, paths))
+    if blob_skill_dir == "":
+        expanded_paths = ["."]
+        install_details = {"paths": expanded_paths, "discovery": "github-blob-file"}
+    else:
+        expanded_paths, install_details = expand_github_install_paths((repo, ref, paths))
     if not expanded_paths:
-        raise ApiError("GitHub tree 地址未指向可安装的技能目录。")
+        raise ApiError("GitHub 地址未指向可安装的技能目录。")
     install_details.update({"repo": repo, "ref": ref, "paths": expanded_paths})
     cmd.extend(["--repo", repo, "--path", *expanded_paths, "--ref", ref])
+    if blob_skill_dir == "" and not name:
+        name = repo.rsplit("/", 1)[-1]
     if name:
         safe_skill_name(name)
         cmd.extend(["--name", name])

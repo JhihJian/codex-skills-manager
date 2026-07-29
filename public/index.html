@@ -102,12 +102,12 @@
         <div class="install-section">
           <div class="install-section-head">
             <strong>安装技能</strong>
-            <span>粘贴 GitHub tree 地址即可自动识别仓库、分支和技能路径；父目录会批量安装其下所有 skill。</span>
+            <span>粘贴 GitHub tree 地址或 SKILL.md 文件地址即可自动识别仓库、分支和技能路径；父目录会批量安装其下所有 skill。</span>
           </div>
           <div class="install-grid">
             <label>
-              <span>GitHub tree 地址</span>
-              <input id="installSource" placeholder="https://github.com/iOfficeAI/OfficeCLI/tree/main/skills" aria-describedby="installSourceError installExamples" />
+              <span>GitHub 地址</span>
+              <input id="installSource" placeholder="https://github.com/LiamGvchi/gc-minimal-zine-poster/blob/main/SKILL.md" aria-describedby="installSourceError installExamples" />
               <small id="installSourceError" class="field-error" hidden></small>
             </label>
             <label>
@@ -117,7 +117,7 @@
             <button id="installButton" class="primary-button">安装到项目库</button>
           </div>
           <div class="install-examples" id="installExamples">
-            <code>例如：https://github.com/iOfficeAI/OfficeCLI/tree/main/skills</code>
+            <code>例如：https://github.com/LiamGvchi/gc-minimal-zine-poster/blob/main/SKILL.md</code>
           </div>
         </div>
         <div class="install-section repository-section">

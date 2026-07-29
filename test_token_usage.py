@@ -33,7 +33,7 @@ class SkillTokenUsageTests(unittest.TestCase):
             self.assertEqual(payload["byName"]["enabled"]["characters"], len("codex content\n中文"))
             self.assertFalse(payload["byName"]["disabled"]["counted"])
             self.assertEqual(payload["byName"]["disabled"]["reason"], "未启用")
-            self.assertEqual(Path(payload["byName"]["enabled"]["path"]), codex / "SKILL.md")
+            self.assertEqual(Path(payload["byName"]["enabled"]["path"]), (codex / "SKILL.md").resolve())
 
     def test_missing_enabled_file_is_reported_without_failing_calculation(self) -> None:
         payload = calculate_skill_token_usage({"missing": {"enabled": True}}, allowed_roots=())

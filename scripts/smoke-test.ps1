@@ -35,7 +35,7 @@ try {
 }
 
 Assert-True -Condition ($IndexText.Contains("Codex Skills")) -Message "首页没有返回预期内容。"
-Assert-True -Condition ($IndexText.Contains("https://github.com/iOfficeAI/OfficeCLI/tree/main/skills")) -Message "首页没有显示单 URL 技能安装入口。"
+Assert-True -Condition ($IndexText.Contains("https://github.com/LiamGvchi/gc-minimal-zine-poster/blob/main/SKILL.md")) -Message "首页没有显示 SKILL.md 文件安装入口。"
 Assert-True -Condition (-not $IndexText.Contains('id="installPath"')) -Message "首页仍显示技能安装路径输入框。"
 Assert-True -Condition (-not $IndexText.Contains('id="installRef"')) -Message "首页仍显示技能安装 ref 输入框。"
 

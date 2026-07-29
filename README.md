@@ -4,7 +4,7 @@
 
 ## 功能
 
-- 通过本地 Codex 自带的 `skill-installer` 脚本安装 GitHub tree URL 中的 skill。
+- 通过本地 Codex 自带的 `skill-installer` 脚本安装 GitHub tree URL 或 `SKILL.md` 文件 URL 中的 skill。
 - 将技能安装到独立 skills Git 仓库根目录下的 `skills/`，再按需复制到 `C:\Users\user\.codex\skills` 启用。
 - 点击同步时扫描 `C:\Users\user\.codex\skills`，发现不在独立 skills 仓库中的额外技能会自动复制到 `skills/` 并登记为“本机纳管”；普通页面加载和 `GET /api/state` 只读取状态，不执行纳管写入。同步和安装完成后，未填写分类的技能会自动调用本机 `codex exec` 识别分类。
 - 在独立 skills 仓库根目录的 `codex-skills-manager.sqlite3` 记录技能来源、分类、标签、依赖、启用状态、启停记录、备注和同步时间。
@@ -99,13 +99,15 @@ http://127.0.0.1:8876/settings.html
 
 ## 安装技能
 
-页面顶部安装面板只需要填写一个 GitHub tree URL。系统会从 URL 自动识别仓库、分支和 repo 内路径，不再需要单独填写“路径”或“ref”。例如：
+页面顶部安装面板只需要填写一个 GitHub tree URL，或指向 `SKILL.md` 的 GitHub blob URL。系统会从 URL 自动识别仓库、分支和 repo 内路径，不再需要单独填写“路径”或“ref”。例如：
 
 ```text
 https://github.com/iOfficeAI/OfficeCLI/tree/main/skills
+
+https://github.com/LiamGvchi/gc-minimal-zine-poster/blob/main/SKILL.md
 ```
 
-URL 可以指向单个 skill，也可以指向父目录；指向父目录时会批量安装其下所有直接包含 `SKILL.md` 的技能子目录。
+URL 可以指向单个 skill、单个 `SKILL.md` 文件或父目录；指向父目录时会批量安装其下所有直接包含 `SKILL.md` 的技能子目录。根目录的 `SKILL.md` 会以仓库名作为默认技能名称。
 
 父目录安装会优先通过 GitHub API 识别技能目录；当公共 API 配额耗尽并返回 403 时，会自动改用 GitHub 源码归档扫描，不需要填写令牌或等待配额恢复。
 

@@ -1457,8 +1457,8 @@ async function install() {
   const source = $("installSource").value.trim();
   const category = $("installCategory").value.trim();
   if (!source) {
-    setStatus("需要填写 GitHub tree 地址");
-    showInstallSourceError("请填写 GitHub tree 地址，例如 https://github.com/iOfficeAI/OfficeCLI/tree/main/skills。");
+    setStatus("需要填写 GitHub 地址");
+    showInstallSourceError("请填写 GitHub tree 地址或 SKILL.md 文件地址，例如 https://github.com/LiamGvchi/gc-minimal-zine-poster/blob/main/SKILL.md。");
     return;
   }
   showInstallSourceError("");
