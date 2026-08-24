@@ -323,11 +323,35 @@ class OutcomeReviewService:
         force_rebuild: bool = False,
     ) -> dict[str, Any]:
         stat = path.stat()
-        session_id, family, header_hash, observed_header_hash = self._header(source, path)
         old_location = self.store.execute(
-            """SELECT f.*, g.id AS generation_id, g.generation_key, g.parser_version, g.observed_size, g.observed_mtime_ns, g.header_hash, g.metadata_json FROM log_file_locations l JOIN log_file_generations g ON g.id = l.generation_id JOIN log_files f ON f.id = g.log_file_id WHERE l.path = ? AND l.is_current = 1 AND f.source = ? ORDER BY g.started_at DESC LIMIT 1""",
+            """SELECT f.*, g.id AS generation_id, g.generation_key, g.parser_version,
+                      g.observed_size, g.observed_mtime_ns, g.header_hash,
+                      g.metadata_json AS generation_metadata_json
+               FROM log_file_locations l JOIN log_file_generations g ON g.id = l.generation_id
+               JOIN log_files f ON f.id = g.log_file_id
+               WHERE l.path = ? AND l.is_current = 1 AND f.source = ?
+               ORDER BY g.started_at DESC LIMIT 1""",
             (str(path), source),
         ).fetchone()
+        if old_location is not None and not force_rebuild and old_location["parser_version"] == self.parser_version:
+            old_metadata = json.loads(old_location["generation_metadata_json"])
+            old_checkpoint = self.store.latest_checkpoint(old_location["generation_id"])
+            metadata_unchanged = (
+                stat.st_size == old_location["observed_size"]
+                and stat.st_mtime_ns == old_location["observed_mtime_ns"]
+                and stat.st_ctime_ns == old_metadata.get("observed_ctime_ns")
+            )
+            if old_checkpoint and old_checkpoint["byte_offset"] >= stat.st_size and metadata_unchanged:
+                self.store.upsert_generation(
+                    old_location["id"], old_location["generation_key"], self.parser_version,
+                    generation_id=old_location["generation_id"], scan_run_id=scan_run_id,
+                    session_header_id=old_location["session_header_id"],
+                    device=str(stat.st_dev), inode=str(stat.st_ino), observed_size=stat.st_size,
+                    observed_mtime_ns=stat.st_mtime_ns, header_hash=old_location["header_hash"],
+                    metadata=old_metadata,
+                )
+                return {"bytes": 0, "pending": False}
+        session_id, family, header_hash, observed_header_hash = self._header(source, path)
         stable_key = f"session:{session_id}" if session_id else (
             old_location["stable_key"] if old_location is not None else f"inode:{stat.st_dev}:{stat.st_ino}"
         )

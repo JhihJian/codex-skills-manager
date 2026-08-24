@@ -67,7 +67,13 @@ class OutcomeReviewServiceTests(unittest.TestCase):
             "SELECT c.call_id, r.status FROM tool_calls c JOIN tool_results r ON r.tool_call_id=c.id"
         ).fetchone()
         self.assertEqual(tuple(paired), ("call-1", "returned"))
-        self.assertEqual(self.service.scan({"pi": self.logs})["indexed_bytes"], 0)
+        with patch.object(Path, "open", side_effect=AssertionError("unchanged JSONL must not be opened")):
+            unchanged = self.service.scan({"pi": self.logs})
+        self.assertEqual(unchanged["indexed_bytes"], 0)
+        self.assertEqual(
+            (unchanged["status"], unchanged["failed_files"], unchanged["error"]),
+            ("completed", 0, []),
+        )
 
     def test_same_size_rewrite_move_and_delete_replace_provenance(self):
         path = self.logs / "one.jsonl"
