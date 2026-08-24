@@ -185,7 +185,7 @@ class EffectAdapterTests(unittest.TestCase):
         self.assertEqual([event.event_type for event in first], ["user_message", "skill"])
         self.assertEqual(first[1].metadata["skill_name"], "deploy-memory")
         self.assertEqual(len(episodes), 2)
-        self.assertEqual(episodes[1].continuation_of, episodes[0].episode_id)
+        self.assertEqual(episodes[1].continuation_of, "")
 
     def test_task_fact_extraction_is_deterministic(self) -> None:
         context = {"session_id": "c", "session_family": "f"}
@@ -203,6 +203,47 @@ class EffectAdapterTests(unittest.TestCase):
             fact.value for fact in first if fact.predicate == "task-tag"
         })
         self.assertTrue(all(fact.status == "accepted" for fact in first))
+
+    def test_negated_user_intent_does_not_create_positive_task_tags(self) -> None:
+        event = parse_pi_jsonl_line({
+            "type": "message", "id": "negated", "message": {
+                "role": "user", "content": "Do not run tests and 不要部署，也无需 gradle。",
+            },
+        }, session_id="s", session_family="s")[0]
+        values = {(fact.predicate, fact.value) for fact in extract_task_facts([event])}
+        self.assertNotIn(("task-tag", "test"), values)
+        self.assertNotIn(("task-tag", "deploy"), values)
+        self.assertNotIn(("task-tag", "gradle"), values)
+
+        mixed = parse_pi_jsonl_line({
+            "type": "message", "id": "mixed", "message": {
+                "role": "user", "content": "不要部署，运行测试。",
+            },
+        }, session_id="s", session_family="s")[0]
+        mixed_values = {(fact.predicate, fact.value) for fact in extract_task_facts([mixed])}
+        self.assertNotIn(("task-tag", "deploy"), mixed_values)
+        self.assertIn(("task-tag", "test"), mixed_values)
+
+        exclamation = parse_pi_jsonl_line({
+            "type": "message", "id": "mixed-bang", "message": {
+                "role": "user", "content": "不要部署！请运行测试。",
+            },
+        }, session_id="s", session_family="s")[0]
+        bang_values = {(fact.predicate, fact.value) for fact in extract_task_facts([exclamation])}
+        self.assertNotIn(("task-tag", "deploy"), bang_values)
+        self.assertIn(("task-tag", "test"), bang_values)
+
+    def test_private_keys_and_unlabeled_high_entropy_tokens_are_redacted_before_events(self) -> None:
+        private_key = "-----BEGIN PRIVATE KEY-----\nvery-secret-key-material\n-----END PRIVATE KEY-----"
+        token = "A9zK4mP7qR2sT8vW3xY6bC1dF5gH0jL9"
+        event = parse_pi_jsonl_line({
+            "type": "message", "id": "secret", "message": {
+                "role": "user", "content": f"{private_key}\n{token}",
+            },
+        }, session_id="s", session_family="s")[0]
+        encoded = json.dumps(event.payload)
+        self.assertNotIn("very-secret-key-material", encoded)
+        self.assertNotIn(token, encoded)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from effect_store import EffectStore, ImmutableSnapshotError, RevisionConflict, SCHEMA_VERSION
+from effect_store import EffectStore, EffectStoreError, ImmutableSnapshotError, RevisionConflict, SCHEMA_VERSION
 
 
 class EffectStoreTests(unittest.TestCase):
@@ -33,15 +33,19 @@ class EffectStoreTests(unittest.TestCase):
         )
 
     def create_review(self) -> tuple[dict, dict, dict, dict]:
-        actor = self.store.create_actor("Reviewer", roles=["reviewer"])
+        actor = self.store.create_actor("Reviewer", roles=["reviewer", "admin"])
         case = self.store.create_task_case("case-1", task_type="coding")
         assessment = self.store.create_assessment_revision(
             case["id"],
             expected_revision=0,
             case_revision=1,
+            skill_id="demo",
+            skill_sha256="abc",
+            attribution_kind="direct",
             contract_version_id="contract-v1",
             assessability="assessable",
             automated_verdict="pass",
+            freshness="current",
         )
         review = self.store.create_review_task(case["id"], assessment["id"], "calibration")
         return actor, case, assessment, review
@@ -78,6 +82,45 @@ class EffectStoreTests(unittest.TestCase):
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'migration_probe'"
         ).fetchone()
         self.assertIsNone(probe)
+
+    def test_current_user_version_still_repairs_required_columns(self) -> None:
+        path = Path(self.tmp.name) / "repair.sqlite3"
+        repair = EffectStore(path)
+        repair.close()
+        with sqlite3.connect(path) as connection:
+            connection.execute("ALTER TABLE semantic_reviews DROP COLUMN assessment_id")
+            connection.execute("ALTER TABLE check_runs DROP COLUMN case_revision")
+            connection.execute("DROP TABLE calibration_profiles")
+            connection.executescript(
+                """DROP TRIGGER metric_snapshot_no_update;
+                   CREATE TRIGGER metric_snapshot_no_update BEFORE UPDATE ON metric_snapshots
+                   BEGIN SELECT 1; END;"""
+            )
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        repaired = EffectStore(path)
+        try:
+            semantic_columns = {row[1] for row in repaired.execute("PRAGMA table_info(semantic_reviews)")}
+            check_columns = {row[1] for row in repaired.execute("PRAGMA table_info(check_runs)")}
+            self.assertIn("assessment_id", semantic_columns)
+            self.assertIn("case_revision", check_columns)
+            self.assertIsNotNone(repaired.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='calibration_profiles'"
+            ).fetchone())
+            trigger_sql = repaired.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='metric_snapshot_no_update'"
+            ).fetchone()[0]
+            self.assertIn("RAISE", trigger_sql)
+        finally:
+            repaired.close()
+
+        malformed_path = Path(self.tmp.name) / "malformed.sqlite3"
+        malformed = EffectStore(malformed_path)
+        malformed.close()
+        with sqlite3.connect(malformed_path) as connection:
+            connection.execute("ALTER TABLE artifacts DROP COLUMN freshness")
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        with self.assertRaisesRegex(EffectStoreError, "schema does not match"):
+            EffectStore(malformed_path)
 
     def test_event_can_have_multiple_provenances_and_orphan_state_tracks_deletion(self) -> None:
         generation_1 = self.create_generation("g1")
@@ -166,11 +209,47 @@ class EffectStoreTests(unittest.TestCase):
                 case["id"], actor_id=actor["id"], expected_revision=0,
                 correction_type="duplicate", reason_code="stale",
             )
+        with self.assertRaises(RevisionConflict):
+            self.store.append_exception(
+                case["id"], assessment_id=assessment["id"], actor_id=actor["id"],
+                expected_revision=0, reason_code="stale-assessment",
+            )
+        reassessment = self.store.create_assessment_revision(
+            case["id"], expected_revision=1, contract_version_id="contract-v1",
+            assessability="assessable", automated_verdict="fail",
+        )
         exception = self.store.append_exception(
-            case["id"], assessment_id=assessment["id"], actor_id=actor["id"],
+            case["id"], assessment_id=reassessment["id"], actor_id=actor["id"],
             expected_revision=0, reason_code="approved-deviation",
         )
         self.assertEqual(exception["revision"], 1)
+
+    def test_review_task_claim_is_atomic_and_exception_time_is_normalized(self) -> None:
+        actor, case, assessment, review = self.create_review()
+        claimed = self.store.claim_review_task(review["id"], actor_id=actor["id"])
+        self.assertEqual(claimed["claimed_by_actor_id"], actor["id"])
+        other = self.store.create_actor("Other", roles=["reviewer"])
+        with self.assertRaises(RevisionConflict):
+            self.store.claim_review_task(review["id"], actor_id=other["id"])
+        with self.assertRaises(RevisionConflict):
+            self.store.write_manual_decision(
+                review["id"], actor_id=other["id"], expected_revision=0,
+                verdict="pass", reason_code="wrong-owner",
+            )
+        with self.assertRaises(ValueError):
+            self.store.append_exception(
+                case["id"], assessment_id=assessment["id"], actor_id=actor["id"],
+                expected_revision=0, reason_code="",
+            )
+        exception = self.store.append_exception(
+            case["id"], assessment_id=assessment["id"], actor_id=actor["id"],
+            expected_revision=0, reason_code="temporary",
+            expires_at="2026-08-25T08:00:00+08:00",
+        )
+        self.assertEqual(exception["expires_at"], "2026-08-25T00:00:00.000000Z")
+        self.assertEqual(self.store.execute(
+            "SELECT conflict_state FROM outcome_assessments WHERE id=?", (assessment["id"],)
+        ).fetchone()[0], "exception-accepted")
 
     def test_metric_snapshot_is_immutable(self) -> None:
         _actor, case, assessment, _review = self.create_review()
@@ -188,13 +267,14 @@ class EffectStoreTests(unittest.TestCase):
                 "skill_sha256": "abc",
                 "contract_version_id": "contract-v1",
                 "task_type": "coding",
-                "attribution_kind": "primary",
+                "attribution_kind": "direct",
                 "effective_verdict": "pass",
                 "metric_eligible": True,
             }],
         )
         self.assertEqual(snapshot["sealed"], 1)
         self.assertEqual(len(snapshot["cases"]), 1)
+        self.assertEqual(snapshot["cases"][0]["metric_eligible"], 1)
 
         with self.assertRaises(ImmutableSnapshotError):
             self.store.execute(
@@ -237,11 +317,82 @@ class EffectStoreTests(unittest.TestCase):
         finally:
             external.close()
 
+    def test_hard_failure_rejects_ordinary_human_pass(self) -> None:
+        actor = self.store.create_actor("Reviewer", roles=["reviewer", "admin"])
+        case = self.store.create_task_case("hard-failure")
+        assessment = self.store.create_assessment_revision(
+            case["id"], expected_revision=0, contract_version_id="contract-v1",
+            skill_id="demo", skill_sha256="abc", attribution_kind="direct",
+            assessability="assessable", automated_verdict="fail", hard_failure=True,
+        )
+        review = self.store.create_review_task(case["id"], assessment["id"], "deterministic-failure")
+        with self.assertRaises(EffectStoreError):
+            self.store.write_manual_decision(
+                review["id"], actor_id=actor["id"], expected_revision=0,
+                verdict="pass", reason_code="ordinary-override",
+            )
+
+    def test_new_assessment_does_not_inherit_decision_and_exception_is_excluded(self) -> None:
+        actor, case, assessment, review = self.create_review()
+        first = self.store.write_manual_decision(
+            review["id"], actor_id=actor["id"], expected_revision=0,
+            verdict="pass", reason_code="first-revision",
+        )
+        second = self.store.create_assessment_revision(
+            case["id"], expected_revision=1, contract_version_id="contract-v1",
+            skill_id="demo", skill_sha256="abc", attribution_kind="direct",
+            assessability="assessable", automated_verdict="fail",
+        )
+        snapshot = self.store.create_metric_snapshot(
+            cutoff_at="2026-08-24T12:00:00Z", coverage_status="complete",
+            dimensions={}, versions={}, cases=[{
+                "task_case_id": case["id"], "task_case_revision": 1,
+                "assessment_id": second["id"], "skill_id": "demo",
+                "skill_sha256": "abc", "contract_version_id": "contract-v1",
+                "attribution_kind": "direct",
+            }],
+        )
+        self.assertEqual(snapshot["cases"][0]["effective_verdict"], "fail")
+        self.assertIsNone(snapshot["cases"][0]["manual_decision_id"])
+        self.assertNotEqual(first["assessment_id"], second["id"])
+
+        exception = self.store.append_exception(
+            case["id"], assessment_id=second["id"], actor_id=actor["id"],
+            expected_revision=0, reason_code="accepted-exception",
+        )
+        excluded = self.store.create_metric_snapshot(
+            cutoff_at="2999-08-24T12:01:00Z", coverage_status="complete",
+            dimensions={}, versions={}, cases=[{
+                "task_case_id": case["id"], "task_case_revision": 1,
+                "assessment_id": second["id"], "skill_id": "demo",
+                "skill_sha256": "abc", "contract_version_id": "contract-v1",
+                "attribution_kind": "direct",
+            }],
+        )
+        self.assertTrue(exception["id"])
+        self.assertEqual(excluded["cases"][0]["effective_verdict"], "exception-accepted")
+        self.assertEqual(excluded["cases"][0]["metric_eligible"], 0)
+
+    def test_incomplete_coverage_is_never_metric_eligible(self) -> None:
+        _actor, case, assessment, _review = self.create_review()
+        snapshot = self.store.create_metric_snapshot(
+            cutoff_at="2026-08-24T12:00:00Z", coverage_status="partial",
+            dimensions={}, versions={}, cases=[{
+                "task_case_id": case["id"], "task_case_revision": 1,
+                "assessment_id": assessment["id"], "skill_id": "demo",
+                "skill_sha256": "abc", "contract_version_id": "contract-v1",
+                "attribution_kind": "direct",
+            }],
+        )
+        self.assertEqual(snapshot["cases"][0]["metric_eligible"], 0)
+        self.assertEqual(snapshot["cases"][0]["exclusion_reason"], "coverage-incomplete")
+
     @unittest.skipIf(os.name == "nt", "POSIX permission bits are not available on Windows")
     def test_wal_foreign_keys_busy_timeout_and_permissions(self) -> None:
         self.assertEqual(str(self.store.pragma("journal_mode")).lower(), "wal")
         self.assertEqual(self.store.pragma("foreign_keys"), 1)
         self.assertEqual(self.store.pragma("busy_timeout"), 2345)
+        self.assertEqual(self.store.execute("PRAGMA secure_delete").fetchone()[0], 1)
         self.assertEqual(self.db_path.stat().st_mode & 0o777, 0o600)
         wal_path = Path(f"{self.db_path}-wal")
         self.assertTrue(wal_path.exists())

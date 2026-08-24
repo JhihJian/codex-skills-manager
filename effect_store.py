@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 5
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
 
@@ -218,6 +219,9 @@ CREATE TABLE IF NOT EXISTS task_facts (
     fact_type TEXT NOT NULL,
     value_json TEXT NOT NULL,
     evidence_event_id TEXT REFERENCES canonical_events(id) ON DELETE SET NULL,
+    source_kind TEXT NOT NULL DEFAULT 'deterministic-parser',
+    producer_version TEXT NOT NULL DEFAULT 'unknown',
+    status TEXT NOT NULL DEFAULT 'accepted',
     confidence REAL,
     created_at TEXT NOT NULL
 );
@@ -240,6 +244,7 @@ CREATE TABLE IF NOT EXISTS skill_invocations (
     invocation_fingerprint TEXT NOT NULL UNIQUE,
     task_episode_id TEXT NOT NULL REFERENCES task_episodes(id) ON DELETE CASCADE,
     event_id TEXT NOT NULL REFERENCES canonical_events(id) ON DELETE RESTRICT,
+    result_event_id TEXT REFERENCES canonical_events(id) ON DELETE RESTRICT,
     skill_id TEXT NOT NULL,
     skill_sha256 TEXT,
     skill_path TEXT,
@@ -317,6 +322,7 @@ CREATE TABLE IF NOT EXISTS attribution_links (
 CREATE TABLE IF NOT EXISTS check_runs (
     id TEXT PRIMARY KEY,
     task_case_id TEXT NOT NULL REFERENCES task_cases(id) ON DELETE CASCADE,
+    case_revision INTEGER NOT NULL DEFAULT 1 CHECK (case_revision >= 1),
     artifact_id TEXT REFERENCES artifacts(id) ON DELETE SET NULL,
     checker_id TEXT NOT NULL,
     checker_version TEXT NOT NULL,
@@ -332,6 +338,7 @@ CREATE TABLE IF NOT EXISTS check_runs (
 CREATE TABLE IF NOT EXISTS semantic_reviews (
     id TEXT PRIMARY KEY,
     task_case_id TEXT NOT NULL REFERENCES task_cases(id) ON DELETE CASCADE,
+    assessment_id TEXT REFERENCES outcome_assessments(id) ON DELETE RESTRICT,
     case_revision INTEGER NOT NULL CHECK (case_revision >= 1),
     model_id TEXT NOT NULL,
     model_version TEXT,
@@ -348,6 +355,11 @@ CREATE TABLE IF NOT EXISTS outcome_assessments (
     task_case_id TEXT NOT NULL REFERENCES task_cases(id) ON DELETE CASCADE,
     revision INTEGER NOT NULL CHECK (revision >= 1),
     case_revision INTEGER NOT NULL CHECK (case_revision >= 1),
+    subject_key TEXT NOT NULL DEFAULT 'task-case',
+    skill_invocation_id TEXT REFERENCES skill_invocations(id) ON DELETE RESTRICT,
+    skill_id TEXT,
+    skill_sha256 TEXT,
+    attribution_kind TEXT,
     contract_version_id TEXT,
     classification_revision INTEGER,
     parser_version TEXT,
@@ -360,6 +372,8 @@ CREATE TABLE IF NOT EXISTS outcome_assessments (
     automated_verdict TEXT NOT NULL DEFAULT 'unset',
     conflict_state TEXT NOT NULL DEFAULT 'none',
     freshness TEXT NOT NULL DEFAULT 'unknown',
+    hard_failure INTEGER NOT NULL DEFAULT 0 CHECK (hard_failure IN (0, 1)),
+    is_current INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0, 1)),
     rationale_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     UNIQUE (task_case_id, revision),
@@ -448,6 +462,47 @@ CREATE TABLE IF NOT EXISTS prospective_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS artifact_manifests (
+    id TEXT PRIMARY KEY,
+    task_case_id TEXT REFERENCES task_cases(id) ON DELETE SET NULL,
+    phase TEXT NOT NULL CHECK (phase IN ('before-invocation', 'after-artifacts', 'after-check')),
+    collector_version TEXT NOT NULL,
+    environment_fingerprint TEXT NOT NULL,
+    root_path_hash TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS calibration_profiles (
+    id TEXT PRIMARY KEY,
+    contract_version_id TEXT NOT NULL,
+    task_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    rubric_version TEXT NOT NULL,
+    corpus_sha256 TEXT NOT NULL,
+    sample_count INTEGER NOT NULL CHECK (sample_count >= 0),
+    major_task_sample_count INTEGER NOT NULL CHECK (major_task_sample_count >= 0),
+    pass_precision_lower_bound REAL NOT NULL,
+    eligible INTEGER NOT NULL CHECK (eligible IN (0, 1)),
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(contract_version_id, task_type, source, model_version, prompt_version, rubric_version, corpus_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS data_cleanup_audits (
+    id TEXT PRIMARY KEY,
+    requested_at TEXT NOT NULL,
+    older_than TEXT,
+    skill_id_hash TEXT,
+    project_id_hash TEXT,
+    affected_case_count INTEGER NOT NULL,
+    summary_json TEXT NOT NULL,
+    criteria_sha256 TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS metric_snapshots (
     id TEXT PRIMARY KEY,
     scan_run_id TEXT REFERENCES scan_runs(id) ON DELETE RESTRICT,
@@ -490,6 +545,8 @@ CREATE INDEX IF NOT EXISTS idx_provenance_generation ON event_provenance(generat
 CREATE INDEX IF NOT EXISTS idx_cases_type ON task_cases(task_type, updated_at);
 CREATE INDEX IF NOT EXISTS idx_invocations_skill ON skill_invocations(skill_id, skill_sha256);
 CREATE INDEX IF NOT EXISTS idx_assessments_case ON outcome_assessments(task_case_id, revision DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_current_assessment_subject
+ON outcome_assessments(task_case_id, subject_key) WHERE is_current = 1;
 CREATE INDEX IF NOT EXISTS idx_review_queue ON review_tasks(status, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_manual_case ON manual_decisions(task_case_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_snapshot_cutoff ON metric_snapshots(cutoff_at, id);
@@ -548,6 +605,61 @@ BEGIN
 END;
 """
 
+_EXPECTED_SCHEMA = SCHEMA
+_EXPECTED_SCHEMA_SHAPE: dict[str, Any] | None = None
+
+
+def _schema_shape(connection: sqlite3.Connection) -> dict[str, Any]:
+    tables = {
+        row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    table_shapes = {}
+    for table in tables:
+        columns = tuple(sorted(
+            (row[1], str(row[2]).upper(), row[3], row[4], row[5])
+            for row in connection.execute(f"PRAGMA table_info({table})")
+        ))
+        foreign_keys = tuple(sorted(tuple(row[2:8]) for row in connection.execute(
+            f"PRAGMA foreign_key_list({table})"
+        )))
+        table_shapes[table] = (columns, foreign_keys)
+    objects = {}
+    for object_type in ("index", "trigger"):
+        objects[object_type] = {
+            row[0]: re.sub(r"\s+", " ", str(row[1] or "").strip()).lower()
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type=? AND sql IS NOT NULL",
+                (object_type,),
+            )
+        }
+    return {"tables": table_shapes, **objects}
+
+
+def _expected_schema_shape() -> dict[str, Any]:
+    global _EXPECTED_SCHEMA_SHAPE
+    if _EXPECTED_SCHEMA_SHAPE is None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            connection.executescript(_EXPECTED_SCHEMA)
+            _EXPECTED_SCHEMA_SHAPE = _schema_shape(connection)
+        finally:
+            connection.close()
+    return _EXPECTED_SCHEMA_SHAPE
+
+
+def _schema_conforms(connection: sqlite3.Connection) -> bool:
+    expected = _expected_schema_shape()
+    actual = _schema_shape(connection)
+    return (
+        all(actual["tables"].get(name) == shape for name, shape in expected["tables"].items())
+        and all(
+            all(actual[object_type].get(name) == sql for name, sql in expected[object_type].items())
+            for object_type in ("index", "trigger")
+        )
+    )
+
 
 class EffectStore:
     """SQLite-backed index for normalized skill-effect data."""
@@ -567,11 +679,16 @@ class EffectStore:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA recursive_triggers = ON")
+        self.connection.execute("PRAGMA secure_delete = ON")
         self.connection.execute(f"PRAGMA busy_timeout = {max(int(busy_timeout_ms), 0)}")
         self.connection.execute("PRAGMA journal_mode = WAL")
         self._secure_files()
         self.connection.execute("PRAGMA synchronous = NORMAL")
-        self.migrate()
+        try:
+            self.migrate()
+        except BaseException:
+            self.connection.close()
+            raise
         self._secure_files()
 
     def __enter__(self) -> EffectStore:
@@ -623,8 +740,103 @@ class EffectStore:
     def migrate(self) -> int:
         if self._transaction_depth:
             raise EffectStoreError("migration cannot run inside another transaction")
+        current_version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+        repair_statements: list[str] = []
+        if current_version == SCHEMA_VERSION and SCHEMA == _EXPECTED_SCHEMA:
+            expected_shape = _expected_schema_shape()
+            actual_shape = _schema_shape(self.connection)
+            tables_complete = all(
+                actual_shape["tables"].get(name) == shape
+                for name, shape in expected_shape["tables"].items()
+            )
+            guarded_objects_complete = all(
+                all(actual_shape[object_type].get(name) == sql for name, sql in expected_shape[object_type].items())
+                for object_type in ("index", "trigger")
+            )
+            if tables_complete and guarded_objects_complete:
+                self._secure_files()
+                return SCHEMA_VERSION
+            for object_type in ("index", "trigger"):
+                for name, sql in expected_shape[object_type].items():
+                    actual_sql = actual_shape[object_type].get(name)
+                    if actual_sql is not None and actual_sql != sql:
+                        repair_statements.append(f"DROP {object_type.upper()} IF EXISTS {name};")
+        calibration_columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(calibration_profiles)")
+        }
+        calibration_rebuild = bool(calibration_columns) and "corpus_sha256" not in calibration_columns
+        calibration_rebuild_sql = ""
+        if calibration_rebuild:
+            calibration_rebuild_sql = """
+            ALTER TABLE calibration_profiles RENAME TO calibration_profiles_legacy;
+            CREATE TABLE calibration_profiles (
+                id TEXT PRIMARY KEY, contract_version_id TEXT NOT NULL, task_type TEXT NOT NULL,
+                source TEXT NOT NULL, model_version TEXT NOT NULL, prompt_version TEXT NOT NULL,
+                rubric_version TEXT NOT NULL, corpus_sha256 TEXT NOT NULL,
+                sample_count INTEGER NOT NULL CHECK (sample_count >= 0),
+                major_task_sample_count INTEGER NOT NULL CHECK (major_task_sample_count >= 0),
+                pass_precision_lower_bound REAL NOT NULL,
+                eligible INTEGER NOT NULL CHECK (eligible IN (0, 1)),
+                metrics_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+                UNIQUE(contract_version_id, task_type, source, model_version, prompt_version,
+                       rubric_version, corpus_sha256)
+            );
+            INSERT INTO calibration_profiles(
+                id, contract_version_id, task_type, source, model_version, prompt_version,
+                rubric_version, corpus_sha256, sample_count, major_task_sample_count,
+                pass_precision_lower_bound, eligible, metrics_json, created_at
+            ) SELECT id, contract_version_id, task_type, source, model_version, prompt_version,
+                rubric_version, COALESCE(json_extract(metrics_json, '$.corpusSha256'), 'legacy-' || id),
+                sample_count, major_task_sample_count, pass_precision_lower_bound, eligible,
+                metrics_json, created_at FROM calibration_profiles_legacy;
+            DROP TABLE calibration_profiles_legacy;
+            """
+        additions = {
+            "task_facts": {
+                "source_kind": "TEXT NOT NULL DEFAULT 'deterministic-parser'",
+                "producer_version": "TEXT NOT NULL DEFAULT 'unknown'",
+                "status": "TEXT NOT NULL DEFAULT 'accepted'",
+            },
+            "skill_invocations": {
+                "result_event_id": "TEXT REFERENCES canonical_events(id) ON DELETE RESTRICT",
+            },
+            "outcome_assessments": {
+                "subject_key": "TEXT NOT NULL DEFAULT 'task-case'",
+                "skill_invocation_id": "TEXT REFERENCES skill_invocations(id) ON DELETE RESTRICT",
+                "skill_id": "TEXT",
+                "skill_sha256": "TEXT",
+                "attribution_kind": "TEXT",
+                "hard_failure": "INTEGER NOT NULL DEFAULT 0 CHECK (hard_failure IN (0, 1))",
+                "is_current": "INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0, 1))",
+            },
+            "semantic_reviews": {
+                "assessment_id": "TEXT REFERENCES outcome_assessments(id) ON DELETE RESTRICT",
+            },
+            "check_runs": {
+                "case_revision": "INTEGER NOT NULL DEFAULT 1 CHECK (case_revision >= 1)",
+            },
+        }
+        alter_statements: list[str] = []
+        for table, columns in additions.items():
+            existing = {
+                row[1] for row in self.connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if not existing:
+                continue
+            for column, definition in columns.items():
+                if column not in existing:
+                    alter_statements.append(f"ALTER TABLE {table} ADD COLUMN {column} {definition};")
+            if table == "outcome_assessments" and "is_current" not in existing:
+                alter_statements.append(
+                    "UPDATE outcome_assessments SET is_current = "
+                    "CASE WHEN revision = (SELECT MAX(a2.revision) FROM outcome_assessments a2 "
+                    "WHERE a2.task_case_id = outcome_assessments.task_case_id) THEN 1 ELSE 0 END;"
+                )
         script = f"""
         BEGIN IMMEDIATE;
+        {''.join(repair_statements)}
+        {calibration_rebuild_sql}
+        {''.join(alter_statements)}
         {SCHEMA}
         INSERT OR IGNORE INTO schema_migrations(version, applied_at)
             VALUES ({SCHEMA_VERSION}, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
@@ -639,6 +851,10 @@ class EffectStore:
             raise
         finally:
             self._secure_files()
+        if SCHEMA == _EXPECTED_SCHEMA and not _schema_conforms(self.connection):
+            raise EffectStoreError(
+                "database schema does not match v4; restore from backup or run a supported migration"
+            )
         return SCHEMA_VERSION
 
     def pragma(self, name: str) -> Any:
@@ -945,6 +1161,43 @@ class EffectStore:
         """Delete derived generation data while retaining canonical and manual records."""
         with self.transaction():
             cursor = self.connection.execute("DELETE FROM log_file_generations WHERE id = ?", (generation_id,))
+            if cursor.rowcount:
+                now = _utc_now()
+                self.connection.execute(
+                    """UPDATE skill_invocations SET validity = 'orphaned'
+                       WHERE event_id IN (SELECT id FROM canonical_events WHERE orphaned = 1)"""
+                )
+                self.connection.execute(
+                    """UPDATE task_episodes SET invalidated_at = ?, updated_at = ?
+                       WHERE invalidated_at IS NULL AND (
+                         start_event_id IN (SELECT id FROM canonical_events WHERE orphaned = 1)
+                         OR end_event_id IN (SELECT id FROM canonical_events WHERE orphaned = 1)
+                         OR EXISTS (SELECT 1 FROM skill_invocations i
+                                    WHERE i.task_episode_id = task_episodes.id AND i.validity = 'orphaned')
+                       )""",
+                    (now, now),
+                )
+                self.connection.execute(
+                    """UPDATE task_cases SET invalidated_at = ?, updated_at = ?
+                       WHERE invalidated_at IS NULL AND EXISTS (
+                         SELECT 1 FROM task_case_episodes ce
+                         WHERE ce.task_case_id = task_cases.id
+                       ) AND NOT EXISTS (
+                         SELECT 1 FROM task_case_episodes ce JOIN task_episodes ep ON ep.id = ce.task_episode_id
+                         WHERE ce.task_case_id = task_cases.id AND ep.invalidated_at IS NULL
+                       )""",
+                    (now, now),
+                )
+                self.connection.execute(
+                    """UPDATE outcome_assessments SET is_current = 0, process_state = 'invalidated'
+                       WHERE task_case_id IN (SELECT id FROM task_cases WHERE invalidated_at IS NOT NULL)
+                         AND is_current = 1"""
+                )
+                self.connection.execute(
+                    """UPDATE review_tasks SET status = 'open', queue_reason = 'source-invalidated', updated_at = ?
+                       WHERE task_case_id IN (SELECT id FROM task_cases WHERE invalidated_at IS NOT NULL)""",
+                    (now,),
+                )
         return cursor.rowcount == 1
 
     def get_event(self, event_id_or_fingerprint: str) -> dict[str, Any]:
@@ -1050,6 +1303,11 @@ class EffectStore:
         expected_revision: int,
         case_revision: int | None = None,
         assessment_id: str | None = None,
+        subject_key: str = "task-case",
+        skill_invocation_id: str | None = None,
+        skill_id: str | None = None,
+        skill_sha256: str | None = None,
+        attribution_kind: str | None = None,
         contract_version_id: str | None = None,
         classification_revision: int | None = None,
         parser_version: str | None = None,
@@ -1062,10 +1320,14 @@ class EffectStore:
         automated_verdict: str = "unset",
         conflict_state: str = "none",
         freshness: str = "unknown",
+        hard_failure: bool = False,
         rationale: Any = None,
     ) -> dict[str, Any]:
         assessment_id = assessment_id or _new_id()
         next_revision = expected_revision + 1
+        selected_subject = str(subject_key or "").strip()
+        if not selected_subject:
+            raise ValueError("subject_key is required")
         with self.transaction():
             case = self.connection.execute(
                 "SELECT current_revision, current_assessment_revision FROM task_cases WHERE id = ?", (task_case_id,)
@@ -1074,28 +1336,43 @@ class EffectStore:
                 raise KeyError(task_case_id)
             if case["current_assessment_revision"] != expected_revision:
                 raise RevisionConflict(
-                    f"assessment revision conflict: expected {expected_revision}, "
-                    f"current {case['current_assessment_revision']}"
+                    f"assessment revision conflict: expected {expected_revision}, current {case['current_assessment_revision']}"
                 )
             selected_case_revision = case["current_revision"] if case_revision is None else case_revision
             if selected_case_revision != case["current_revision"]:
                 raise RevisionConflict(
                     f"task case revision conflict: selected {selected_case_revision}, current {case['current_revision']}"
                 )
+            if skill_invocation_id is not None:
+                invocation = self.connection.execute(
+                    "SELECT skill_id, skill_sha256 FROM skill_invocations WHERE id = ?", (skill_invocation_id,)
+                ).fetchone()
+                if invocation is None:
+                    raise KeyError(skill_invocation_id)
+                if skill_id is not None and skill_id != invocation["skill_id"]:
+                    raise EffectStoreError("assessment skill does not match its invocation")
+                skill_id = skill_id or invocation["skill_id"]
+                skill_sha256 = skill_sha256 or invocation["skill_sha256"]
+            self.connection.execute(
+                "UPDATE outcome_assessments SET is_current = 0 WHERE task_case_id = ? AND subject_key = ? AND is_current = 1",
+                (task_case_id, selected_subject),
+            )
             self.connection.execute(
                 """
                 INSERT INTO outcome_assessments(
-                    id, task_case_id, revision, case_revision, contract_version_id, classification_revision,
+                    id, task_case_id, revision, case_revision, subject_key, skill_invocation_id,
+                    skill_id, skill_sha256, attribution_kind, contract_version_id, classification_revision,
                     parser_version, checker_version, model_version, prompt_version, rubric_version,
                     process_state, assessability, automated_verdict, conflict_state, freshness,
-                    rationale_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    hard_failure, is_current, rationale_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    assessment_id, task_case_id, next_revision, selected_case_revision,
-                    contract_version_id, classification_revision, parser_version, checker_version,
-                    model_version, prompt_version, rubric_version, process_state, assessability,
-                    automated_verdict, conflict_state, freshness, _json(rationale), _utc_now(),
+                    assessment_id, task_case_id, next_revision, selected_case_revision, selected_subject,
+                    skill_invocation_id, skill_id, skill_sha256, attribution_kind, contract_version_id,
+                    classification_revision, parser_version, checker_version, model_version, prompt_version,
+                    rubric_version, process_state, assessability, automated_verdict, conflict_state,
+                    freshness, int(hard_failure), 1, _json(rationale), _utc_now(),
                 ),
             )
             cursor = self.connection.execute(
@@ -1128,6 +1405,28 @@ class EffectStore:
             )
         return self._get("review_tasks", review_task_id)
 
+    def claim_review_task(self, review_task_id: str, *, actor_id: str) -> dict[str, Any]:
+        with self.transaction():
+            actor = self.connection.execute(
+                "SELECT roles_json, active FROM actors WHERE id=?", (actor_id,)
+            ).fetchone()
+            if actor is None or not actor["active"] or "reviewer" not in json.loads(actor["roles_json"]):
+                raise EffectStoreError("review task claims require an active reviewer")
+            cursor = self.connection.execute(
+                """UPDATE review_tasks SET claimed_by_actor_id=?, updated_at=?
+                   WHERE id=? AND status='open'
+                     AND (claimed_by_actor_id IS NULL OR claimed_by_actor_id=?)""",
+                (actor_id, _utc_now(), review_task_id, actor_id),
+            )
+            if cursor.rowcount != 1:
+                task = self.connection.execute(
+                    "SELECT claimed_by_actor_id, status FROM review_tasks WHERE id=?", (review_task_id,)
+                ).fetchone()
+                if task is None:
+                    raise KeyError(review_task_id)
+                raise RevisionConflict("review task is no longer available for claim")
+        return self._get("review_tasks", review_task_id)
+
     def write_manual_decision(
         self,
         review_task_id: str,
@@ -1141,6 +1440,9 @@ class EffectStore:
         binding: Any = None,
         decision_id: str | None = None,
     ) -> dict[str, Any]:
+        reason_code = str(reason_code or "").strip()
+        if not reason_code:
+            raise ValueError("manual decision reason_code is required")
         decision_id = decision_id or _new_id()
         next_revision = expected_revision + 1
         with self.transaction():
@@ -1154,11 +1456,27 @@ class EffectStore:
                     f"manual decision revision conflict: expected {expected_revision}, "
                     f"current {task['current_decision_revision']}"
                 )
+            if task["claimed_by_actor_id"] is not None and task["claimed_by_actor_id"] != actor_id:
+                raise RevisionConflict("review task is claimed by another reviewer")
             assessment = self.connection.execute(
                 "SELECT * FROM outcome_assessments WHERE id = ?", (task["assessment_id"],)
             ).fetchone()
             if assessment is None:
                 raise EffectStoreError("review task has no assessment")
+            if action == "decision" and assessment["assessability"] != "assessable":
+                raise EffectStoreError("outcome decisions require an assessable assessment")
+            case = self.connection.execute(
+                "SELECT current_revision FROM task_cases WHERE id = ?", (task["task_case_id"],)
+            ).fetchone()
+            if not assessment["is_current"] or case is None or assessment["case_revision"] != case["current_revision"]:
+                raise RevisionConflict("review task assessment is no longer current")
+            actor = self.connection.execute(
+                "SELECT roles_json, active FROM actors WHERE id = ?", (actor_id,)
+            ).fetchone()
+            if actor is None or not actor["active"] or "reviewer" not in json.loads(actor["roles_json"]):
+                raise EffectStoreError("manual decisions require an active reviewer")
+            if assessment["hard_failure"] and action == "decision" and verdict == "pass":
+                raise EffectStoreError("a valid hard failure cannot be overridden by an ordinary pass decision")
             previous = self.connection.execute(
                 "SELECT id FROM manual_decisions WHERE review_task_id = ? ORDER BY revision DESC LIMIT 1",
                 (review_task_id,),
@@ -1167,6 +1485,15 @@ class EffectStore:
             binding_value["assessmentRevision"] = assessment["revision"]
             binding_value["caseRevision"] = assessment["case_revision"]
             binding_value["contractVersionId"] = assessment["contract_version_id"]
+            binding_value["skillInvocationId"] = assessment["skill_invocation_id"]
+            binding_value["skillId"] = assessment["skill_id"]
+            binding_value["skillSha256"] = assessment["skill_sha256"]
+            binding_value["classificationRevision"] = assessment["classification_revision"]
+            binding_value["parserVersion"] = assessment["parser_version"]
+            binding_value["checkerVersion"] = assessment["checker_version"]
+            binding_value["modelVersion"] = assessment["model_version"]
+            binding_value["promptVersion"] = assessment["prompt_version"]
+            binding_value["rubricVersion"] = assessment["rubric_version"]
             self.connection.execute(
                 """
                 INSERT INTO manual_decisions(
@@ -1190,6 +1517,16 @@ class EffectStore:
             )
             if cursor.rowcount != 1:
                 raise RevisionConflict("manual decision revision changed during write")
+            if action == "withdraw":
+                conflict_state = "none"
+            elif action == "decision" and assessment["automated_verdict"] in {"pass", "partial", "fail"} and verdict != assessment["automated_verdict"]:
+                conflict_state = "disputed"
+            else:
+                conflict_state = "none"
+            self.connection.execute(
+                "UPDATE outcome_assessments SET conflict_state=? WHERE id=?",
+                (conflict_state, assessment["id"]),
+            )
         return self._get("manual_decisions", decision_id)
 
     append_manual_decision = write_manual_decision
@@ -1206,6 +1543,10 @@ class EffectStore:
         payload: Any = None,
         correction_id: str | None = None,
     ) -> dict[str, Any]:
+        correction_type = str(correction_type or "").strip()
+        reason_code = str(reason_code or "").strip()
+        if not correction_type or not reason_code:
+            raise ValueError("correction_type and reason_code are required")
         correction_id = correction_id or _new_id()
         next_revision = expected_revision + 1
         with self.transaction():
@@ -1232,6 +1573,24 @@ class EffectStore:
                     _utc_now(),
                 ),
             )
+            updated = self.connection.execute(
+                """UPDATE task_cases SET current_revision = current_revision + 1,
+                       current_assessment_revision = current_assessment_revision, updated_at = ?
+                   WHERE id = ?""",
+                (_utc_now(), task_case_id),
+            )
+            if updated.rowcount != 1:
+                raise KeyError(task_case_id)
+            self.connection.execute(
+                """UPDATE outcome_assessments SET is_current = 0,
+                       conflict_state='resolved-by-correction'
+                   WHERE task_case_id = ? AND is_current = 1""",
+                (task_case_id,),
+            )
+            self.connection.execute(
+                "UPDATE review_tasks SET status = 'open', queue_reason = 'correction-reassessment', updated_at = ? WHERE task_case_id = ?",
+                (_utc_now(), task_case_id),
+            )
         row = self.connection.execute("SELECT * FROM corrections WHERE id = ?", (correction_id,)).fetchone()
         return self._row(row)
 
@@ -1249,16 +1608,35 @@ class EffectStore:
         expires_at: str | None = None,
         exception_id: str | None = None,
     ) -> dict[str, Any]:
+        reason_code = str(reason_code or "").strip()
+        if not reason_code:
+            raise ValueError("exception reason_code is required")
+        if expires_at is not None:
+            try:
+                parsed_expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("exception expires_at must be an ISO timestamp") from exc
+            if parsed_expiry.tzinfo is None:
+                raise ValueError("exception expires_at must include a timezone")
+            expires_at = parsed_expiry.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
         exception_id = exception_id or _new_id()
         next_revision = expected_revision + 1
         with self.transaction():
             assessment = self.connection.execute(
-                "SELECT task_case_id FROM outcome_assessments WHERE id = ?", (assessment_id,)
+                "SELECT task_case_id, is_current FROM outcome_assessments WHERE id = ?", (assessment_id,)
             ).fetchone()
             if assessment is None:
                 raise KeyError(assessment_id)
             if assessment["task_case_id"] != task_case_id:
                 raise EffectStoreError("exception assessment belongs to another task case")
+            if not assessment["is_current"]:
+                raise RevisionConflict("exception assessment is no longer current")
+            actor = self.connection.execute(
+                "SELECT roles_json, active FROM actors WHERE id = ?", (actor_id,)
+            ).fetchone()
+            roles = set(json.loads(actor["roles_json"])) if actor is not None else set()
+            if actor is None or not actor["active"] or not {"reviewer", "admin"} <= roles:
+                raise EffectStoreError("exceptions require an active reviewer and admin")
             current = self.connection.execute(
                 'SELECT COALESCE(MAX(revision), 0) FROM "exceptions" WHERE task_case_id = ?',
                 (task_case_id,),
@@ -1280,6 +1658,10 @@ class EffectStore:
                     exception_id, task_case_id, assessment_id, actor_id, next_revision, reason_code,
                     _json(scope), expires_at, previous["id"] if previous else None, _utc_now(),
                 ),
+            )
+            self.connection.execute(
+                "UPDATE outcome_assessments SET conflict_state='exception-accepted' WHERE id=?",
+                (assessment_id,),
             )
         row = self.connection.execute('SELECT * FROM "exceptions" WHERE id = ?', (exception_id,)).fetchone()
         return self._row(row)
@@ -1362,6 +1744,84 @@ class EffectStore:
                 ),
             )
             for case in cases:
+                frozen = dict(case.get("frozen") or {})
+                assessment = None
+                if case.get("assessment_id"):
+                    assessment = self.connection.execute(
+                        """SELECT a.*, c.invalidated_at AS case_invalidated_at
+                           FROM outcome_assessments a JOIN task_cases c ON c.id = a.task_case_id
+                           WHERE a.id = ? AND a.task_case_id = ?""",
+                        (case.get("assessment_id"), case["task_case_id"]),
+                    ).fetchone()
+                decision = None
+                if assessment is not None:
+                    decision = self.connection.execute(
+                        """SELECT d.*, actor.roles_json AS actor_roles_json, actor.active AS actor_active
+                           FROM manual_decisions d JOIN review_tasks r ON r.id = d.review_task_id
+                           JOIN actors actor ON actor.id=d.actor_id
+                           WHERE d.assessment_id = ? AND d.revision = r.current_decision_revision
+                             AND d.created_at <= ?
+                           ORDER BY d.created_at DESC LIMIT 1""",
+                        (assessment["id"], cutoff_at),
+                    ).fetchone()
+                exception = None
+                if assessment is not None:
+                    exception = self.connection.execute(
+                        """SELECT id FROM exceptions WHERE assessment_id = ? AND created_at <= ?
+                           AND (expires_at IS NULL OR expires_at > ?) ORDER BY revision DESC LIMIT 1""",
+                        (assessment["id"], cutoff_at, cutoff_at),
+                    ).fetchone()
+                effective_verdict = "unset"
+                exclusion_reason: str | None = None
+                eligible = False
+                if assessment is None:
+                    exclusion_reason = "assessment-missing"
+                elif exception is not None:
+                    effective_verdict = "exception-accepted"
+                    exclusion_reason = "exception-accepted"
+                else:
+                    manual_verdict = (
+                        decision["verdict"] if decision is not None and decision["action"] != "withdraw" else None
+                    )
+                    effective_verdict = str(manual_verdict or assessment["automated_verdict"])
+                    effective_conflict = assessment["conflict_state"]
+                    if effective_conflict == "exception-accepted":
+                        effective_conflict = (
+                            "disputed" if manual_verdict is not None
+                            and assessment["automated_verdict"] in {"pass", "partial", "fail"}
+                            and manual_verdict != assessment["automated_verdict"] else "none"
+                        )
+                    governance_exclusion = frozen.get("governanceExclusion")
+                    if governance_exclusion:
+                        exclusion_reason = str(governance_exclusion)
+                    elif case["attribution_kind"] not in {"direct", "shared"}:
+                        exclusion_reason = "attribution-ineligible"
+                    elif decision is not None and (
+                        not decision["actor_active"]
+                        or "reviewer" not in json.loads(decision["actor_roles_json"])
+                    ):
+                        exclusion_reason = "manual-actor-ineligible"
+                    elif coverage_status != "complete":
+                        exclusion_reason = "coverage-incomplete"
+                    elif not assessment["is_current"] or assessment["case_invalidated_at"] is not None:
+                        exclusion_reason = "assessment-not-current"
+                    elif assessment["freshness"] != "current":
+                        exclusion_reason = "assessment-freshness-ineligible"
+                    elif assessment["assessability"] != "assessable":
+                        exclusion_reason = "not-assessable"
+                    elif effective_conflict != "none":
+                        exclusion_reason = "disputed"
+                    elif assessment["hard_failure"] and effective_verdict == "pass":
+                        exclusion_reason = "hard-failure-conflict"
+                    elif not assessment["contract_version_id"]:
+                        exclusion_reason = "contract-missing"
+                    elif assessment["skill_id"] != case["skill_id"] or assessment["skill_sha256"] != case.get("skill_sha256"):
+                        exclusion_reason = "assessment-subject-mismatch"
+                    elif effective_verdict not in {"pass", "partial", "fail"}:
+                        exclusion_reason = "verdict-unset"
+                    else:
+                        eligible = True
+                frozen["eligibilityDerivedBy"] = "effect-store-v4"
                 self.connection.execute(
                     """
                     INSERT INTO metric_snapshot_cases(
@@ -1373,12 +1833,12 @@ class EffectStore:
                     """,
                     (
                         snapshot_id, case["task_case_id"], case["task_case_revision"],
-                        case.get("assessment_id"), case.get("assessment_revision"),
-                        case.get("manual_decision_id"), case.get("manual_decision_revision"),
+                        case.get("assessment_id"), assessment["revision"] if assessment is not None else None,
+                        decision["id"] if decision is not None else None,
+                        decision["revision"] if decision is not None else None,
                         case["skill_id"], case.get("skill_sha256"), case.get("contract_version_id"),
-                        case.get("task_type"), case["attribution_kind"], case["effective_verdict"],
-                        int(bool(case["metric_eligible"])), case.get("exclusion_reason"),
-                        _json(case.get("frozen")),
+                        case.get("task_type"), case["attribution_kind"], effective_verdict,
+                        int(eligible), exclusion_reason, _json(frozen),
                     ),
                 )
             self.connection.execute("UPDATE metric_snapshots SET sealed = 1 WHERE id = ?", (snapshot_id,))

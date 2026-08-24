@@ -1,3 +1,4 @@
+import copy
 import sqlite3
 import tempfile
 import unittest
@@ -81,9 +82,38 @@ class OutcomeContractStoreTests(unittest.TestCase):
             )
         with self.assertRaises(OutcomeContractError):
             self.store.create_draft("demo", SHA_A, {"requirements": [{"id": "empty"}]}, "author")
+        with self.assertRaises(OutcomeContractError):
+            self.store.create_draft(
+                "demo", SHA_A,
+                {"artifacts": [{"id": "always", "selector": {}, "minCount": 0}]}, "author",
+            )
 
 
 class OutcomeContractInterpreterTests(unittest.TestCase):
+    def evaluate(self, contract, **kwargs):
+        prepared = copy.deepcopy(contract)
+
+        def approve(value):
+            if isinstance(value, dict):
+                if "checker" in value:
+                    value.setdefault("checkerVersion", ">=1")
+                    value.setdefault("parserVersion", 1)
+                    value.setdefault("trustLevel", "trusted")
+                    value.setdefault("approvalVersion", "local-admin-v1")
+                for nested in value.values():
+                    approve(nested)
+            elif isinstance(value, list):
+                for nested in value:
+                    approve(nested)
+
+        approve(prepared)
+        for item in kwargs.get("evidence") or []:
+            item.setdefault("checker_version", "1")
+            item.setdefault("parser_version", 1)
+            item.setdefault("approval_version", "local-admin-v1")
+            item.setdefault("freshness", "current")
+        return OutcomeContractInterpreter().evaluate(prepared, **kwargs)
+
     def test_applicability_uses_accepted_task_facts_and_preserves_unknown(self) -> None:
         rule = {"anyOf": [{"taskTag": "gradle-test"}, {"taskTag": "gradle-build"}]}
         self.assertEqual(evaluate_applicability(rule, []), "unknown")
@@ -100,11 +130,11 @@ class OutcomeContractInterpreterTests(unittest.TestCase):
             "artifacts": [{"id": "doc", "selector": {"kind": "file", "glob": "docs/*.md"}, "minCount": 1}],
             "requirements": [{"id": "document-valid", "allOf": [{"checker": "document-artifact"}]}],
         }
-        result = OutcomeContractInterpreter().evaluate(
+        result = self.evaluate(
             contract,
             task_facts={"taskTag": "docs", "commandType": "write"},
             artifacts=[{"id": "a1", "kind": "file", "path": "docs/report.md"}],
-            evidence=[{"id": "e1", "checker_id": "document-artifact", "lifecycle": "finished", "outcome": "assertion-pass", "validity": "valid", "assertions": {"total": 1}}],
+            evidence=[{"id": "e1", "checker_id": "document-artifact", "lifecycle": "finished", "outcome": "assertion-pass", "validity": "valid", "trust_level": "trusted", "assertions": {"total": 1}}],
         )
         self.assertEqual(result["verdict"], "pass")
 
@@ -114,12 +144,12 @@ class OutcomeContractInterpreterTests(unittest.TestCase):
             "requirements": [{"id": "tests", "allOf": [{"checker": "gradle-summary", "checkerVersion": ">=1,<2", "parserVersion": 1, "trustLevel": "trusted"}]}],
         }
         base = {"task_facts": {"taskTag": "gradle-test"}}
-        failure = OutcomeContractInterpreter().evaluate(
+        failure = self.evaluate(
             contract,
             **base,
             evidence=[{"checker_id": "gradle-summary", "checker_version": "1.0.0", "parser_version": 1, "trust_level": "trusted", "outcome": "assertion-fail", "validity": "valid", "lifecycle": "finished", "assertions": {"total": 3, "failed": 1}}],
         )
-        infrastructure = OutcomeContractInterpreter().evaluate(
+        infrastructure = self.evaluate(
             contract,
             **base,
             evidence=[{"checker_id": "gradle-summary", "checker_version": "1.0.0", "parser_version": 1, "trust_level": "trusted", "outcome": "infrastructure-error", "validity": "environment-mismatch", "lifecycle": "finished"}],
@@ -133,10 +163,10 @@ class OutcomeContractInterpreterTests(unittest.TestCase):
             "requirements": [{"id": "choice", "anyOf": [{"checker": "first"}, {"checker": "second"}]}],
         }
         evidence = [
-            {"checker_id": "first", "outcome": "assertion-fail", "validity": "valid", "lifecycle": "finished", "assertions": {"total": 1}},
-            {"checker_id": "second", "outcome": "assertion-pass", "validity": "valid", "lifecycle": "finished", "assertions": {"total": 1}},
+            {"checker_id": "first", "outcome": "assertion-fail", "validity": "valid", "lifecycle": "finished", "trust_level": "trusted", "assertions": {"total": 1}},
+            {"checker_id": "second", "outcome": "assertion-pass", "validity": "valid", "lifecycle": "finished", "trust_level": "trusted", "assertions": {"total": 1}},
         ]
-        result = OutcomeContractInterpreter().evaluate(contract, task_facts={"taskTag": "test"}, evidence=evidence)
+        result = self.evaluate(contract, task_facts={"taskTag": "test"}, evidence=evidence)
         self.assertEqual(result["verdict"], "pass")
 
     def test_checker_pass_requires_explicit_validity_lifecycle_and_assertion_count(self) -> None:
@@ -144,10 +174,22 @@ class OutcomeContractInterpreterTests(unittest.TestCase):
             "applicability": {"taskTag": "test"},
             "requirements": [{"id": "test", "allOf": [{"checker": "demo"}]}],
         }
-        result = OutcomeContractInterpreter().evaluate(
+        result = self.evaluate(
             contract,
             task_facts={"taskTag": "test"},
             evidence=[{"checker_id": "demo", "outcome": "assertion-pass"}],
+        )
+        self.assertEqual(result["verdict"], "inconclusive")
+
+    def test_checker_approval_must_match_contract_exactly(self) -> None:
+        contract = {
+            "applicability": {"taskTag": "test"},
+            "requirements": [{"id": "test", "checker": "demo", "checkerVersion": ">=1", "parserVersion": 1, "trustLevel": "trusted", "approvalVersion": "local-admin-v1"}],
+        }
+        result = OutcomeContractInterpreter().evaluate(
+            contract,
+            task_facts={"taskTag": "test"},
+            evidence=[{"checker_id": "demo", "checker_version": "1", "parser_version": 1, "approval_version": "unapproved", "trust_level": "trusted", "outcome": "assertion-pass", "validity": "valid", "lifecycle": "finished", "assertions": {"total": 1}}],
         )
         self.assertEqual(result["verdict"], "inconclusive")
 
@@ -160,10 +202,10 @@ class OutcomeContractInterpreterTests(unittest.TestCase):
             ],
         }
         evidence = [
-            {"checker_id": "known", "outcome": "assertion-pass", "validity": "valid", "lifecycle": "finished", "assertions": {"total": 1}},
-            {"checker_id": "one", "outcome": "assertion-pass", "validity": "valid", "lifecycle": "finished", "assertions": {"total": 1}},
+            {"checker_id": "known", "outcome": "assertion-pass", "validity": "valid", "lifecycle": "finished", "trust_level": "trusted", "assertions": {"total": 1}},
+            {"checker_id": "one", "outcome": "assertion-pass", "validity": "valid", "lifecycle": "finished", "trust_level": "trusted", "assertions": {"total": 1}},
         ]
-        result = OutcomeContractInterpreter().evaluate(contract, task_facts={"taskTag": "test"}, evidence=evidence)
+        result = self.evaluate(contract, task_facts={"taskTag": "test"}, evidence=evidence)
         self.assertEqual(result["verdict"], "partial")
 
     def test_malformed_assertion_count_is_inconclusive(self) -> None:
@@ -171,13 +213,13 @@ class OutcomeContractInterpreterTests(unittest.TestCase):
             "applicability": {"taskTag": "test"},
             "requirements": [{"id": "test", "allOf": [{"checker": "demo"}]}],
         }
-        result = OutcomeContractInterpreter().evaluate(
+        result = self.evaluate(
             contract,
             task_facts={"taskTag": "test"},
             evidence=[{"checker_id": "demo", "outcome": "assertion-pass", "validity": "valid", "lifecycle": "finished", "assertions": {"total": "invalid"}}],
         )
         self.assertEqual(result["verdict"], "inconclusive")
-        fractional = OutcomeContractInterpreter().evaluate(
+        fractional = self.evaluate(
             contract,
             task_facts={"taskTag": "test"},
             evidence=[{"checker_id": "demo", "outcome": "assertion-pass", "validity": "valid", "lifecycle": "finished", "assertions": {"total": 1.5}}],

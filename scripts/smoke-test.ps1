@@ -6,6 +6,8 @@
 $ErrorActionPreference = "Stop"
 
 $BaseUrl = "http://${HostName}:$Port"
+$Root = Resolve-Path (Join-Path $PSScriptRoot "..")
+$TokenFile = Join-Path $Root "data/access-token"
 
 function Assert-True {
   param(
@@ -25,6 +27,11 @@ function New-WebClient {
 
 $Client = New-WebClient
 try {
+  if (-not (Test-Path $TokenFile)) {
+    throw "访问密钥文件不存在：$TokenFile"
+  }
+  $Token = (Get-Content -Raw -Encoding UTF8 $TokenFile).Trim()
+  $Client.Headers["Authorization"] = "Bearer $Token"
   $IndexText = $Client.DownloadString("$BaseUrl/")
   $HealthText = $Client.DownloadString("$BaseUrl/api/health")
   $SettingsText = $Client.DownloadString("$BaseUrl/api/settings")

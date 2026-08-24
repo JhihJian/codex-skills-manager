@@ -1,4 +1,5 @@
 import tempfile
+import shutil
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -22,7 +23,7 @@ class GradleSummaryCheckerTests(unittest.TestCase):
     def test_reports_failures_and_skips(self) -> None:
         failed = self.checker.parse("10 tests completed, 2 failed, 1 skipped\nBUILD FAILED", exit_code=1)
         skipped = self.checker.parse("3 tests completed, 3 skipped\nBUILD SUCCESSFUL", exit_code=0)
-        self.assertEqual(failed["outcome"], "assertion-fail")
+        self.assertEqual(failed["outcome"], "inconclusive")
         self.assertEqual(failed["assertions"]["failed"], 2)
         self.assertEqual(skipped["outcome"], "parse-error")
         self.assertEqual(skipped["reason"], "all-tests-skipped")
@@ -31,6 +32,17 @@ class GradleSummaryCheckerTests(unittest.TestCase):
         result = self.checker.parse("", "ERROR: JAVA_HOME is not set", exit_code=1)
         self.assertEqual(result["outcome"], "infrastructure-error")
         self.assertEqual(result["validity"], "environment-mismatch")
+
+    @unittest.skipUnless(shutil.which("gradle"), "trusted Gradle is not installed")
+    def test_runner_mode_requires_attested_test_task_summary(self) -> None:
+        command = self.checker.build_command("/workspace")
+        self.assertIn("--init-script", command)
+        nonce = self.checker._attestation_nonce
+        forged = self.checker.parse("1 test completed", exit_code=0)
+        self.assertEqual(forged["outcome"], "parse-error")
+        self.checker._attestation_nonce = nonce
+        attested = self.checker.parse(f"CODEX_TEST_SUMMARY_{nonce}:1:0:0", exit_code=0)
+        self.assertEqual(attested["outcome"], "inconclusive")
 
 
 class DocumentArtifactCheckerTests(unittest.TestCase):
@@ -56,6 +68,26 @@ class DocumentArtifactCheckerTests(unittest.TestCase):
 
 
 class BubblewrapRunnerTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("bwrap") and shutil.which("gradle"), "bubblewrap or trusted Gradle is not installed")
+    def test_workspace_gradlew_cannot_forge_trusted_gradle_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "gradlew"
+            script.write_text("#!/bin/sh\necho '1 test completed'\n", encoding="utf-8")
+            script.chmod(0o755)
+            (root / "build.gradle").write_text(
+                "tasks.register('test') { doLast { println '1 test completed' } }\n",
+                encoding="utf-8",
+            )
+            runner = BubblewrapCheckerRunner(
+                [GradleSummaryChecker()], allowed_workspace_roots=[root], timeout_seconds=10
+            )
+            result = runner.run("gradle-summary", root)
+        self.assertNotEqual(result["outcome"], "assertion-pass")
+        if result["outcome"] == "blocked":
+            self.assertEqual(result["validity"], "environment-mismatch")
+            self.assertEqual(result["reason"], "sandbox-start-failed")
+
     def test_rejects_unregistered_and_arbitrary_commands(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runner = BubblewrapCheckerRunner([GradleSummaryChecker()], bwrap_path="/missing/bwrap")

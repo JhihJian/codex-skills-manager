@@ -1,0 +1,12 @@
+import org.gradle.api.tasks.testing.Test
+
+allprojects {
+    tasks.withType(Test).configureEach { testTask ->
+        testTask.afterSuite { descriptor, result ->
+            if (descriptor.parent == null) {
+                def nonce = System.getProperty("codex.outcome.nonce", "")
+                println("CODEX_TEST_SUMMARY_${nonce}:${result.testCount}:${result.failedTestCount}:${result.skippedTestCount}")
+            }
+        }
+    }
+}

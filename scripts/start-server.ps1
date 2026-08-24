@@ -10,13 +10,21 @@ $WorkDir = Join-Path $Root "work"
 $PidFile = Join-Path $WorkDir "server.pid"
 $LogFile = Join-Path $WorkDir "server.log"
 $ErrFile = Join-Path $WorkDir "server.err.log"
+$TokenFile = Join-Path $Root "data/access-token"
 
 New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
 
 function Test-Health {
   param([string]$Url)
   try {
-    $Payload = & curl.exe -fsS "$Url/api/health" 2>$null
+    if (-not (Test-Path $TokenFile)) {
+      return $false
+    }
+    $Token = (Get-Content -Raw -Encoding UTF8 $TokenFile).Trim()
+    if (-not $Token) {
+      return $false
+    }
+    $Payload = & curl.exe -fsS -H "Authorization: Bearer $Token" "$Url/api/health" 2>$null
     if (-not $Payload) {
       return $false
     }

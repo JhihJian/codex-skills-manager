@@ -1,10 +1,12 @@
-const state = {
-  activeReview: "usage",
-  running: false,
-  results: new Map(),
-};
-
+const state = { view: "loads", overview: null, selectedCase: null, skillFilter: "", busy: false };
 const $ = (id) => document.getElementById(id);
+
+function element(tag, className = "", text = "") {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== "") node.textContent = String(text);
+  return node;
+}
 
 function setStatus(text) {
   $("statusText").textContent = text;
@@ -12,229 +14,433 @@ function setStatus(text) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await window.skillAuth.fetch(path, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
   const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || `HTTP ${response.status}`);
-  }
+  if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
   return payload;
 }
 
 function badge(text, tone = "") {
-  const span = document.createElement("span");
-  span.className = `badge ${tone}`.trim();
-  span.textContent = text;
-  return span;
+  return element("span", `badge ${tone}`.trim(), text);
 }
 
-function usageStatusLabel(status) {
+function toneFor(value) {
+  if (["pass", "assessable", "loaded", "complete", "active"].includes(value)) return "green";
+  if (["fail", "error", "blocked", "invalidated", "disputed"].includes(value)) return "red";
+  if (["partial", "needs-evidence", "unknown", "pending", "inconclusive", "exception-accepted"].includes(value)) return "orange";
+  return "";
+}
+
+function label(value) {
   return {
-    active: "近期使用",
-    stale: "长期未用",
-    "never-used": "暂无真实使用证据",
-    "declared-only": "仅有声明",
-  }[status] || status;
+    loaded: "加载成功", pending: "等待结果", "result-missing": "结果缺失", error: "加载错误",
+    blocked: "已阻止", cancelled: "已取消", pass: "通过", partial: "部分通过", fail: "失败",
+    unset: "未形成结论", assessable: "可评审", "needs-evidence": "证据不足",
+    "not-assessable": "不可评审", direct: "直接参与", shared: "共享参与", candidate: "候选关系",
+    rejected: "已排除", "exception-accepted": "例外接受", disputed: "结论冲突",
+    "resolved-by-correction": "已由纠正解决", "manual-decision": "人工裁决",
+    "manual-disposition": "人工处置", automatic: "自动评审", exception: "业务例外",
+    complete: "完整", partial_data: "部分数据", unknown: "未知",
+  }[value] || value || "未知";
 }
 
-function usageStatusTone(status) {
-  return {
-    active: "green",
-    stale: "orange",
-    "never-used": "red",
-    "declared-only": "orange",
-  }[status] || "";
+function shortSha(value) {
+  return value ? String(value).slice(0, 10) : "版本未知";
 }
 
-function formatRelativeUsage(item) {
-  if (item.daysSinceLastUsed === null || item.daysSinceLastUsed === undefined) return item.lastUsedAt || "无真实使用证据";
-  if (item.daysSinceLastUsed === 0) return "今天";
-  return `${item.daysSinceLastUsed} 天前`;
+function dateText(value) {
+  if (!value) return "时间未知";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("zh-CN", { hour12: false });
 }
 
-function warningNode(warning) {
-  const node = document.createElement("div");
-  node.className = "review-warning";
-  node.textContent = warning.message || String(warning);
-  return node;
+function sectionHead(title, description = "") {
+  const head = element("div", "outcome-section-head");
+  const copy = element("div");
+  copy.append(element("h1", "", title));
+  if (description) copy.append(element("p", "", description));
+  head.append(copy);
+  return head;
 }
 
-const reviews = {
-  usage: {
-    title: "长期未真实使用",
-    description: "识别长期没有真实触发证据的 skills，避免把会话技能列表或普通关键词命中误判为使用。",
-    runningSummary() {
-      const staleDays = $("reviewStaleDays").value || "30";
-      return `正在扫描本机会话，按 ${staleDays} 天阈值识别未真实使用的技能。`;
-    },
-    runningPolicy:
-      "正在读取 Codex 与 Pi 的结构化会话事件，把 SKILL.md 读取和 Pi /skill 命令加载计为真实使用证据。",
-    buildBody() {
-      return {
-        staleDays: $("reviewStaleDays").value,
-        scope: $("reviewScope").value,
-        includeSystem: $("reviewIncludeSystem").checked,
-      };
-    },
-    async run() {
-      return api("/api/reviews/usage", {
-        method: "POST",
-        body: JSON.stringify(this.buildBody()),
-      });
-    },
-    renderResult(payload) {
-      const stats = payload.stats || {};
-      const summaryItems = [
-        ["审查", stats.reviewed ?? 0, ""],
-        ["问题", stats.issues ?? 0, "red"],
-        ["未确认", stats.neverUsed ?? 0, "red"],
-        ["仅声明", stats.declaredOnly ?? 0, "orange"],
-        ["长期未用", stats.stale ?? 0, "orange"],
-        ["近期使用", stats.active ?? 0, "green"],
-      ];
-      $("reviewSummary").replaceChildren(
-        ...summaryItems.map(([label, value, tone]) => {
-          const item = document.createElement("div");
-          item.className = "review-metric";
-          item.append(badge(label, tone), document.createElement("strong"));
-          item.querySelector("strong").textContent = value;
-          return item;
-        }),
-      );
-      const codexFiles = payload.scan?.sources?.codex?.scannedFiles || 0;
-      const piFiles = payload.scan?.sources?.pi?.scannedFiles || 0;
-      $("reviewPolicy").textContent = `${payload.evidencePolicy || ""} 扫描 Codex ${codexFiles} 个、Pi ${piFiles} 个会话文件，阈值 ${payload.staleDays} 天。`;
-
-      const interesting = (payload.entries || []).filter((item) => item.status !== "active");
-      const entries = interesting.length ? interesting : payload.entries || [];
-      const warnings = (payload.warnings || []).map(warningNode);
-      if (!entries.length) {
-        const empty = document.createElement("div");
-        empty.className = "empty-state";
-        empty.textContent = stats.reviewed ? "当前范围内没有需要展示的技能。" : "当前审查范围内没有技能。";
-        $("reviewResults").replaceChildren(...warnings, empty);
-        return;
-      }
-      $("reviewResults").replaceChildren(...warnings, ...entries.map(renderUsageReviewItem));
-    },
-  },
-};
-
-function renderUsageReviewItem(item) {
-  const article = document.createElement("article");
-  article.className = `review-item ${item.status}`;
-  const head = document.createElement("div");
-  head.className = "review-item-head";
-  const title = document.createElement("a");
-  title.className = "review-skill-link";
-  title.href = `/?skill=${encodeURIComponent(item.name)}`;
-  title.textContent = item.name;
-  title.title = item.title || item.name;
-  const status = badge(usageStatusLabel(item.status), usageStatusTone(item.status));
-  const meta = document.createElement("span");
-  meta.className = "review-item-meta";
-  meta.textContent = formatRelativeUsage(item);
-  head.append(title, status, meta);
-
-  const details = document.createElement("div");
-  details.className = "review-item-details";
-  const counts = document.createElement("span");
-  counts.textContent = `证据 ${item.confirmedEvidenceCount || 0} · 声明 ${item.announcementEvidenceCount || 0} · ${item.category || "未分类"}`;
-  details.appendChild(counts);
-
-  const evidenceList = document.createElement("div");
-  evidenceList.className = "review-evidence";
-  const evidence = (item.evidence?.length ? item.evidence : item.announcements || []).slice(0, 3);
-  if (!evidence.length) {
-    const empty = document.createElement("p");
-    empty.textContent = "没有发现 SKILL.md 读取证据。";
-    evidenceList.appendChild(empty);
-  } else {
-    for (const evidenceItem of evidence) {
-      const row = document.createElement("p");
-      const label = document.createElement("span");
-      const source = evidenceItem.source === "pi" ? "Pi" : "Codex";
-      label.textContent = `${source} · ${evidenceItem.confidence === "confirmed" ? "确认" : "声明"} L${evidenceItem.line || "?"}`;
-      row.append(label, document.createTextNode(evidenceItem.snippet || evidenceItem.title || ""));
-      evidenceList.appendChild(row);
-    }
-  }
-
-  article.append(head, details, evidenceList);
-  return article;
+function actionButton(text, action, className = "secondary-button") {
+  const button = element("button", className, text);
+  button.type = "button";
+  button.addEventListener("click", () => action().catch((error) => setStatus(error.message)));
+  return button;
 }
 
-function renderReview() {
-  const review = reviews[state.activeReview];
-  $("reviewTitle").textContent = review.title;
-  $("reviewDescription").textContent = review.description;
-  $("reviewProgress").hidden = !state.running;
-  $("reviewProgress").setAttribute("aria-busy", state.running ? "true" : "false");
-  $("runReviewButton").textContent = state.running ? "审查中" : "开始审查";
-  $("runReviewButton").disabled = state.running;
-  document.querySelectorAll(".review-type").forEach((button) => {
-    button.classList.toggle("active", button.dataset.review === state.activeReview);
-  });
-
-  if (state.running) {
-    $("reviewSummary").replaceChildren(document.createElement("span"));
-    $("reviewSummary").firstElementChild.textContent = review.runningSummary();
-    $("reviewPolicy").textContent = review.runningPolicy;
-    $("reviewResults").replaceChildren();
-    return;
-  }
-
-  const payload = state.results.get(state.activeReview);
-  if (!payload) {
-    $("reviewSummary").replaceChildren(document.createElement("span"));
-    $("reviewSummary").firstElementChild.textContent = "尚未运行审查";
-    $("reviewPolicy").textContent = "";
-    $("reviewResults").replaceChildren();
-    return;
-  }
-  review.renderResult(payload);
-}
-
-async function runActiveReview() {
-  const review = reviews[state.activeReview];
-  state.running = true;
-  state.results.delete(state.activeReview);
-  renderReview();
-  setStatus("正在审查技能问题");
-  try {
-    const payload = await review.run();
-    state.results.set(state.activeReview, payload);
-    const warnings = payload.warnings || [];
-    if (warnings.some((item) => item.code === "empty-scope")) {
-      setStatus("审查完成，当前范围内没有技能");
-    } else if (warnings.some((item) => item.code === "no-session-files")) {
-      setStatus(`审查完成，但没有扫描到会话证据；发现 ${payload.stats?.issues || 0} 个缺少证据的技能`);
-    } else {
-      setStatus(`审查完成，发现 ${payload.stats?.issues || 0} 个需要关注的技能`);
-    }
-  } finally {
-    state.running = false;
-    renderReview();
-  }
-}
-
-function bindEvents() {
-  $("reviewTypeCount").textContent = Object.keys(reviews).length;
-  document.querySelectorAll(".review-type").forEach((button) => {
-    button.addEventListener("click", () => {
-      if (state.running) return;
-      state.activeReview = button.dataset.review || "usage";
-      renderReview();
-    });
-  });
-  $("runReviewButton").addEventListener("click", () => runActiveReview().catch((error) => {
-    setStatus(error.message);
-    state.running = false;
-    renderReview();
+function renderOverview() {
+  const overview = state.overview || {};
+  const scan = overview.latest_scan || {};
+  const metrics = [
+    ["规范事件", overview.event_count || 0],
+    ["任务案例", overview.task_case_count || 0],
+    ["可评审", overview.assessable_count || 0],
+    ["证据不足", overview.needs_evidence_count || 0],
+    ["待人工", overview.open_review_count || 0],
+    ["覆盖", label(scan.coverage_status || "unknown")],
+  ];
+  $("effectOverview").replaceChildren(...metrics.map(([name, value]) => {
+    const metric = element("div", "outcome-overview-item");
+    metric.append(element("span", "", name), element("strong", "", value));
+    return metric;
   }));
+  $("openQueueCount").textContent = overview.open_review_count || 0;
+  $("updatedAt").textContent = scan.finished_at ? `索引 ${dateText(scan.finished_at)}` : "尚未建立结果索引";
 }
 
-bindEvents();
-renderReview();
+async function loadOverview() {
+  state.overview = await api("/api/effect-overview");
+  renderOverview();
+}
+
+function filterBar({ skill = true, status = false } = {}) {
+  const bar = element("div", "outcome-filterbar");
+  if (skill) {
+    const input = element("input");
+    input.type = "search";
+    input.placeholder = "筛选技能名称";
+    input.value = state.skillFilter;
+    input.addEventListener("change", () => { state.skillFilter = input.value.trim(); renderView(); });
+    bar.append(input);
+  }
+  if (status) {
+    const select = element("select");
+    [["", "全部加载状态"], ["loaded", "加载成功"], ["result-missing", "结果缺失"], ["error", "加载错误"]]
+      .forEach(([value, text]) => select.append(new Option(text, value)));
+    select.addEventListener("change", () => { select.dataset.value = select.value; renderLoads(select.value); });
+    bar.append(select);
+  }
+  return bar;
+}
+
+function resultRow(item, mode) {
+  const row = element("div", "outcome-table-row");
+  const skill = element("strong", "", item.skill_id || "未知技能");
+  const version = element("span", "outcome-mono", shortSha(item.skill_sha256));
+  const primary = element("div", "outcome-row-primary");
+  primary.append(skill, version);
+  row.append(primary);
+  if (mode === "loads") {
+    row.append(badge(label(item.load_status), toneFor(item.load_status)));
+    row.append(element("span", "", label(item.attribution_kind)));
+  } else {
+    const verdict = item.effective_verdict || item.automated_verdict || item.assessability;
+    row.append(badge(label(verdict), toneFor(verdict)));
+    row.append(element("span", "outcome-mono", item.contract_version_id ? item.contract_version_id.slice(0, 8) : "无合同"));
+  }
+  row.append(element("time", "", dateText(item.created_at)));
+  row.append(actionButton("查看", async () => openCase(item.task_case_id), "text-button"));
+  return row;
+}
+
+async function renderLoads(status = "") {
+  const content = $("outcomeContent");
+  const head = sectionHead("检测到技能加载", "加载记录只证明技能内容被请求并返回，不代表任务成功或技能产生价值。");
+  head.append(filterBar({ skill: true, status: true }));
+  content.replaceChildren(head, element("div", "loading-state", "正在读取加载记录"));
+  const query = new URLSearchParams({ limit: "300" });
+  if (state.skillFilter) query.set("skill", state.skillFilter);
+  if (status) query.set("status", status);
+  const payload = await api(`/api/skill-use-events?${query}`);
+  const table = element("div", "outcome-table");
+  table.append(element("div", "outcome-table-head", "技能 / 状态 / 参与关系 / 时间"));
+  (payload.items || []).forEach((item) => table.append(resultRow(item, "loads")));
+  if (!payload.items?.length) table.append(element("div", "empty-state", "当前筛选条件下没有检测到技能加载。"));
+  content.replaceChildren(head, table);
+}
+
+async function renderOutcomes() {
+  const content = $("outcomeContent");
+  const head = sectionHead("使用该技能的任务结果", "结论按技能 SHA、合同版本、任务类型和参与关系分别展示。");
+  head.append(filterBar());
+  content.replaceChildren(head, element("div", "loading-state", "正在读取任务结果"));
+  const query = new URLSearchParams({ limit: "300" });
+  if (state.skillFilter) query.set("skill", state.skillFilter);
+  const payload = await api(`/api/skill-use-events?${query}`);
+  const table = element("div", "outcome-table");
+  table.append(element("div", "outcome-table-head", "技能 / 当前结论 / 合同 / 时间"));
+  (payload.items || []).forEach((item) => table.append(resultRow(item, "outcomes")));
+  if (!payload.items?.length) table.append(element("div", "empty-state", "尚无任务结果记录。先扫描会话并评审案例。"));
+  content.replaceChildren(head, table);
+}
+
+async function renderQueue() {
+  const content = $("outcomeContent");
+  const head = sectionHead("人工评审队列", "证据不足、适用性未知、确定性失败和冲突案例在此处理。");
+  content.replaceChildren(head, element("div", "loading-state", "正在读取队列"));
+  const payload = await api("/api/review-tasks?status=open&limit=300");
+  const table = element("div", "outcome-table");
+  table.append(element("div", "outcome-table-head", "技能 / 队列原因 / 自动结论 / 操作"));
+  for (const item of payload.items || []) {
+    const row = element("div", "outcome-table-row queue-row");
+    row.append(element("strong", "", item.skill_id || "技能版本未知"));
+    row.append(badge(label(item.queue_reason), "orange"));
+    row.append(badge(label(item.automated_verdict), toneFor(item.automated_verdict)));
+    row.append(element("span", "", item.task_type || "任务类型未知"));
+    row.append(actionButton(item.claimed_by_actor_id ? "继续评审" : "领取并评审", async () => {
+      if (!item.claimed_by_actor_id) {
+        await api(`/api/review-tasks/${item.id}/claim`, { method: "POST", body: "{}" });
+      }
+      await openCase(item.task_case_id);
+    }, "primary-button compact-button"));
+    table.append(row);
+  }
+  if (!payload.items?.length) table.append(element("div", "empty-state", "当前没有待人工处理的案例。"));
+  content.replaceChildren(head, table);
+}
+
+function timelineItem(kind, title, meta, detail = "") {
+  const item = element("div", "outcome-timeline-item");
+  item.append(badge(kind), element("strong", "", title), element("time", "", meta));
+  if (detail) item.append(element("p", "", detail));
+  return item;
+}
+
+async function submitReview(caseId, invocationId) {
+  await api(`/api/task-cases/${encodeURIComponent(caseId)}/review`, {
+    method: "POST", body: JSON.stringify({ skillInvocationId: invocationId }),
+  });
+  setStatus("自动评审已生成新 revision");
+  await Promise.all([loadOverview(), openCase(caseId)]);
+}
+
+function reviewActions(detail) {
+  const panel = element("div", "outcome-action-panel");
+  const current = [...(detail.assessments || [])].reverse().find((item) => item.is_current);
+  const task = (detail.review_tasks || []).find((item) => current && item.assessment_id === current.id);
+  const invocation = (detail.invocations || []).find((item) => item.load_status === "loaded" && item.validity === "valid");
+  const row = element("div", "outcome-action-row");
+  if (invocation) row.append(actionButton("重新评审", () => submitReview(detail.case.id, invocation.id), "secondary-button"));
+  if (current && task?.queue_reason === "semantic-review-required") {
+    row.append(actionButton("运行语义评审", async () => {
+      await api(`/api/task-cases/${detail.case.id}/semantic-review`, {
+        method: "POST", body: JSON.stringify({ assessmentId: current.id }),
+      });
+      setStatus("语义评审已完成");
+      await Promise.all([loadOverview(), openCase(detail.case.id)]);
+    }, "primary-button"));
+  }
+  if (!task || !current) {
+    panel.append(row, element("p", "outcome-muted", "生成 assessment 后可提交人工裁决。"));
+    return panel;
+  }
+  const verdict = element("select");
+  [["pass", "通过"], ["partial", "部分通过"], ["fail", "失败"]].forEach(([value, text]) => {
+    const option = new Option(text, value);
+    if (current.hard_failure && value === "pass") option.disabled = true;
+    verdict.append(option);
+  });
+  if (current.hard_failure) verdict.value = "fail";
+  const reason = element("input"); reason.placeholder = "原因代码"; reason.value = "manual-review";
+  const note = element("input"); note.placeholder = "备注（可选）";
+  if (current.assessability === "assessable") {
+    row.append(verdict, reason, note, actionButton("提交裁决", async () => {
+      await api(`/api/review-tasks/${task.id}/decision`, {
+        method: "PUT", body: JSON.stringify({
+          expectedRevision: task.current_decision_revision, verdict: verdict.value,
+          reasonCode: reason.value.trim(), note: note.value.trim(),
+        }),
+      });
+      setStatus("人工裁决已追加");
+      await Promise.all([loadOverview(), openCase(detail.case.id)]);
+    }, "primary-button"));
+  }
+  const dispositionRow = element("div", "outcome-action-row");
+  const disposition = element("select");
+  disposition.append(new Option("不可评审", "not-assessable"), new Option("需要证据", "needs-evidence"));
+  dispositionRow.append(disposition, actionButton("提交处置", async () => {
+    await api(`/api/review-tasks/${task.id}/disposition`, {
+      method: "PUT", body: JSON.stringify({ expectedRevision: task.current_decision_revision, disposition: disposition.value, reasonCode: "manual-disposition" }),
+    });
+    await openCase(detail.case.id);
+  }));
+  const correctionRow = element("div", "outcome-action-row");
+  const taskType = element("input"); taskType.placeholder = "纠正后的任务类型";
+  correctionRow.append(taskType, actionButton("追加纠正", async () => {
+    const revision = Math.max(0, ...(detail.corrections || []).map((item) => item.revision));
+    await api(`/api/task-cases/${detail.case.id}/corrections`, {
+      method: "POST", body: JSON.stringify({ expectedRevision: revision, correctionType: "task-type", reasonCode: "manual-correction", assessmentId: current.id, payload: { task_type: taskType.value.trim() } }),
+    });
+    await Promise.all([loadOverview(), openCase(detail.case.id)]);
+  }));
+  const exceptionRow = element("div", "outcome-action-row");
+  exceptionRow.append(element("span", "outcome-muted", "业务接受例外会排除正常结果率"), actionButton("接受例外", async () => {
+    const revision = Math.max(0, ...(detail.exceptions || []).map((item) => item.revision));
+    await api(`/api/task-cases/${detail.case.id}/exception`, {
+      method: "POST", body: JSON.stringify({ expectedRevision: revision, assessmentId: current.id, reasonCode: "business-exception", scope: { mode: "single-case" } }),
+    });
+    await openCase(detail.case.id);
+  }, "secondary-button danger-button"));
+  panel.append(row, dispositionRow, correctionRow, exceptionRow);
+  return panel;
+}
+
+async function openCase(caseId) {
+  state.selectedCase = caseId;
+  const content = $("outcomeContent");
+  content.replaceChildren(element("div", "loading-state", "正在读取案例证据"));
+  const detail = await api(`/api/task-cases/${encodeURIComponent(caseId)}`);
+  const head = sectionHead(detail.case.task_type || "任务案例", `Case ${detail.case.id.slice(0, 12)} · revision ${detail.case.current_revision}`);
+  head.append(actionButton("返回", async () => { state.selectedCase = null; await renderView(); }, "text-button"));
+  const layout = element("div", "case-detail-layout");
+  const timeline = element("section", "case-timeline");
+  timeline.append(element("h2", "", "证据时间线"));
+  for (const episode of detail.episodes || []) timeline.append(timelineItem("目标", episode.goal_text || "未恢复用户目标", dateText(episode.created_at), episode.process_state));
+  for (const invocation of detail.invocations || []) timeline.append(timelineItem("技能", invocation.skill_id, dateText(invocation.created_at), `${label(invocation.load_status)} · ${shortSha(invocation.skill_sha256)} · ${label(invocation.attribution_kind)}`));
+  for (const call of detail.tool_calls || []) timeline.append(timelineItem("工具", call.tool_name, dateText(call.called_at), call.result_status ? `结果：${call.result_status}` : "结果缺失"));
+  for (const check of detail.checks || []) timeline.append(timelineItem("检查", check.checker_id, dateText(check.finished_at), `${check.assertion_outcome || check.status} · freshness ${check.freshness}`));
+  for (const review of detail.semantic_reviews || []) timeline.append(timelineItem(
+    "语义", review.id, dateText(review.created_at),
+    `${label(review.verdict)} · assessment ${review.assessment_id?.slice(0, 8) || "未知"} · ${review.model_version}`,
+  ));
+  for (const evidence of detail.evidence || []) {
+    const locator = evidence.locator?.line ? `generation ${shortSha(evidence.locator.generationId)} · line ${evidence.locator.line}` : JSON.stringify(evidence.locator || {});
+    timeline.append(timelineItem("证据", evidence.evidenceId, dateText(evidence.observedAt), `${shortSha(evidence.contentHash)} · ${locator}`));
+  }
+  const side = element("aside", "case-assessment-side");
+  side.append(element("h2", "", "评审结论"));
+  for (const assessment of [...(detail.assessments || [])].reverse()) {
+    const item = element("div", "assessment-item");
+    const verdict = assessment.effective_verdict || assessment.automated_verdict || assessment.assessability;
+    item.append(badge(`r${assessment.revision}`), badge(label(verdict), toneFor(verdict)));
+    item.append(element("strong", "", assessment.skill_id || "技能未绑定"));
+    item.append(element("p", "", `合同 ${assessment.contract_version_id?.slice(0, 8) || "缺失"} · freshness ${assessment.freshness}`));
+    if (assessment.effective_source && assessment.effective_source !== "automatic") item.append(element("p", "outcome-muted", `有效来源：${label(assessment.effective_source)} · ${label(assessment.conflict_state)}`));
+    if (assessment.hard_failure) item.append(badge("有效硬失败", "red"));
+    side.append(item);
+  }
+  side.append(element("h2", "", "人工操作"));
+  for (const decision of detail.decisions || []) side.append(timelineItem(decision.action, label(decision.verdict), dateText(decision.created_at), decision.reason_code));
+  side.append(reviewActions(detail));
+  layout.append(timeline, side);
+  content.replaceChildren(head, layout);
+}
+
+async function renderContracts() {
+  const content = $("outcomeContent");
+  const head = sectionHead("结果评审合同", "合同绑定精确 SKILL.md SHA。发布后不可修改，只能创建新版本。");
+  const controls = element("div", "outcome-filterbar");
+  const input = element("input"); input.placeholder = "技能名称"; input.value = state.skillFilter;
+  const load = actionButton("查询", async () => { state.skillFilter = input.value.trim(); await renderContracts(); }, "secondary-button");
+  const createGradle = actionButton("新建 Gradle 合同", async () => createContract(input.value, "gradle"), "secondary-button");
+  const createDocument = actionButton("新建文档合同", async () => createContract(input.value, "document"), "secondary-button");
+  controls.append(input, load, createGradle, createDocument);
+  head.append(controls);
+  content.replaceChildren(head);
+  if (!state.skillFilter) {
+    content.append(element("div", "empty-state", "输入技能名称以读取精确版本合同。"));
+    return;
+  }
+  const payload = await api(`/api/skills/${encodeURIComponent(state.skillFilter)}/outcome-contracts`);
+  const list = element("div", "contract-list");
+  for (const contract of payload.contracts || []) {
+    const item = element("article", "contract-item");
+    const title = element("div", "contract-title");
+    title.append(element("strong", "", `v${contract.version}`), badge(contract.status, toneFor(contract.status)), element("span", "outcome-mono", shortSha(contract.skill_sha256)));
+    if (contract.status === "draft") title.append(actionButton("发布", async () => {
+      await api(`/api/outcome-contracts/${contract.id}/publish`, { method: "POST", body: "{}" });
+      await renderContracts();
+    }, "primary-button compact-button"));
+    const pre = element("pre", "contract-json", JSON.stringify(contract.contract, null, 2));
+    item.append(title, pre);
+    list.append(item);
+  }
+  if (!payload.contracts?.length) list.append(element("div", "empty-state", "该技能尚无结果评审合同。"));
+  content.append(list);
+}
+
+async function createContract(rawSkill, template) {
+  const skill = rawSkill.trim();
+  if (!skill) throw new Error("请输入技能名称");
+  state.skillFilter = skill;
+  await api(`/api/skills/${encodeURIComponent(skill)}/outcome-contracts`, {
+    method: "POST", body: JSON.stringify({ template }),
+  });
+  setStatus("合同草稿已创建");
+  await renderContracts();
+}
+
+async function renderMetrics() {
+  const content = $("outcomeContent");
+  const head = sectionHead("结果指标", "实时预览不进入历史趋势；正式快照冻结案例、结论、覆盖和版本元组。");
+  content.replaceChildren(head, element("div", "loading-state", "正在读取指标"));
+  const payload = await api("/api/effect-metrics");
+  const preview = element("section", "metric-band");
+  preview.append(element("div", "metric-big", payload.preview.caseCount), element("div", "", "当前候选案例"), badge("非正式预览", "orange"));
+  preview.append(actionButton("创建正式快照", async () => {
+    const coverage = state.overview?.latest_scan?.coverage_status || "partial";
+    await api("/api/effect-metric-snapshots", {
+      method: "POST", body: JSON.stringify({ cutoffAt: new Date().toISOString(), coverageStatus: coverage, dimensions: {}, versions: { parser: "outcome-reviews-v1" } }),
+    });
+    await renderMetrics();
+  }, "primary-button"));
+  const latestReport = payload.snapshots?.[0]?.report;
+  const report = element("section", "metric-report");
+  if (latestReport) {
+    report.append(element("h2", "", "最近正式快照口径"));
+    report.append(element("p", "outcome-muted", `纳入 ${latestReport.included} · 排除 ${latestReport.excluded} · 覆盖 ${label(latestReport.coverageStatus)}`));
+    for (const group of latestReport.groups || []) {
+      const row = element("div", "metric-group-row");
+      const passRate = group.rates.pass.rate;
+      row.append(
+        element("strong", "", group.skillId),
+        element("span", "outcome-mono", `${shortSha(group.skillSha256)} · ${group.contractVersionId?.slice(0, 8) || "无合同"}`),
+        element("span", "", `样本 ${group.denominator}`),
+        element("span", "", passRate === null ? "通过率：样本少于 20" : `通过率 ${(passRate * 100).toFixed(1)}%`),
+      );
+      report.append(row);
+    }
+    if (!latestReport.groups?.length) report.append(element("p", "outcome-muted", "最近快照没有符合口径的案例。"));
+  }
+  const list = element("div", "outcome-table");
+  list.append(element("div", "outcome-table-head", "快照 / 覆盖 / 截止时间 / 版本"));
+  for (const snapshot of payload.snapshots || []) {
+    const row = element("div", "outcome-table-row metric-row");
+    row.append(element("strong", "outcome-mono", snapshot.id.slice(0, 10)), badge(label(snapshot.coverage_status), toneFor(snapshot.coverage_status)), element("time", "", dateText(snapshot.cutoff_at)), element("span", "", "已封存"));
+    list.append(row);
+  }
+  if (!payload.snapshots?.length) list.append(element("div", "empty-state", "尚未创建正式指标快照。"));
+  content.replaceChildren(head, preview, report, list);
+}
+
+async function renderView() {
+  document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
+  if (state.selectedCase) return openCase(state.selectedCase);
+  if (state.view === "loads") return renderLoads();
+  if (state.view === "outcomes") return renderOutcomes();
+  if (state.view === "queue") return renderQueue();
+  if (state.view === "contracts") return renderContracts();
+  return renderMetrics();
+}
+
+async function runScan() {
+  if (state.busy) return;
+  state.busy = true;
+  $("effectScanButton").disabled = true;
+  setStatus("正在增量扫描会话");
+  try {
+    const scan = await api("/api/effect-scan", { method: "POST", body: JSON.stringify({ budgetBytes: 268435456, budgetSeconds: 20 }) });
+    setStatus(`扫描完成：索引 ${scan.indexed_files} 个文件，待处理 ${scan.pending_files} 个`);
+    await loadOverview();
+    await renderView();
+  } finally {
+    state.busy = false;
+    $("effectScanButton").disabled = false;
+  }
+}
+
+document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => {
+  state.view = button.dataset.view;
+  state.selectedCase = null;
+  renderView().catch((error) => setStatus(error.message));
+}));
+$("effectScanButton").addEventListener("click", () => runScan().catch((error) => setStatus(error.message)));
+
+Promise.all([loadOverview(), renderView()])
+  .then(() => setStatus("结果评审数据已加载"))
+  .catch((error) => setStatus(error.message));

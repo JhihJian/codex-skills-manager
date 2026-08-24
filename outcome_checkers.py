@@ -6,6 +6,7 @@ import errno
 import hashlib
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -14,6 +15,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
+
+from auth import redact_sensitive
 
 try:
     import resource
@@ -151,6 +154,23 @@ class GradleSummaryChecker:
     version = "1.0.0"
     parser_version = 1
 
+    def __init__(self, gradle_executable: str | None = None) -> None:
+        executable = gradle_executable or shutil.which("gradle")
+        self.gradle_home: Path | None = None
+        if executable:
+            resolved = Path(executable).expanduser().resolve()
+            if resolved.is_file() and os.access(resolved, os.X_OK) and resolved.parent.name == "bin":
+                self.gradle_home = resolved.parent.parent
+        self.init_assets = Path(__file__).with_name("checker-assets").resolve()
+        self.trusted_bindings = (
+            (
+                (self.gradle_home, Path("/opt/codex-trusted-gradle")),
+                (self.init_assets, Path("/opt/codex-checker-assets")),
+            )
+            if self.gradle_home is not None and self.init_assets.is_dir() else ()
+        )
+        self._attestation_nonce: str | None = None
+
     _SUMMARY_RE = re.compile(
         r"(?P<total>\d+)\s+tests?\s+completed(?:,\s*(?P<failed>\d+)\s+failed)?(?:,\s*(?P<skipped>\d+)\s+skipped)?",
         re.IGNORECASE,
@@ -179,7 +199,14 @@ class GradleSummaryChecker:
     ) -> dict[str, Any]:
         text = f"{stdout or ''}\n{stderr or ''}"
         raw_hash = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
-        summaries = list(self._SUMMARY_RE.finditer(text)) or list(self._ALT_SUMMARY_RE.finditer(text))
+        if self._attestation_nonce:
+            attested = re.compile(
+                rf"CODEX_TEST_SUMMARY_{re.escape(self._attestation_nonce)}:(?P<total>\d+):(?P<failed>\d+):(?P<skipped>\d+)"
+            )
+            summaries = list(attested.finditer(text))
+            self._attestation_nonce = None
+        else:
+            summaries = list(self._SUMMARY_RE.finditer(text)) or list(self._ALT_SUMMARY_RE.finditer(text))
         if not summaries:
             environment_error = any(pattern.search(text) for pattern in self._ENVIRONMENT_PATTERNS)
             return _result(
@@ -214,19 +241,13 @@ class GradleSummaryChecker:
                 exit_code=exit_code,
                 raw_result_sha256=raw_hash,
             )
-        if failed > 0:
-            outcome, reason = "assertion-fail", "tests-failed"
-        elif skipped > 0 and skipped_policy == "forbid":
-            outcome, reason = "assertion-fail", "tests-skipped"
-        elif exit_code != 0:
-            # A non-zero process with a clean summary may have failed after the
-            # tests (reporting, daemon, or another task), so it is not an
-            # assertion failure.
-            outcome, reason = "infrastructure-error", "gradle-process-failed"
-        elif any(pattern.search(text) for pattern in self._ENVIRONMENT_PATTERNS):
+        if any(pattern.search(text) for pattern in self._ENVIRONMENT_PATTERNS):
             outcome, reason = "infrastructure-error", "gradle-environment-error"
         else:
-            outcome, reason = "assertion-pass", None
+            # Gradle build scripts execute arbitrary project code in the same
+            # JVM as Test listeners. Suite counts are useful review evidence,
+            # but cannot establish an unforgeable automatic pass or hard fail.
+            outcome, reason = "inconclusive", "gradle-result-requires-human"
         return _result(
             self.checker_id,
             outcome=outcome,
@@ -241,6 +262,8 @@ class GradleSummaryChecker:
     check = parse
 
     def build_command(self, sandbox_workspace: str, **options: Any) -> Sequence[str]:
+        if self.gradle_home is None or not self.trusted_bindings:
+            raise CheckerCommandRejected("a trusted system Gradle installation is required")
         tasks = options.get("tasks", ["test"])
         if isinstance(tasks, str):
             tasks = [tasks]
@@ -252,7 +275,13 @@ class GradleSummaryChecker:
             if not re.fullmatch(r"[A-Za-z0-9_:.-]+", value) or value.startswith("-"):
                 raise CheckerCommandRejected(f"unsafe Gradle task: {value}")
             safe_tasks.append(value)
-        return [f"{sandbox_workspace}/gradlew", "--no-daemon", "--console=plain", *safe_tasks]
+        self._attestation_nonce = secrets.token_hex(16)
+        return [
+            "/opt/codex-trusted-gradle/bin/gradle", "--no-daemon", "--console=plain",
+            f"-Dcodex.outcome.nonce={self._attestation_nonce}",
+            "--init-script", "/opt/codex-checker-assets/gradle-outcome.init.gradle",
+            *safe_tasks,
+        ]
 
 
 class DocumentArtifactChecker:
@@ -390,6 +419,7 @@ class BubblewrapCheckerRunner:
         process_limit: int = 64,
         max_workspace_bytes: int = 1_073_741_824,
         max_workspace_files: int = 100_000,
+        allowed_workspace_roots: Sequence[str | Path] = (),
     ):
         detected = str(bwrap_path) if bwrap_path is not None else shutil.which("bwrap")
         self.bwrap_path = detected
@@ -399,6 +429,7 @@ class BubblewrapCheckerRunner:
         self.process_limit = int(process_limit)
         self.max_workspace_bytes = int(max_workspace_bytes)
         self.max_workspace_files = int(max_workspace_files)
+        self.allowed_workspace_roots = tuple(Path(root).expanduser().resolve() for root in allowed_workspace_roots)
         self._checkers: dict[str, RegisteredChecker] = {}
         for checker in checkers:
             self.register(checker)
@@ -431,7 +462,11 @@ class BubblewrapCheckerRunner:
         os.setsid()
 
     @staticmethod
-    def _base_bwrap_command(bwrap_path: str, workspace: Path) -> list[str]:
+    def _base_bwrap_command(
+        bwrap_path: str,
+        workspace: Path,
+        trusted_bindings: Sequence[tuple[Path, Path]] = (),
+    ) -> list[str]:
         command = [
             bwrap_path,
             "--die-with-parent",
@@ -452,6 +487,10 @@ class BubblewrapCheckerRunner:
         for host_path in ("/usr", "/bin", "/lib", "/lib64"):
             if Path(host_path).exists():
                 command.extend(("--ro-bind", host_path, host_path))
+        for source, target in trusted_bindings:
+            if not source.is_dir() or not target.is_absolute():
+                raise CheckerCommandRejected("checker trusted binding is invalid")
+            command.extend(("--ro-bind", str(source), str(target)))
         return command
 
     def run(
@@ -470,6 +509,10 @@ class BubblewrapCheckerRunner:
         source = Path(workspace).expanduser().resolve()
         if not source.is_dir():
             raise ValueError(f"workspace is not a directory: {source}")
+        if self.allowed_workspace_roots and not any(
+            source == root or root in source.parents for root in self.allowed_workspace_roots
+        ):
+            raise CheckerCommandRejected("workspace is outside the configured allowed roots")
         if not self.available:
             return _result(
                 checker_id,
@@ -504,7 +547,13 @@ class BubblewrapCheckerRunner:
             command = list(checker.build_command("/workspace", **options))
             if not command or not all(isinstance(item, str) and item for item in command):
                 raise CheckerCommandRejected("checker produced an invalid command")
-            full_command = [*self._base_bwrap_command(str(self.bwrap_path), isolated_workspace), "--", *command]
+            trusted_bindings = tuple(getattr(checker, "trusted_bindings", ()))
+            full_command = [
+                *self._base_bwrap_command(
+                    str(self.bwrap_path), isolated_workspace, trusted_bindings
+                ),
+                "--", *command,
+            ]
             started = time.monotonic()
             with tempfile.TemporaryFile() as output_file:
                 try:
@@ -542,12 +591,22 @@ class BubblewrapCheckerRunner:
                 output_file.seek(0)
                 stdout_raw = output_file.read(self.max_output_bytes + 1)
             truncated = len(stdout_raw) > self.max_output_bytes or process.returncode == -signal.SIGXFSZ
-            stdout = stdout_raw[: self.max_output_bytes].decode("utf-8", errors="replace")
+            stdout = redact_sensitive(stdout_raw[: self.max_output_bytes].decode("utf-8", errors="replace"))
             stderr = ""
             if timed_out:
                 outcome, reason = "timeout", "checker-timeout"
             elif truncated:
                 outcome, reason = "infrastructure-error", "output-limit-exceeded"
+            elif process.returncode != 0 and stdout.lstrip().lower().startswith("bwrap:"):
+                parsed = _result(
+                    checker_id,
+                    outcome="blocked",
+                    validity="environment-mismatch",
+                    reason="sandbox-start-failed",
+                    checker_version=str(getattr(checker, "version", "unknown")),
+                    sandbox_error=stdout[:500],
+                )
+                outcome, reason = "blocked", "sandbox-start-failed"
             elif callable(getattr(checker, "parse", None)):
                 try:
                     parser_options = {
@@ -582,7 +641,7 @@ class BubblewrapCheckerRunner:
                 "workspace_mode": "temporary-writable-copy",
                 "executed": True,
             }
-            if not timed_out and not truncated and callable(getattr(checker, "parse", None)):
+            if not timed_out and not truncated and 'parsed' in locals():
                 parsed.update(runner_fields)
                 return parsed
             return _result(

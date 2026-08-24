@@ -17,7 +17,7 @@ function setStatusBusy(busy) {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await window.skillAuth.fetch(path, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });

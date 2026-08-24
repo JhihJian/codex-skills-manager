@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import base64
 import json
+import math
 import os
 import re
 import secrets
@@ -338,6 +340,19 @@ class AuthService:
             with self._lock:
                 self._sessions.pop(cookie_value, None)
 
+    def session_csrf_token(self, cookie_value: str | None) -> str:
+        """Return the CSRF token for an authenticated same-origin session."""
+        if not isinstance(cookie_value, str) or not cookie_value:
+            raise AuthenticationError("session cookie is required")
+        now = self._clock()
+        with self._lock:
+            session = self._sessions.get(cookie_value)
+            if session is None or session.expires_at <= now:
+                if session is not None:
+                    self._sessions.pop(cookie_value, None)
+                raise AuthenticationError("session is invalid or expired")
+            return session.csrf_token
+
     def revoke_all_sessions(self) -> None:
         with self._lock:
             self._sessions.clear()
@@ -466,6 +481,27 @@ _KNOWN_TOKEN_RE = re.compile(
     r")(?![A-Za-z0-9_])"
 )
 _OPAQUE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-])")
+_STANDARD_BASE64_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_+\-/=])[A-Za-z0-9+/]{24,}={0,2}(?![A-Za-z0-9_+\-/=])"
+)
+
+
+def _redact_base64_candidate(match: re.Match[str]) -> str:
+    token = match.group(0)
+    if token.startswith("/") and token.count("/") >= 2:
+        return token
+    try:
+        decoded = base64.b64decode(token + "=" * (-len(token) % 4), validate=True)
+    except Exception:
+        return token
+    if len(decoded) < 18:
+        return token
+    frequencies = {byte: decoded.count(byte) for byte in set(decoded)}
+    entropy = -sum(
+        (count / len(decoded)) * math.log2(count / len(decoded))
+        for count in frequencies.values()
+    )
+    return REDACTED if entropy >= 4.0 else token
 
 
 def redact_sensitive(value: object) -> str:
@@ -486,6 +522,7 @@ def redact_sensitive(value: object) -> str:
         redacted = _URL_PASSWORD_RE.sub(lambda match: match.group(1) + REDACTED + match.group(3), redacted)
         redacted = _KNOWN_TOKEN_RE.sub(REDACTED, redacted)
 
+        redacted = _STANDARD_BASE64_TOKEN_RE.sub(_redact_base64_candidate, redacted)
         return _OPAQUE_TOKEN_RE.sub(REDACTED, redacted)
     except Exception:
         return REDACTION_FAILED

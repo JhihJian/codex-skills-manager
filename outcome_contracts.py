@@ -91,14 +91,60 @@ def _validate_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             )
         elif not ({"checker", "evidence"} & set(requirement)):
             raise OutcomeContractError(f"requirements.{requirement['id']} must define checker or evidence")
+        _validate_checker_atoms(requirement, f"requirements.{requirement['id']}")
     for artifact in result.get("artifacts") or []:
         if not isinstance(artifact.get("selector", {}), Mapping):
             raise OutcomeContractError(f"artifacts.{artifact['id']}.selector must be an object")
         minimum = _contract_count(artifact.get("minCount", 1), f"artifacts.{artifact['id']}.minCount")
+        if minimum < 1:
+            raise OutcomeContractError(f"artifacts.{artifact['id']}.minCount must be at least 1")
         maximum = artifact.get("maxCount")
         if maximum is not None and _contract_count(maximum, f"artifacts.{artifact['id']}.maxCount") < minimum:
             raise OutcomeContractError(f"artifacts.{artifact['id']}.maxCount must be at least minCount")
+    semantic = result.get("semanticReview")
+    if semantic is not None:
+        if not isinstance(semantic, Mapping):
+            raise OutcomeContractError("semanticReview must be an object")
+        if "required" in semantic and not isinstance(semantic["required"], bool):
+            raise OutcomeContractError("semanticReview.required must be a boolean")
+        dimensions = semantic.get("dimensions")
+        if dimensions is not None:
+            if not isinstance(dimensions, list) or not dimensions:
+                raise OutcomeContractError("semanticReview.dimensions must be a non-empty list")
+            for index, dimension in enumerate(dimensions):
+                if not isinstance(dimension, Mapping):
+                    raise OutcomeContractError(f"semanticReview.dimensions[{index}] must be an object")
+                _require_text(dimension.get("id"), f"semanticReview.dimensions[{index}].id")
+                _require_text(dimension.get("description"), f"semanticReview.dimensions[{index}].description")
     return result
+
+
+def _validate_checker_atoms(expression: Mapping[str, Any], field: str) -> None:
+    for operator in ("allOf", "anyOf"):
+        if operator in expression:
+            for index, choice in enumerate(expression.get(operator) or []):
+                _validate_checker_atoms(choice, f"{field}.{operator}[{index}]")
+            return
+    if "minCount" in expression:
+        raw = expression["minCount"]
+        choices = (
+            raw.get("of", raw.get("conditions", []))
+            if isinstance(raw, Mapping)
+            else expression.get("of", expression.get("conditions", []))
+        )
+        for index, choice in enumerate(choices or []):
+            _validate_checker_atoms(choice, f"{field}.minCount[{index}]")
+        return
+    if "checker" not in expression:
+        return
+    for required in ("checkerVersion", "parserVersion", "trustLevel", "approvalVersion"):
+        if required not in expression:
+            raise OutcomeContractError(f"{field}.{required} is required for checker evidence")
+    _require_text(expression["checker"], f"{field}.checker")
+    _require_text(expression["checkerVersion"], f"{field}.checkerVersion")
+    _require_text(expression["approvalVersion"], f"{field}.approvalVersion")
+    if expression["trustLevel"] not in {"trusted", "sandboxed"}:
+        raise OutcomeContractError(f"{field}.trustLevel must be trusted or sandboxed")
 
 
 def _contract_count(value: Any, field: str) -> int:
@@ -629,6 +675,8 @@ def evaluate_applicability(
 
 
 def _artifact_matches(selector: Mapping[str, Any], artifact: Mapping[str, Any]) -> bool:
+    if artifact.get("validity", "valid") != "valid" or artifact.get("freshness") == "stale":
+        return False
     for key, expected in selector.items():
         actual = artifact.get(key)
         if key == "glob":
@@ -653,7 +701,7 @@ def _clause_result(clause: Mapping[str, Any], evidence: Sequence[Mapping[str, An
     else:
         matches = list(evidence)
         for key, expected in clause.items():
-            if key in {"id", "assertions", "checkerVersion", "parserVersion", "trustLevel"}:
+            if key in {"id", "assertions", "checkerVersion", "parserVersion", "trustLevel", "approvalVersion"}:
                 continue
             if key == "evidence":
                 matches = [
@@ -670,13 +718,20 @@ def _clause_result(clause: Mapping[str, Any], evidence: Sequence[Mapping[str, An
             lifecycle = item.get("lifecycle")
             validity = item.get("validity")
             status = item.get("status")
+            freshness = item.get("freshness")
             if lifecycle not in {None, "finished"}:
                 continue
             if validity not in {None, "valid"}:
                 continue
             if status in {"candidate", "rejected", "invalid", "revoked"}:
                 continue
-            return "pass", ids, None
+            if freshness == "stale":
+                continue
+            # Positive evidence capability is assigned by a trusted adapter.
+            # Text claims and caller-constructed generic records have no
+            # positive weight even when their fields happen to match.
+            if item.get("positive_capability") is True and item.get("trust_level") in {"trusted", "sandboxed"}:
+                return "pass", ids, None
         return "inconclusive", ids, "evidence-invalid"
     saw_valid_pass = False
     reason = "evidence-invalid"
@@ -686,12 +741,22 @@ def _clause_result(clause: Mapping[str, Any], evidence: Sequence[Mapping[str, An
         lifecycle = item.get("lifecycle")
         checker_version = item.get("checker_version", item.get("checkerVersion"))
         parser_version = item.get("parser_version", item.get("parserVersion"))
+        approval_version = item.get("approval_version", item.get("approvalVersion"))
         trust_level = item.get("trust_level", item.get("trustLevel"))
+        if item.get("freshness") != "current":
+            reason = "evidence-stale" if item.get("freshness") == "stale" else "evidence-freshness-unknown"
+            continue
+        if trust_level not in {"trusted", "sandboxed"}:
+            reason = "checker-trust-insufficient"
+            continue
         if "checkerVersion" in clause and not _version_satisfies(checker_version, clause["checkerVersion"]):
             reason = "checker-version-mismatch"
             continue
         if "parserVersion" in clause and str(parser_version) != str(clause["parserVersion"]):
             reason = "parser-version-mismatch"
+            continue
+        if not clause.get("approvalVersion") or str(approval_version or "") != str(clause["approvalVersion"]):
+            reason = "checker-approval-mismatch"
             continue
         if "trustLevel" in clause:
             trust_order = {"untrusted": 0, "sandboxed": 1, "trusted": 2}
@@ -778,7 +843,9 @@ class OutcomeContractInterpreter:
                     }
                 )
                 continue
-            complete = bool(requirement.get("observationComplete", True))
+            # Historical scans cannot prove absence unless their adapter
+            # explicitly declares a complete observation boundary.
+            complete = requirement.get("observationComplete") is True
             valid_count = len(matches) >= minimum and (maximum is None or len(matches) <= maximum)
             status = "pass" if valid_count else ("fail" if complete else "inconclusive")
             artifact_results.append(

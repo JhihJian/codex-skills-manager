@@ -1,6 +1,7 @@
 __pycache__/
 .pytest_cache/
 *.py[cod]
+data/
 data/audit-log.jsonl
 data/usage-stats.json
 data/chinese-skill-views.sqlite3

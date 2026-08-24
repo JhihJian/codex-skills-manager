@@ -48,7 +48,7 @@ function clearGithubSourcesCache() {
 }
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await window.skillAuth.fetch(path, {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
@@ -446,7 +446,7 @@ function usageStatusTone(status) {
 
 function formatRelativeUsage(item) {
   if (!item || item.status === "unknown") return "尚未统计";
-  if (item.daysSinceLastUsed === null || item.daysSinceLastUsed === undefined) return item.lastUsedAt || "无真实使用证据";
+  if (item.daysSinceLastUsed === null || item.daysSinceLastUsed === undefined) return item.lastUsedAt || "无技能加载证据";
   if (item.daysSinceLastUsed === 0) return "今天";
   return `${item.daysSinceLastUsed} 天前`;
 }
@@ -1265,7 +1265,7 @@ function renderUsagePayload(skill, payload) {
     : "使用统计尚未生成";
   $("usageRecordMetrics").replaceChildren(
     ...[
-      ["真实使用", `${entry.confirmedEvidenceCount || 0} 次`],
+      ["检测到加载", `${entry.confirmedEvidenceCount || 0} 次`],
       ["涉及会话", `${entry.confirmedSessionCount || 0} 个`],
       ["使用天数", `${entry.confirmedDayCount || 0} 天`],
       ["最近使用", formatRelativeUsage(entry)],
@@ -1572,7 +1572,7 @@ function renderStats() {
   $("tokenMetric").title = `当前 ${tokenUsage.enabledSkillCount || 0} 个已启用 skills 的索引，共 ${tokenUsage.totalTokens || 0} 预注入 token；全部按需加载约 ${tokenUsage.totalLazyTokens || 0} token；${tokenUsageMethodLabel(tokenUsage)}`;
   $("usageFilter").value = state.usageFilter;
   $("usageFilter").disabled = !usageStatsEnabled();
-  $("usageFilter").title = usageStatsEnabled() ? "按最近真实使用证据筛选技能" : "使用统计已关闭，可在设置页开启";
+  $("usageFilter").title = usageStatsEnabled() ? "按最近技能加载证据筛选技能" : "使用统计已关闭，可在设置页开启";
   $("sortSelect").value = state.sort;
   $("sortSelect").querySelectorAll("option").forEach((option) => {
     option.disabled = !usageStatsEnabled() && ["recent", "count"].includes(option.value);
@@ -1752,7 +1752,7 @@ async function refreshUsageStats() {
     syncSelectionWithVisible();
     render();
     const stats = payload.stats || {};
-    setStatus(`使用统计已刷新：有真实使用证据 ${(stats.active || 0) + (stats.stale || 0)} 个，需关注 ${stats.issues || 0} 个`);
+    setStatus(`加载统计已刷新：检测到加载 ${(stats.active || 0) + (stats.stale || 0)} 个，需关注 ${stats.issues || 0} 个`);
   } finally {
     setStatusBusy(false);
     $("usageRefreshButton").disabled = state.data?.usageStats?.enabled === false;

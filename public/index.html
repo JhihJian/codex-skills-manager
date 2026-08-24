@@ -328,13 +328,13 @@
             <div class="tab-panel" id="tabUsage" hidden>
               <div class="usage-record-head">
                 <div>
-                  <strong>真实使用记录</strong>
+                  <strong>技能加载记录</strong>
                   <span id="usageRecordMeta">尚未读取</span>
                 </div>
               </div>
               <dl class="usage-record-metrics" id="usageRecordMetrics"></dl>
               <div class="usage-record-list" id="usageRecordList"></div>
-              <div class="empty-state" id="emptyUsageRecords" hidden>没有发现真实使用记录</div>
+              <div class="empty-state" id="emptyUsageRecords" hidden>没有检测到技能加载记录</div>
             </div>
 
             <div class="tab-panel" id="tabHistory" hidden>
@@ -395,6 +395,7 @@
     </div>
 
     <datalist id="categoryList"></datalist>
+    <script src="/auth.js"></script>
     <script src="/app.js" type="module"></script>
   </body>
 </html>

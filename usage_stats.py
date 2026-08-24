@@ -413,7 +413,7 @@ class UsageStatsService:
                 "piSessions": str(self.pi_sessions_dir),
                 "sources": source_scan,
             },
-            "evidencePolicy": "合并 Codex 与 Pi 会话，把 SKILL.md 读取工具调用和 Pi /skill 命令加载计为真实使用证据；助手明确使用声明仅作为辅助证据。已排除系统技能列表、用户普通提及和上下文关键词命中。",
+            "evidencePolicy": "合并 Codex 与 Pi 会话，把 SKILL.md 读取工具调用和 Pi /skill 命令计为技能加载证据；助手明确使用声明仅作为辅助证据。已排除系统技能列表、用户普通提及和上下文关键词命中。加载证据不表示任务成功或技能产生价值。",
         }
 
     def refresh(self, *, reason: str = "manual", body: dict[str, Any] | None = None) -> dict[str, Any]:

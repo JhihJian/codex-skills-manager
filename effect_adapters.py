@@ -6,21 +6,15 @@ import re
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 
+from auth import REDACTION_FAILED, redact_sensitive
+
 
 ADAPTER_VERSION = "effect-adapters-v1"
 DEFAULT_TEXT_LIMIT = 4096
 _SENSITIVE_KEY = re.compile(
     r"(?i)(?:authorization|cookie|password|passwd|secret|token|api[-_]?key|private[-_]?key|access[-_]?key)"
 )
-_SENSITIVE_TEXT = (
-    re.compile(
-        r"(?i)\b(password|passwd|secret|token|api[-_]?key|access[-_]?key)(\s*[:=]\s*)[^\s,;]+"
-    ),
-    re.compile(r"(?i)\b(Bearer\s+)[A-Za-z0-9._~+/=-]+"),
-    re.compile(r"\b(sk-(?:proj-)?)[A-Za-z0-9_-]{12,}"),
-    re.compile(r"\b(gh[opusr]_|github_pat_)[A-Za-z0-9_]{12,}"),
-    re.compile(r"(?i)(https?://[^:/\s]+:)[^@/\s]+@"),
-)
+
 _SKILL_BLOCK = re.compile(
     r'<skill\s+name="(?P<name>[^"]+)"\s+location="(?P<location>[^"]+)"[^>]*>',
     re.IGNORECASE,
@@ -134,10 +128,10 @@ def _json_value(line: str | bytes | Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _redact_text(value: str, limit: int = DEFAULT_TEXT_LIMIT) -> str:
-    text = value
-    text = _SENSITIVE_TEXT[0].sub(r"\1\2[REDACTED]", text)
-    for pattern in _SENSITIVE_TEXT[1:]:
-        text = pattern.sub(r"\1[REDACTED]", text)
+    try:
+        text = redact_sensitive(value)
+    except Exception:
+        text = REDACTION_FAILED
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 15)] + "...[truncated]"
@@ -194,7 +188,9 @@ def event_fingerprint(
             timestamp,
             parent_id,
             call_id,
-            _hash(redact_value(payload)),
+            # Hash the pre-redaction value. Only this digest is retained, so
+            # distinct secrets keep distinct identities without being stored.
+            _hash(payload),
         ]
     return hashlib.sha256(_canonical(identity).encode("utf-8")).hexdigest()
 
@@ -289,7 +285,7 @@ def _event(
         timestamp=timestamp,
         parent_id=parent_id,
         call_id=call_id,
-        payload=normalized_payload,
+        payload=fingerprint_payload,
     )
     return NormalizedEvent(
         source=source,
@@ -669,10 +665,9 @@ def build_task_episodes(events: Iterable[NormalizedEvent]) -> list[TaskEpisode]:
     episodes: list[TaskEpisode] = []
     current: list[NormalizedEvent] = []
     current_user = ""
-    previous_episode_id = ""
 
     def close() -> None:
-        nonlocal current, current_user, previous_episode_id
+        nonlocal current, current_user
         if not current:
             return
         first, last = current[0], current[-1]
@@ -700,11 +695,11 @@ def build_task_episodes(events: Iterable[NormalizedEvent]) -> list[TaskEpisode]:
                 user_text=current_user,
                 started_at=first.timestamp,
                 ended_at=last.timestamp,
-                continuation_of=previous_episode_id,
+                # Time adjacency is not a structural continuation edge.
+                continuation_of="",
                 outcome=outcome,
             )
         )
-        previous_episode_id = episode_id
         current = []
         current_user = ""
 
@@ -732,10 +727,14 @@ _TOOL_FAMILIES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("subagent", re.compile(r"(?i)subagent|spawn_agent|send_input")),
 )
 _DOCUMENT_EXTENSIONS = {".md", ".mdx", ".doc", ".docx", ".pdf", ".rst", ".txt"}
-_DEPLOY_PATTERN = re.compile(r"(?i)\b(deploy|deployment|docker|kubectl|helm|systemctl|vercel|netlify|cloudflare)\b")
+_DEPLOY_PATTERN = re.compile(r"(?i)\b(deploy|deployment|docker|kubectl|helm|systemctl|vercel|netlify|cloudflare)\b|部署")
 _GRADLE_PATTERN = re.compile(r"(?i)(?:\./|\.\\)?gradlew?\b|\bgradle\b")
-_TEST_PATTERN = re.compile(r"(?i)\b(test|pytest|unittest|jest|vitest|gradle\w*test)\b")
+_TEST_PATTERN = re.compile(r"(?i)\b(tests?|pytest|unittest|jest|vitest|gradle\w*test)\b|测试")
 _PATH_EXTENSION = re.compile(r"(?i)(\.[a-z0-9]{1,8})(?:\b|$)")
+_NEGATION_GAP = r"[^,，。;；!！?？:：\n]{0,24}"
+_NEGATED_TEST = re.compile(rf"(?i)(?:do\s+not|don't|dont|no|不要|无需|别)\s*{_NEGATION_GAP}(?:test|测试)")
+_NEGATED_DEPLOY = re.compile(rf"(?i)(?:do\s+not|don't|dont|no|不要|无需|别)\s*{_NEGATION_GAP}(?:deploy|部署)")
+_NEGATED_GRADLE = re.compile(rf"(?i)(?:do\s+not|don't|dont|no|不要|无需|别)\s*{_NEGATION_GAP}(?:gradle|gradlew)")
 
 
 def _searchable(event: NormalizedEvent) -> str:
@@ -753,6 +752,10 @@ def extract_task_facts(events: Iterable[NormalizedEvent]) -> list[TaskFact]:
 
     for event in events:
         searchable = _searchable(event)
+        user_text = event.text if event.event_type == "user_message" else ""
+        negated_test = bool(user_text and _NEGATED_TEST.search(user_text))
+        negated_deploy = bool(user_text and _NEGATED_DEPLOY.search(user_text))
+        negated_gradle = bool(user_text and _NEGATED_GRADLE.search(user_text))
         if event.event_type == "tool_call":
             normalized_name = event.tool_name.lower()
             family = "other"
@@ -761,13 +764,13 @@ def extract_task_facts(events: Iterable[NormalizedEvent]) -> list[TaskFact]:
                     family = candidate
                     break
             add("tool-family", family, event)
-        if event.event_type not in {"user_message", "tool_call", "skill"}:
+        if event.event_type not in {"user_message", "tool_call"}:
             continue
-        if _GRADLE_PATTERN.search(searchable):
+        if _GRADLE_PATTERN.search(searchable) and not negated_gradle:
             add("task-tag", "gradle", event)
-        if _DEPLOY_PATTERN.search(searchable):
+        if _DEPLOY_PATTERN.search(searchable) and not negated_deploy:
             add("task-tag", "deploy", event)
-        if _TEST_PATTERN.search(searchable):
+        if _TEST_PATTERN.search(searchable) and not negated_test:
             add("task-tag", "test", event)
         extensions = {match.group(1).lower() for match in _PATH_EXTENSION.finditer(searchable)}
         if extensions & _DOCUMENT_EXTENSIONS:

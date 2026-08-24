@@ -13,10 +13,10 @@
 - 顶部“中文信息”按钮会为英文或中英混合的 skill 生成中文名称和中文触发条件，并保存到 registry 的本地化元数据；左侧可以在“中文/原文”视图间切换，详情页“中文”页签支持查看、生成和手动修正。该功能不修改原始 `SKILL.md`。
 - 安装或同步后会为 `SKILL.md` 自动生成完整中文阅读视图；详情页“中文原文”页签可查看或重新生成。译文只保存在管理器本地缓存，绝不会写入 skills 仓库、`.codex/skills` 或 Codex 实际加载的 skill。
 - 管理台可以展示技能使用频率。该功能已模块化为独立统计服务，可在“设置”页单独开启或关闭；开启后服务运行期间每天定时扫描一次本机 Codex 与 Pi 会话，结果缓存到 `data/usage-stats.json`。顶部“使用统计”按钮可手动刷新。
-- 技能列表会直接展示真实使用次数；详情页“使用记录”页签按需读取最近证据，显示 Codex/Pi 来源、会话标题、发生时间、日志位置和调用片段。
+- 技能列表会展示检测到加载的次数；详情页“使用记录”页签按需读取最近加载证据，显示 Codex/Pi 来源、会话标题、发生时间、日志位置和调用片段。
 - 管理台会自动计算当前已启用 skills 的惰性加载 token：顶部“预注入 token”只统计启动时注入的技能索引，详情页“来源”中同时显示索引 token 和触发后按需加载的完整 `SKILL.md` token。统计优先使用本机 `tiktoken` 的 `o200k_base`/`cl100k_base` 编码；未安装时使用中英文 Unicode 估算。
 - 用户点击“检索上下文”后读取本机 Codex 与 Pi 会话 JSONL，快速查看某个 skill 在会话中的上下文片段，用于判断技能是否有效；切换到上下文页不会自动扫描会话。检索结果会标明来源，优先展示按来源、事件和正文去重后的用户/助手正文，并过滤工具调用、函数调用输出、DOM 快照、浏览器自动化日志和长 JSON 工具输出等低价值片段。
-- 顶部“技能审查”入口会打开独立问题审查页，用于扩展多个 skills 常见问题审查项；当前支持按需扫描本机 Codex 与 Pi 会话 JSONL，识别长期未真实触发使用的技能。审查不会把系统注入的技能列表、用户普通提及或上下文关键词命中当作使用；助手执行的 `SKILL.md` 读取工具调用和 Pi `/skill:name` 命令加载计为真实使用证据，助手明确使用某技能的声明仅作为辅助证据。
+- 顶部“技能审查”入口会打开结果评审工作台。工作台增量索引 Codex 与 Pi 会话，分别展示技能加载、任务结果和人工裁决；`SKILL.md` 读取结果与 Pi `/skill:name` 展开形成加载证据，加载事实不解释为任务成功或技能产生价值。
 - 详情页“版本”页签会从 Git 提交记录展示当前 skill 的历史版本、提交时间、作者、提交说明和涉及文件的增删统计；如果仓库还没有提交记录，会在首次提交后开始展示。
 - 详情页“来源”页签可以按 GitHub 仓库聚合展示从哪些仓库安装了哪些 skills，并按需检查远端 `SKILL.md` 是否有更新；发现差异时可直接查看本地版本与 GitHub 当前版本的 diff。
 - 服务运行期间会监测独立 skills 仓库中的 `skills/` 和 `codex-skills-manager.sqlite3`。检测到受管技能变更后，如果 1 小时内没有继续变化，就自动执行一次限定路径的 Git 提交，提交信息会列出涉及的 skill 和文件数量；配置了 GitHub remote 时会尝试 push。
@@ -278,11 +278,25 @@ codex exec --ephemeral --output-schema <schema> --output-last-message <file>
 
 也可以单独调用 `GET /api/token-usage` 获取同一份统计结果。`scope = enabled-catalog` 表示 `totalTokens` 是预注入索引，`lazyLoadScope = enabled-skill-md` 表示 `totalLazyTokens` 是全部触发后的上限估算。`method` 为 `tiktoken:o200k_base` 或 `tiktoken:cl100k_base` 时是对应 tokenizer 的结果；`estimate:unicode` 表示本地估算值。不同模型使用的 tokenizer 可能不同，因此该数值用于评估技能加载成本，不等同于某一次请求最终的完整 prompt token 数。
 
+## 访问认证
+
+服务首次启动时在 `data/access-token` 生成 256-bit 随机访问密钥，并在 `data/operator.json` 创建稳定的单操作者身份。两个文件的权限均为 `0600`。浏览器使用访问密钥登录后获得仅存于服务内存的 `HttpOnly`、`SameSite=Strict` 会话 cookie；所有写接口同时校验 `X-CSRF-Token`。服务重启会清除已有浏览器会话，长期访问密钥不会写入浏览器存储。
+
+单操作者默认具备 `admin`、`contract-owner` 和 `reviewer` 角色。合同发布必须在合同正文中显式设置 `governance.singleOperatorApproved=true`。业务例外同时要求 reviewer 与 admin 角色，并在指标中单列排除。
+
+认证接口：
+
+- `GET /api/auth/status`：读取当前浏览器会话状态和 CSRF token。
+- `POST /api/auth/login`：用 `{"token":"..."}` 换取浏览器会话。
+- `POST /api/auth/logout`：注销当前会话，需要有效 CSRF token。
+
+启用 HTTPS 反向代理时设置 `CODEX_SKILL_SECURE_COOKIE=1`。`CODEX_SKILL_OPERATOR_NAME` 可以设置本机操作者显示名称。
+
 ## 使用频率统计
 
-主页面在启用后展示最近一次使用统计缓存。统计同时读取 Codex 与 Pi 会话，且口径与“技能审查”一致：助手执行的 `SKILL.md` 读取工具调用和 Pi `/skill:name` 命令加载计为真实使用证据，助手声明“使用某技能”只作为辅助证据。真实使用证据次数用于衡量触发频率，涉及会话和使用天数用于避免同一会话内重复读取造成误判；该证据与人工“已确认”状态无关。Pi fork/clone 复制出的同源工具调用会按父会话链和事件 ID 去重，独立会话中的同名事件不会合并；Codex 与 Pi 即使出现相同会话 ID 也会按不同来源分别统计。
+主页面在启用后展示最近一次加载统计缓存。统计同时读取 Codex 与 Pi 会话：助手执行的 `SKILL.md` 读取工具调用和 Pi `/skill:name` 命令形成技能加载证据，助手声明“使用某技能”只作为辅助证据。加载次数用于衡量触发频率，涉及会话和使用天数用于控制同一会话内的重复读取。该证据与人工“已确认”状态、任务结果和技能价值分别统计。Pi fork/clone 复制出的同源工具调用会按父会话链和事件 ID 去重，独立会话中的同名事件保持独立；Codex 与 Pi 出现相同会话 ID 时仍按来源区分。
 
-主页面左侧“使用”筛选会复用这份统计缓存，支持查看 3 天、7 天或 15 天未使用的技能；没有真实使用证据或仅有助手声明的技能会被视为未使用，统计关闭时该筛选不可用。左侧“排序”支持默认顺序、名称、分类、最近使用和使用次数，其中最近使用、使用次数依赖使用统计数据。
+主页面左侧“使用”筛选会复用这份统计缓存，支持查看 3 天、7 天或 15 天未检测到加载的技能；只有助手声明、没有结构化加载证据的技能归入未检测到加载。左侧“排序”支持默认顺序、名称、分类、最近加载和加载次数。
 
 设置页位于：
 
@@ -302,7 +316,7 @@ Pi 会话目录按以下顺序确定：`CODEX_SKILL_PI_SESSIONS_DIR`、`PI_CODIN
 - `PUT /api/settings`：保存使用统计配置；请求体支持 `usageStats`，字段包括 `enabled`、`dailyEnabled`、`dailyHour`、`dailyMinute`、`staleDays`、`maxFiles`、`scope`、`includeSystem`。
 - `GET /api/usage-stats`：读取当前使用统计缓存。
 - `POST /api/usage-stats/refresh`：立即刷新使用统计缓存；请求体可覆盖 `staleDays`、`maxFiles`、`scope`、`includeSystem`。
-- `GET /api/skills/<skill-name>/usage`：读取单个技能的使用汇总和最近真实使用证据。
+- `GET /api/skills/<skill-name>/usage`：读取单个技能的加载汇总和最近加载证据。
 - `GET /api/token-usage`：计算当前已启用 skills 的 `SKILL.md` token 占用。
 
 可用环境变量：
@@ -319,33 +333,50 @@ Pi 会话目录按以下顺序确定：`CODEX_SKILL_PI_SESSIONS_DIR`、`PI_CODIN
 - `PI_CODING_AGENT_DIR`：改写 Pi agent 根目录，默认 `~/.pi/agent`。
 - `PI_CODING_AGENT_SESSION_DIR`：改写 Pi 会话目录，优先级低于管理器专用变量。
 
-## 技能审查
+## 技能结果评审
 
-技能审查页位于：
+结果评审工作台位于 `http://127.0.0.1:8876/reviews.html`，包含加载检测、任务结果、人工队列、合同和指标五个视图。单案例详情按时间展示用户目标、技能加载、工具调用与结果、产物、确定性检查、assessment revision 和人工操作。
 
-```text
-http://127.0.0.1:8876/reviews.html
-```
+### 增量索引与结果模型
 
-该页面用于集中发现常见的 skills 管理问题，左侧是审查项列表，右侧是当前审查项的参数、进度、证据口径和结果。后续新增其它问题审查时，可以继续增加新的审查项，而不用挤在技能管理主页面顶部。
+`data/skill-effects.sqlite3` 保存规范事件、文件 generation、字节 checkpoint、provenance、Task Episode、Task Case、技能调用、归因、证据、检查、assessment 和人工追加记录。扫描器支持字节与时间预算；无变化文件从 checkpoint 继续，同尺寸替换、截断后增长、移动和删除会重建 generation 并使失去 provenance 的自动派生记录失效。人工裁决和审计记录继续保留。
 
-当前已支持的审查项是“长期未真实触发使用”：
+历史会话只有在日志中保存了精确且完整的 `SKILL.md` 内容时才绑定技能 SHA。Codex 完整读取结果和 Pi skill block 可提供该内容；带 offset/limit 或截断标记的 Codex 局部读取只记录加载成功，版本保持未知，当前工作区文件不会回填历史版本。加载失败、取消、阻止和结果缺失分别记录。技能审查、翻译、迁移和自测标记为维护调用并从业务归因排除；同一 Task Case 的后续技能默认记录为 shared。时间邻近、共享提交和纯文本相似只形成候选关系，不自动合并 Task Case。
 
-- 点击“开始审查”后才会读取 Codex 的 `sessions`、`archived_sessions` 和 Pi 的 `sessions` 目录。
-- 审查运行期间会显示不定进度条和当前扫描提示；后端完成一次只读扫描后再切换为结果汇总。
-- 默认审查已启用技能，阈值为 30 天；可以在面板中切换为项目库纳管或全部技能，并选择是否包含系统技能。
-- 真实使用证据来自两类结构化会话事件：Codex function call 或 Pi `toolCall` 读取 `.codex/skills/<skill>/SKILL.md`、`.pi/agent/skills/<skill>/SKILL.md`、`.agents/skills/<skill>/SKILL.md`、`<skills-repo>/skills/<skill>/SKILL.md` 或插件缓存中的 `skills/<skill>/SKILL.md`，以及 Pi `/skill:name` 展开形成的结构化 skill block。
-- 仅在用户消息、developer/system 注入内容、技能列表、普通关键词上下文或工具输出中出现 skill 名称，不会计为真实使用。
-- 审查结果分为“暂无真实使用证据”“仅有声明”“长期未用”和“近期使用”，并展示命中的会话文件、行号和证据片段。
+### 合同与结论
 
-可用接口：
+Outcome Contract 存入 skills 仓库的 `codex-skills-manager.sqlite3`，按技能 ID、精确 SHA 和评审模式选择。每个技能版本只有一个 active 合同；发布版本不可修改。工作台提供 Gradle 和文档合同模板，也支持编辑自定义草稿。
 
-- `POST /api/reviews/usage`：执行一次只读使用审查；请求体支持 `{"staleDays": 30, "scope": "enabled", "includeSystem": true}`。
+合同解释器只接受具有明确证明能力的受信证据。确定性 checker 必须完成生命周期，精确匹配合同声明的审批版本，并通过 trust、checker 和 parser 版本约束，且识别至少一个断言。有效断言失败可形成 hard failure；超时、环境错误、解析失败、陈旧证据和普通命令退出码保持 inconclusive。历史产物缺失默认表示观察不完整，不形成任务失败。
 
-可用环境变量：
+人工操作分为 claim、decision、disposition、correction 和 exception。领取操作防止多名 reviewer 并发裁决；decision 只允许用于 assessable assessment，证据不足和不可评审案例使用 disposition；其余操作绑定 actor、reason code 和 expected revision。普通人工 pass 不能覆盖有效 hard failure；证据错误通过 correction 触发重评，业务例外以 exception 记录并排除正常结果率。当前有效结论综合自动评审、最新人工裁决和未过期例外展示，新 assessment revision 默认不继承旧人工裁决。
 
-- `CODEX_SKILL_USAGE_STALE_DAYS=30`：默认长期未用阈值，单位天。
-- `CODEX_SKILL_USAGE_MAX_FILES=1000`：一次审查中每个来源最多扫描的会话 JSONL 文件数。
+### 前瞻采集与语义评审
+
+前瞻采集器记录 `before-invocation`、`after-artifacts` 和 `after-check` 三阶段 manifest，包含允许根内产物的 SHA-256、大小、受控文本摘录、Task Case revision、采集器版本和环境指纹，并投影为当前 revision 的 artifact；旧 revision manifest 不能重放。无漂移状态为 current；manifest 漂移只会把同一 observation group 的产物与检查标记为 stale，同时使当前 assessment 重新进入队列。主动检查必须绑定已存储的 `after-artifacts` manifest，精确匹配 Task Case revision、工作区根哈希、环境和 observation group。文档 checker 的审批配置固定为 manifest 内文件存在且可读，调用者不能提交内容断言参数；Gradle manifest 必须覆盖 runner 会读取的全部工作区文件。检查后由服务端自动采集 `after-check` 并决定 freshness；每次新增检查也会使旧 assessment 失效，必须重评。Gradle 在 bubblewrap 中使用系统安装和受信 init script采集 Test suite 数量，但由于项目构建脚本本身是任意代码，结果保守标记为 inconclusive，只供人工核验，不形成自动 pass 或 hard fail；任意命令、符号链接、路径逃逸和未授权调用被拒绝。
+
+语义评审输入由服务端从当前 Task Case、当前 assessment、精确版本合同、检查和当前 revision 产物构造，浏览器不能提交或删减证据。严格输出 schema 要求模型引用已提供的 Evidence ID；自动 pass 至少引用一个经数据库复核的 current assertion-pass，或内容哈希一致的受控产物文本摘录，用户目标和纯哈希元数据只能作为上下文。助手正向自述不进入正向证据，产物中的提示文本按不受信数据处理，hard failure 在调用模型前和保存 revision 前双重优先；模型运行期间 assessment 失效时拒绝保存。合同声明 `semanticReview.required=true` 时，确定性 pass 只进入语义队列。任何自动语义 pass/partial/fail 都需要精确匹配合同、任务类型、来源、模型、prompt 和 rubric 的 calibration profile。profile 的样本数、混淆计数、语料摘要和 Wilson 95% 下界由服务端从 semantic review 与当前人工裁决语料计算，客户端不能自报；门槛为至少 200 个已裁决案例、主要任务类型至少 30 个案例、自动 pass 精确率下界不低于 0.95，未达到时进入人工队列。
+
+### 指标快照
+
+实时指标预览明确标记为非正式。正式 `metric_snapshot` 的截止时间、最新 scan run、覆盖状态和版本元组由服务端确定，客户端不能声明正式口径；只有服务端配置的 Codex/Pi 全目录扫描可成为正式 scan，调用者自选 `sources` 的 ad-hoc 扫描不能封存指标。快照冻结扫描范围指纹，以及每个案例的 Task Case revision、assessment revision、manual decision revision、技能 SHA、合同、任务类型、参与关系、有效结论和排除原因。覆盖不完整、陈旧或未知 freshness、争议、例外、旧 assessment、缺合同和不满足校准门槛的案例不进入结果率分母。报告按固定统计键分组，提供 pass/partial/fail 计数和 95% 置信区间；明确样本少于 20 时展示计数和区间，稳定率显示为空。
+
+主要接口：
+
+- `POST /api/effect-scan`：按预算增量扫描 Codex 与 Pi 会话。
+- `GET /api/effect-overview`、`GET /api/skill-use-events`：读取覆盖、加载和评审汇总。
+- `GET /api/task-cases/<id>`、`POST /api/task-cases/<id>/review`：读取带 Evidence ID、内容哈希和 generation/行号 locator 的案例证据，并生成 assessment revision。
+- `POST /api/task-cases/<id>/semantic-review`：使用本机 Codex 执行结构化语义评审并追加 assessment revision。
+- `GET /api/review-tasks`、`POST /api/review-tasks/<id>/claim`、`PUT /api/review-tasks/<id>/decision`、`PUT /api/review-tasks/<id>/disposition`：领取并处理人工队列。
+- `POST /api/task-cases/<id>/corrections`、`POST /api/task-cases/<id>/exception`：追加纠正和业务例外。
+- `GET/POST /api/skills/<name>/outcome-contracts`、`PUT /api/outcome-contracts/<id>`、`POST /api/outcome-contracts/<id>/publish`：管理版本化合同。
+- `POST /api/prospective-events`、`POST /api/artifact-manifests`、`POST /api/artifact-manifests/compare`：记录前瞻事件和产物 manifest。
+- `POST /api/outcome-checks/run`：显式授权并绑定 `after-artifacts` manifest 后执行受控 checker，服务端自动完成检查后 manifest 和 freshness 比较。
+- `POST /api/calibration-profiles`：注册不可变语义校准 profile。
+- `GET /api/effect-metrics`、`POST /api/effect-metric-snapshots`：读取预览并创建正式快照。
+- `POST /api/effect-data/cleanup`：按时间、项目或技能清理前瞻事件、产物、检查、语义正文、工具输出和可识别路径；人工 reason code 与 revision 审计链保留，备注清空，并在 `secure_delete` 模式下生成哈希审计摘要、截断 WAL 和受控压缩 SQLite 主文件。
+
+`CODEX_SKILL_CHECK_ROOTS` 使用系统路径分隔符配置允许采集和主动检查的项目根目录。未配置时默认允许管理器父目录。主动检查依赖 Linux `bubblewrap`；运行环境不满足时返回 environment mismatch，不形成自动失败。
 
 ## 注意事项
 
@@ -353,19 +384,20 @@ http://127.0.0.1:8876/reviews.html
 
 ## 验收与回滚
 
-启动后先做只读健康检查：
+启动后使用本机访问密钥做只读健康检查：
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8876/api/health
+$Token = (Get-Content -Raw -Encoding UTF8 .\data\access-token).Trim()
+Invoke-RestMethod -Headers @{ Authorization = "Bearer $Token" } http://127.0.0.1:8876/api/health
 ```
 
-也可以运行 smoke 测试脚本。该脚本只读取首页、`/api/health`、`/api/settings` 和 `/api/state`，不会触发同步、分类、本地化、使用统计刷新或 Git 提交：
+也可以运行 smoke 测试脚本。脚本从 `data/access-token` 读取 Bearer 密钥，只读取首页、`/api/health`、`/api/settings` 和 `/api/state`，不会触发同步、分类、本地化、加载统计刷新或 Git 提交：
 
 ```powershell
 .\scripts\smoke-test.ps1 -HostName 127.0.0.1 -Port 8876
 ```
 
-启动脚本会在后台进程创建后轮询 `/api/health`。如果服务未能变为健康状态，会输出 `work/server.err.log` 的末尾内容并返回非零。常用日志位置：
+启动脚本会在后台进程创建后等待访问密钥文件并使用 Bearer 轮询 `/api/health`。如果服务未能变为健康状态，会输出 `work/server.err.log` 的末尾内容并返回非零。常用日志位置：
 
 - `work/server.log`：服务标准输出和访问日志。
 - `work/server.err.log`：Python 启动、端口绑定和运行异常。

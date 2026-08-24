@@ -202,6 +202,10 @@ class RedactionTests(unittest.TestCase):
     def test_redacts_unlabeled_high_entropy_token(self) -> None:
         secret = "AbCdEfGhIjKlMnOpQrStUvWxYz_0123456789"
         self.assertEqual(redact_sensitive(secret), REDACTED)
+        standard_base64 = "q7+/N2/aZ9+vL4/Tx1+Qm8/rK3+Wp6/Y"
+        self.assertEqual(redact_sensitive(standard_base64), REDACTED)
+        padded_base64 = "q7+/N2/aZ9+vL4/Tx1+Qm8/rK3+WpQ=="
+        self.assertEqual(redact_sensitive(padded_base64), REDACTED)
 
     def test_redaction_fails_closed_for_unsupported_or_unbounded_input(self) -> None:
         self.assertEqual(redact_sensitive(None), REDACTION_FAILED)
