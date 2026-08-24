@@ -33,6 +33,14 @@
         <path d="M12 2v10" />
         <path d="M18.4 6.6a9 9 0 1 1-12.8 0" />
       </symbol>
+      <symbol id="icon-check" viewBox="0 0 24 24">
+        <path d="m5 12 4.2 4.2L19 6.5" />
+      </symbol>
+      <symbol id="icon-more" viewBox="0 0 24 24">
+        <circle cx="5" cy="12" r="1" />
+        <circle cx="12" cy="12" r="1" />
+        <circle cx="19" cy="12" r="1" />
+      </symbol>
       <symbol id="icon-slash" viewBox="0 0 24 24">
         <circle cx="12" cy="12" r="9" />
         <path d="M5.7 5.7 18.3 18.3" />
@@ -84,16 +92,19 @@
             <button class="icon-button icon-button-labeled" id="installToggleButton" title="打开或收起安装面板" aria-label="打开或收起安装面板" aria-expanded="false"><svg><use href="#icon-plus"></use></svg><span>安装</span></button>
             <button class="icon-button icon-button-labeled" id="syncButton" title="同步 .codex/skills 并自动纳管新增技能" aria-label="同步技能"><svg><use href="#icon-refresh"></use></svg><span>同步</span></button>
           </div>
-          <div class="toolbar-group">
-            <button class="icon-button" id="classifyButton" title="使用本机 Codex 自动分类未分类技能" aria-label="自动分类技能"><svg><use href="#icon-sparkles"></use></svg></button>
-            <button class="icon-button" id="localizeButton" title="使用本机 Codex 生成中文名称和中文触发条件" aria-label="生成中文名称和触发条件"><svg><use href="#icon-languages"></use></svg></button>
-            <button class="icon-button" id="usageRefreshButton" title="刷新技能使用频率统计" aria-label="刷新技能使用频率统计"><svg><use href="#icon-chart"></use></svg></button>
-          </div>
-          <div class="toolbar-group">
-            <button class="icon-button icon-button-labeled" id="githubSourcesButton" title="查看已安装的 GitHub 来源" aria-label="查看已安装的 GitHub 来源"><svg><use href="#icon-git-branch"></use></svg><span>来源</span></button>
-            <a class="icon-button icon-button-labeled" id="reviewPageLink" href="/reviews.html" title="打开技能问题审查页" aria-label="打开技能问题审查页"><svg><use href="#icon-shield-alert"></use></svg><span>审查</span></a>
-            <a class="icon-button icon-button-labeled" id="settingsPageLink" href="/settings.html" title="打开设置页" aria-label="打开设置页"><svg><use href="#icon-settings"></use></svg><span>设置</span></a>
-            <button class="icon-button icon-button-labeled" id="auditButton" title="查看最近管理操作" aria-label="查看操作记录"><svg><use href="#icon-history"></use></svg><span>审计</span></button>
+          <button class="icon-button mobile-more-button" id="mobileMoreButton" title="打开更多工具" aria-label="打开更多工具" aria-expanded="false" aria-controls="toolbarOverflow"><svg><use href="#icon-more"></use></svg></button>
+          <div class="toolbar-overflow" id="toolbarOverflow">
+            <div class="toolbar-group">
+              <button class="icon-button" id="classifyButton" title="使用本机 Codex 自动分类未分类技能" aria-label="自动分类技能"><svg><use href="#icon-sparkles"></use></svg></button>
+              <button class="icon-button" id="localizeButton" title="使用本机 Codex 生成中文名称和中文触发条件" aria-label="生成中文名称和触发条件"><svg><use href="#icon-languages"></use></svg></button>
+              <button class="icon-button" id="usageRefreshButton" title="刷新技能使用频率统计" aria-label="刷新技能使用频率统计"><svg><use href="#icon-chart"></use></svg></button>
+            </div>
+            <div class="toolbar-group">
+              <button class="icon-button icon-button-labeled" id="githubSourcesButton" title="查看已安装的 GitHub 来源" aria-label="查看已安装的 GitHub 来源"><svg><use href="#icon-git-branch"></use></svg><span>来源</span></button>
+              <a class="icon-button icon-button-labeled" id="reviewPageLink" href="/reviews.html" title="打开技能问题审查页" aria-label="打开技能问题审查页"><svg><use href="#icon-shield-alert"></use></svg><span>审查</span></a>
+              <a class="icon-button icon-button-labeled" id="settingsPageLink" href="/settings.html" title="打开设置页" aria-label="打开设置页"><svg><use href="#icon-settings"></use></svg><span>设置</span></a>
+              <button class="icon-button icon-button-labeled" id="auditButton" title="查看最近管理操作" aria-label="查看操作记录"><svg><use href="#icon-history"></use></svg><span>审计</span></button>
+            </div>
           </div>
         </div>
       </header>
@@ -147,15 +158,21 @@
             <svg class="search-icon" aria-hidden="true"><use href="#icon-search"></use></svg>
             <input id="searchInput" placeholder="搜索技能、来源、说明" />
           </div>
-          <div class="segments" id="filterSegments">
-            <button data-filter="all" class="active">全部</button>
+          <div class="sidebar-filter-group">
+            <span class="filter-label">范围</span>
+            <div class="segments" id="filterSegments">
+            <button data-filter="all" class="active">所有</button>
             <button data-filter="enabled">启用</button>
             <button data-filter="managed">项目库</button>
             <button data-filter="system">系统</button>
+            </div>
           </div>
-          <div class="segments mode-segments" id="displayModeSegments">
-            <button data-mode="zh" class="active">中文</button>
-            <button data-mode="raw">原文</button>
+          <div class="sidebar-filter-group">
+            <span class="filter-label">显示</span>
+            <div class="segments mode-segments" id="displayModeSegments">
+              <button data-mode="zh" class="active">中文</button>
+              <button data-mode="raw">原文</button>
+            </div>
           </div>
           <div class="list-controls">
             <label>
@@ -178,6 +195,10 @@
               </select>
             </label>
           </div>
+          <label class="compact-category-filter">
+            <span>分类</span>
+            <select id="categorySelect"></select>
+          </label>
           <div class="category-list" id="categoryListView"></div>
           <div class="path-box">
             <div><span>Skills 仓库</span><a id="libraryPath" href="#" target="_blank" rel="noreferrer"></a></div>
@@ -186,15 +207,19 @@
         </aside>
 
         <section class="list-pane">
-          <div class="list-header">
-            <div class="metric"><strong id="totalCount">0</strong><span>Skills</span></div>
-            <div class="metric"><strong id="enabledCount">0</strong><span>启用</span></div>
-            <div class="metric"><strong id="managedCount">0</strong><span>纳管</span></div>
-            <div class="metric"><strong id="systemCount">0</strong><span>系统</span></div>
-            <div class="metric"><strong id="usedCount">0</strong><span>使用</span></div>
-            <div class="metric" id="tokenMetric" title="当前已启用 skills 的索引 token 估算"><strong id="enabledTokenCount">0</strong><span>预注入 token</span></div>
+          <div class="queue-header">
+            <div class="queue-tabs" id="queueSegments" role="group" aria-label="技能工作队列">
+              <button data-queue="pending" class="active"><strong id="pendingCount">0</strong><span>待确认</span></button>
+              <button data-queue="confirmed"><strong id="confirmedCount">0</strong><span>已确认</span></button>
+              <button data-queue="enabled"><strong id="enabledCount">0</strong><span>已启用</span></button>
+              <button data-queue="all"><strong id="totalCount">0</strong><span>全部</span></button>
+            </div>
+            <div class="queue-meta">
+              <span id="visibleCount">0 项</span>
+              <span id="tokenMetric" title="当前已启用 skills 的索引 token 估算"><strong id="enabledTokenCount">0</strong> token</span>
+            </div>
           </div>
-          <div class="table" id="skillTable" role="list"></div>
+          <ul class="table" id="skillTable"></ul>
           <div class="empty-state empty-list-state" id="emptyList" hidden>
             <span id="emptyListMessage">没有匹配的技能</span>
             <div class="empty-actions">
@@ -208,14 +233,19 @@
           <div class="empty" id="emptyDetail">选择一个技能</div>
           <div class="detail" id="detailView" hidden>
             <div class="detail-head">
+              <button class="mobile-back-button" id="mobileBackButton" type="button">返回技能列表</button>
               <div>
                 <h1 id="detailTitle"></h1>
                 <p id="detailDescription"></p>
                 <button class="link-button" id="descriptionToggle" type="button" aria-expanded="false">显示完整描述</button>
+                <div class="confirmation-meta" id="confirmationMeta"></div>
               </div>
               <div class="detail-actions">
-                <button class="icon-button" id="enableButton" title="复制到 .codex/skills 并启用" aria-label="启用当前技能"><svg><use href="#icon-power"></use></svg></button>
-                <button class="icon-button danger" id="disableButton" title="从 .codex/skills 停用" aria-label="停用当前技能"><svg><use href="#icon-slash"></use></svg></button>
+                <button class="primary-button confirmation-button" id="confirmButton"><svg><use href="#icon-check"></use></svg><span>标记已确认</span></button>
+                <div class="management-actions">
+                  <button class="icon-button" id="enableButton" title="复制到 .codex/skills 并启用" aria-label="启用当前技能"><svg><use href="#icon-power"></use></svg></button>
+                  <button class="icon-button danger" id="disableButton" title="从 .codex/skills 停用" aria-label="停用当前技能"><svg><use href="#icon-slash"></use></svg></button>
+                </div>
               </div>
             </div>
             <div class="badges" id="detailBadges"></div>
@@ -343,7 +373,7 @@
         </section>
       </main>
       <footer class="statusbar">
-        <span class="status-left">
+        <span class="status-left" role="status" aria-live="polite">
           <span class="status-spinner" id="statusSpinner" aria-hidden="true" hidden></span>
           <span id="statusText">准备就绪</span>
         </span>

@@ -21,6 +21,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -160,6 +161,15 @@ SKILL_VERSION_LOCK = threading.RLock()
 SKILL_VERSION_PENDING_SINCE: datetime | None = None
 SKILL_VERSION_LAST_SIGNATURE = ""
 SKILL_VERSION_COMMITTING = threading.Event()
+
+
+def registry_mutation(function: Any) -> Any:
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with REGISTRY_LOCK:
+            return function(*args, **kwargs)
+
+    return wrapped
 
 
 class ApiError(Exception):
@@ -597,6 +607,7 @@ def stable_json(value: Any) -> str:
     return json.dumps(value if value is not None else {}, ensure_ascii=False, sort_keys=True)
 
 
+@registry_mutation
 def merge_classification_registry(
     source_registry: dict[str, Any],
     names: list[str],
@@ -645,6 +656,7 @@ def merge_classification_registry(
     return latest, applied, skipped
 
 
+@registry_mutation
 def merge_localization_registry(
     source_registry: dict[str, Any],
     names: list[str],
@@ -1114,6 +1126,74 @@ def read_registry_state() -> dict[str, Any]:
     return sync_registry(adopt_extra=False, save=False)
 
 
+def skill_confirmation_source(name: str, entry: dict[str, Any]) -> dict[str, Any]:
+    candidates: list[Path] = []
+    if entry.get("skillMdPath"):
+        candidates.append(Path(str(entry["skillMdPath"])))
+    for key in ("libraryPath", "codexPath"):
+        if entry.get(key):
+            candidates.append(Path(str(entry[key])) / "SKILL.md")
+
+    for candidate in candidates:
+        skill_md = candidate if candidate.name.lower() == "skill.md" else candidate / "SKILL.md"
+        resolved = skill_md.resolve()
+        if not (is_relative_to(resolved, LIBRARY_DIR) or is_relative_to(resolved, CODEX_SKILLS_DIR)):
+            continue
+        if not resolved.exists() or not resolved.is_file():
+            continue
+        try:
+            payload = resolved.read_bytes()
+        except OSError as exc:
+            raise ApiError(f"读取 SKILL.md 失败：{exc}", HTTPStatus.INTERNAL_SERVER_ERROR) from exc
+        return {"path": str(resolved), "sourceSha256": hashlib.sha256(payload).hexdigest()}
+    raise ApiError("未找到该技能的 SKILL.md。", HTTPStatus.NOT_FOUND)
+
+
+def skill_confirmation_view(name: str, entry: dict[str, Any]) -> dict[str, Any]:
+    if entry.get("system"):
+        return {"status": "not-applicable", "confirmed": False}
+    if entry.get("status") == "missing":
+        return {"status": "unavailable", "confirmed": False}
+
+    stored = entry.get("confirmation") if isinstance(entry.get("confirmation"), dict) else {}
+    try:
+        source = skill_confirmation_source(name, entry)
+    except ApiError as exc:
+        return {"status": "unavailable", "confirmed": False, "error": exc.message}
+
+    confirmed_at = str(stored.get("confirmedAt") or "").strip()
+    confirmed_sha = str(stored.get("sourceSha256") or "").strip()
+    if not confirmed_at or not confirmed_sha:
+        return {
+            "status": "unconfirmed",
+            "confirmed": False,
+            "currentSourceSha256": source["sourceSha256"],
+        }
+    if confirmed_sha != source["sourceSha256"]:
+        return {
+            "status": "needs-review",
+            "confirmed": False,
+            "confirmedAt": confirmed_at,
+            "sourceSha256": confirmed_sha,
+            "currentSourceSha256": source["sourceSha256"],
+        }
+    return {
+        "status": "confirmed",
+        "confirmed": True,
+        "confirmedAt": confirmed_at,
+        "sourceSha256": confirmed_sha,
+        "currentSourceSha256": source["sourceSha256"],
+    }
+
+
+def is_pending_confirmation(skill: dict[str, Any]) -> bool:
+    return bool(
+        skill.get("enabled")
+        and not skill.get("system")
+        and skill.get("confirmation", {}).get("status") in {"unconfirmed", "needs-review"}
+    )
+
+
 def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
     skills = [dict(item) for item in registry.get("skills", {}).values()]
     skills.sort(key=lambda item: (not item.get("enabled", False), item.get("category", ""), item.get("name", "")))
@@ -1133,6 +1213,7 @@ def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
         skill["lifecycle"] = lifecycle
         skill["tokenUsage"] = token_usage_by_name.get(skill.get("name"), {})
         skill["chineseView"] = chinese_skill_view_status(str(skill.get("name") or ""), skill)
+        skill["confirmation"] = skill_confirmation_view(str(skill.get("name") or ""), skill)
     localized_count = len(
         [
             s
@@ -1142,6 +1223,9 @@ def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
             and str(s["localized"].get("zhTrigger") or "").strip()
         ]
     )
+    confirmed_count = len([s for s in skills if s.get("confirmation", {}).get("status") == "confirmed"])
+    pending_confirmation_count = len([s for s in skills if is_pending_confirmation(s)])
+    needs_review_count = len([s for s in skills if s.get("confirmation", {}).get("status") == "needs-review"])
     return {
         "version": registry.get("version", 1),
         "updatedAt": registry.get("updatedAt"),
@@ -1168,6 +1252,9 @@ def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
             "unclassified": len([s for s in skills if (s.get("category") or "未分类") == "未分类"]),
             "localized": localized_count,
             "unlocalized": len(skills) - localized_count,
+            "confirmed": confirmed_count,
+            "pendingConfirmation": pending_confirmation_count,
+            "needsReview": needs_review_count,
             "enabledSkillTokens": token_usage["totalTokens"],
             "enabledSkillIndexTokens": token_usage["totalTokens"],
             "enabledSkillLazyTokens": token_usage["totalLazyTokens"],
@@ -2786,8 +2873,10 @@ def run_installer(body: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
     return installed, details
 
 
-def install_skill(body: dict[str, Any]) -> dict[str, Any]:
-    installed, details = run_installer(body)
+@registry_mutation
+def register_installed_skills(
+    installed: list[str], details: dict[str, Any], body: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any], str]:
     registry = sync_registry()
     source_payload = {
         "type": details["mode"],
@@ -2815,6 +2904,12 @@ def install_skill(body: dict[str, Any]) -> dict[str, Any]:
         if notes:
             entry["notes"] = notes
     save_registry(registry)
+    return registry, source_payload, category
+
+
+def install_skill(body: dict[str, Any]) -> dict[str, Any]:
+    installed, details = run_installer(body)
+    registry, source_payload, category = register_installed_skills(installed, details, body)
     append_audit("install-skill", {"skills": installed, "source": source_payload})
     classification = {"classified": [], "skipped": [], "errors": []}
     if not category:
@@ -2827,10 +2922,11 @@ def install_skill(body: dict[str, Any]) -> dict[str, Any]:
         "classification": classification,
         "localization": localization,
         "chineseView": chinese_view,
-        "state": registry_view(registry),
+        "state": registry_view(read_registry_state()),
     }
 
 
+@registry_mutation
 def enable_skill(name: str) -> dict[str, Any]:
     name = safe_skill_name(name)
     registry = sync_registry()
@@ -2855,6 +2951,7 @@ def enable_skill(name: str) -> dict[str, Any]:
     return {"message": "已启用。重启 Codex 后新技能会被会话加载。", "state": registry_view(registry)}
 
 
+@registry_mutation
 def disable_skill(name: str) -> dict[str, Any]:
     name = safe_skill_name(name)
     registry = sync_registry()
@@ -2878,6 +2975,89 @@ def disable_skill(name: str) -> dict[str, Any]:
     return {"message": "已停用。项目技能库中的副本仍然保留。", "state": registry_view(registry)}
 
 
+@registry_mutation
+def confirm_skill(name: str) -> dict[str, Any]:
+    name = safe_skill_name(name)
+    registry = sync_registry(save=False)
+    entry = registry["skills"].get(name)
+    if not entry:
+        raise ApiError("未找到该技能。", HTTPStatus.NOT_FOUND)
+    if entry.get("system"):
+        raise ApiError("系统技能由 Codex 管理，不进入人工确认队列。")
+    if entry.get("status") == "missing":
+        raise ApiError("技能文件缺失，无法确认。")
+
+    source = skill_confirmation_source(name, entry)
+    current = skill_confirmation_view(name, entry)
+    if current.get("status") == "confirmed":
+        return {"message": "该技能已确认。", "state": registry_view(registry)}
+
+    previous_confirmation = dict(entry["confirmation"]) if isinstance(entry.get("confirmation"), dict) else None
+    previous_updated_at = entry.get("updatedAt")
+    confirmed_at = now_iso()
+    entry["confirmation"] = {
+        "confirmedAt": confirmed_at,
+        "sourceSha256": source["sourceSha256"],
+        "sourcePath": source["path"],
+    }
+    entry["updatedAt"] = confirmed_at
+    save_registry(registry)
+    try:
+        append_audit(
+            "confirm-skill",
+            {"skill": name, "sourceSha256": source["sourceSha256"], "sourcePath": source["path"]},
+            event_time=confirmed_at,
+        )
+    except Exception:
+        if previous_confirmation is None:
+            entry.pop("confirmation", None)
+        else:
+            entry["confirmation"] = previous_confirmation
+        if previous_updated_at is None:
+            entry.pop("updatedAt", None)
+        else:
+            entry["updatedAt"] = previous_updated_at
+        save_registry(registry)
+        raise
+    return {"message": "已确认，该技能将退出待确认队列。", "state": registry_view(registry)}
+
+
+@registry_mutation
+def unconfirm_skill(name: str) -> dict[str, Any]:
+    name = safe_skill_name(name)
+    registry = sync_registry(save=False)
+    entry = registry["skills"].get(name)
+    if not entry:
+        raise ApiError("未找到该技能。", HTTPStatus.NOT_FOUND)
+    if entry.get("system"):
+        raise ApiError("系统技能由 Codex 管理，不进入人工确认队列。")
+    if not isinstance(entry.get("confirmation"), dict):
+        return {"message": "该技能尚未确认。", "state": registry_view(registry)}
+
+    previous = dict(entry["confirmation"])
+    previous_updated_at = entry.get("updatedAt")
+    entry.pop("confirmation", None)
+    changed_at = now_iso()
+    entry["updatedAt"] = changed_at
+    save_registry(registry)
+    try:
+        append_audit(
+            "unconfirm-skill",
+            {"skill": name, "previousConfirmedAt": previous.get("confirmedAt")},
+            event_time=changed_at,
+        )
+    except Exception:
+        entry["confirmation"] = previous
+        if previous_updated_at is None:
+            entry.pop("updatedAt", None)
+        else:
+            entry["updatedAt"] = previous_updated_at
+        save_registry(registry)
+        raise
+    return {"message": "已撤销确认，该技能会重新进入待确认队列。", "state": registry_view(registry)}
+
+
+@registry_mutation
 def update_skill(name: str, body: dict[str, Any]) -> dict[str, Any]:
     name = safe_skill_name(name)
     registry = sync_registry()
@@ -3737,7 +3917,7 @@ class Handler(SimpleHTTPRequestHandler):
                         "classification": classification,
                         "localization": localization,
                         "chineseView": chinese_view,
-                        "state": registry_view(registry),
+                        "state": registry_view(read_registry_state()),
                     }
                 )
                 return True
@@ -3760,7 +3940,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(install_skill(self.read_body()))
                 return True
 
-            skill_match = re.match(r"^/api/skills/([^/]+)(?:/(enable|disable|contexts|markdown|chinese-view|history|remote-diff|classify|localize))?$", path)
+            skill_match = re.match(r"^/api/skills/([^/]+)(?:/(enable|disable|confirm|unconfirm|contexts|markdown|chinese-view|history|remote-diff|classify|localize))?$", path)
             if skill_match:
                 skill_name = skill_match.group(1)
                 action = skill_match.group(2)
@@ -3769,6 +3949,12 @@ class Handler(SimpleHTTPRequestHandler):
                     return True
                 if method == "POST" and action == "disable":
                     self.send_json(disable_skill(skill_name))
+                    return True
+                if method == "POST" and action == "confirm":
+                    self.send_json(confirm_skill(skill_name))
+                    return True
+                if method == "POST" and action == "unconfirm":
+                    self.send_json(unconfirm_skill(skill_name))
                     return True
                 if method == "PUT" and action is None:
                     self.send_json(update_skill(skill_name, self.read_body()))

@@ -34,7 +34,7 @@ function usageStatusLabel(status) {
   return {
     active: "近期使用",
     stale: "长期未用",
-    "never-used": "未确认使用",
+    "never-used": "暂无真实使用证据",
     "declared-only": "仅有声明",
   }[status] || status;
 }
@@ -49,7 +49,7 @@ function usageStatusTone(status) {
 }
 
 function formatRelativeUsage(item) {
-  if (item.daysSinceLastUsed === null || item.daysSinceLastUsed === undefined) return item.lastUsedAt || "无确认使用证据";
+  if (item.daysSinceLastUsed === null || item.daysSinceLastUsed === undefined) return item.lastUsedAt || "无真实使用证据";
   if (item.daysSinceLastUsed === 0) return "今天";
   return `${item.daysSinceLastUsed} 天前`;
 }
@@ -139,7 +139,7 @@ function renderUsageReviewItem(item) {
   const details = document.createElement("div");
   details.className = "review-item-details";
   const counts = document.createElement("span");
-  counts.textContent = `确认 ${item.confirmedEvidenceCount || 0} · 声明 ${item.announcementEvidenceCount || 0} · ${item.category || "未分类"}`;
+  counts.textContent = `证据 ${item.confirmedEvidenceCount || 0} · 声明 ${item.announcementEvidenceCount || 0} · ${item.category || "未分类"}`;
   details.appendChild(counts);
 
   const evidenceList = document.createElement("div");

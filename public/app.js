@@ -1,6 +1,7 @@
 const state = {
   data: null,
   selected: null,
+  queue: "pending",
   filter: "all",
   usageFilter: "all",
   sort: "default",
@@ -9,6 +10,7 @@ const state = {
   search: "",
   tab: "meta",
   installOpen: false,
+  mobileDetail: false,
   descriptionExpanded: false,
   descriptionOverflow: false,
   descriptionSkill: null,
@@ -312,6 +314,13 @@ function visibleSkills() {
   const skills = state.data.skills.filter((skill) => {
     const usage = skillUsage(skill);
     const lifecycle = skillLifecycle(skill);
+    const confirmation = skillConfirmation(skill);
+    if (
+      state.queue === "pending" &&
+      (!skill.enabled || skill.system || !["unconfirmed", "needs-review"].includes(confirmation.status))
+    ) return false;
+    if (state.queue === "confirmed" && confirmation.status !== "confirmed") return false;
+    if (state.queue === "enabled" && !skill.enabled) return false;
     if (state.filter === "enabled" && !skill.enabled) return false;
     if (state.filter === "managed" && !skill.managed) return false;
     if (state.filter === "system" && !skill.system) return false;
@@ -332,6 +341,8 @@ function visibleSkills() {
       lifecycle.lastEnabledAt,
       lifecycle.lastDisabledAt,
       disabledDurationLabel(skill),
+      confirmationStatusLabel(confirmation.status),
+      confirmation.confirmedAt,
       (skill.tags || []).join(" "),
       (skill.dependencies || []).join(" "),
       JSON.stringify(skill.source || {}),
@@ -347,11 +358,20 @@ function selectedSkill() {
 
 function filterLabel() {
   return {
-    all: "全部",
+    all: "所有范围",
     enabled: "启用",
     managed: "项目库",
     system: "系统",
   }[state.filter] || state.filter;
+}
+
+function queueLabel() {
+  return {
+    pending: "待确认",
+    confirmed: "已确认",
+    enabled: "已启用",
+    all: "全部",
+  }[state.queue] || state.queue;
 }
 
 function usageFilterLabel() {
@@ -406,7 +426,7 @@ function usageStatusLabel(status) {
   return {
     active: "近期使用",
     stale: "长期未用",
-    "never-used": "未确认使用",
+    "never-used": "暂无使用证据",
     "declared-only": "仅有声明",
     unknown: "未统计",
   }[status] || status;
@@ -423,7 +443,7 @@ function usageStatusTone(status) {
 
 function formatRelativeUsage(item) {
   if (!item || item.status === "unknown") return "尚未统计";
-  if (item.daysSinceLastUsed === null || item.daysSinceLastUsed === undefined) return item.lastUsedAt || "无确认使用证据";
+  if (item.daysSinceLastUsed === null || item.daysSinceLastUsed === undefined) return item.lastUsedAt || "无真实使用证据";
   if (item.daysSinceLastUsed === 0) return "今天";
   return `${item.daysSinceLastUsed} 天前`;
 }
@@ -434,6 +454,42 @@ function skillUsage(skill) {
 
 function skillLifecycle(skill) {
   return skill?.lifecycle && typeof skill.lifecycle === "object" ? skill.lifecycle : {};
+}
+
+function skillConfirmation(skill) {
+  return skill?.confirmation && typeof skill.confirmation === "object"
+    ? skill.confirmation
+    : { status: skill?.system ? "not-applicable" : "unconfirmed", confirmed: false };
+}
+
+function confirmationStatusLabel(status) {
+  return {
+    confirmed: "已确认",
+    unconfirmed: "待确认",
+    "needs-review": "需重新确认",
+    "not-applicable": "系统管理",
+    unavailable: "无法确认",
+  }[status] || "待确认";
+}
+
+function confirmationStatusTone(status) {
+  return {
+    confirmed: "green",
+    "needs-review": "orange",
+    unavailable: "red",
+  }[status] || "";
+}
+
+function confirmationMetaText(confirmation) {
+  if (confirmation.status === "confirmed") {
+    return `已确认于 ${formatDateTime(confirmation.confirmedAt)}，当前 SKILL.md 内容未变更。`;
+  }
+  if (confirmation.status === "needs-review") {
+    return `SKILL.md 在 ${formatDateTime(confirmation.confirmedAt)} 确认后发生变化，需要重新确认。`;
+  }
+  if (confirmation.status === "not-applicable") return "系统技能由 Codex 管理，不进入人工确认队列。";
+  if (confirmation.status === "unavailable") return confirmation.error || "技能文件不可用，暂时无法确认。";
+  return "尚未确认。确认仅记录评估结果，不会启用或停用技能。";
 }
 
 function disabledDurationLabel(skill) {
@@ -672,11 +728,15 @@ function renderDiffText(diff) {
 
 function emptyListMessage() {
   const parts = [];
+  if (state.queue !== "all") parts.push(`队列：${queueLabel()}`);
   if (state.search.trim()) parts.push(`搜索：${state.search.trim()}`);
   if (state.filter !== "all") parts.push(`筛选：${filterLabel()}`);
   if (state.usageFilter !== "all" && usageStatsEnabled()) parts.push(`使用：${usageFilterLabel()}`);
   if (state.category !== "全部") parts.push(`分类：${state.category}`);
   if (state.sort !== "default") parts.push(`排序：${sortLabel()}`);
+  if (state.queue === "pending" && !state.search.trim() && state.filter === "all" && state.category === "全部" && state.usageFilter === "all") {
+    return "没有待确认技能。当前已启用的普通技能都已确认。";
+  }
   return parts.length ? `没有匹配的技能（${parts.join("；")}）` : "没有匹配的技能";
 }
 
@@ -704,6 +764,15 @@ function renderCategories() {
       return option;
     }),
   );
+  $("categorySelect").replaceChildren(
+    ...categories.map((category) => {
+      const option = document.createElement("option");
+      option.value = category;
+      option.textContent = category === "全部" ? `全部分类（${state.data.skills.length}）` : `${category}（${counts.get(category) || 0}）`;
+      return option;
+    }),
+  );
+  $("categorySelect").value = state.category;
   $("categoryListView").replaceChildren(
     ...categories.map((category) => {
       const item = document.createElement("div");
@@ -739,13 +808,15 @@ function renderRows() {
   $("emptyListMessage").textContent = emptyListMessage();
   $("clearSearchButton").hidden = !state.search.trim();
   $("resetFiltersButton").hidden =
-    state.filter === "all" && state.category === "全部" && state.usageFilter === "all" && state.sort === "default";
+    state.queue === "all" && state.filter === "all" && state.category === "全部" && state.usageFilter === "all" && state.sort === "default";
   $("skillTable").replaceChildren(
     ...skills.map((skill) => {
       const usage = skillUsage(skill);
-      const row = document.createElement("div");
+      const confirmation = skillConfirmation(skill);
+      const row = document.createElement("button");
+      row.type = "button";
       row.className = `row ${state.selected === skill.name ? "active" : ""}`;
-      row.setAttribute("role", "listitem");
+      row.setAttribute("aria-pressed", state.selected === skill.name ? "true" : "false");
       const dotTone = skill.status === "missing" ? "missing" : skill.enabled ? "enabled" : "";
       const rowMain = document.createElement("div");
       rowMain.className = "row-main";
@@ -770,16 +841,18 @@ function renderRows() {
       meta.className = "row-meta";
       rowMain.append(rowTitle, rowDesc, meta);
       const rowSide = document.createElement("div");
-      rowSide.className = "row-side";
+      rowSide.className = `row-side ${confirmationStatusTone(confirmation.status)}`.trim();
       const sideCount = document.createElement("strong");
-      sideCount.textContent = String(usage.confirmedEvidenceCount || 0);
+      sideCount.textContent = confirmationStatusLabel(confirmation.status);
       const sideLabel = document.createElement("span");
-      sideLabel.textContent = formatRelativeUsage(usage);
+      sideLabel.textContent = confirmation.confirmedAt
+        ? new Date(confirmation.confirmedAt).toLocaleDateString("zh-CN")
+        : formatRelativeUsage(usage);
       rowSide.replaceChildren(sideCount, sideLabel);
       row.append(rowMain, rowSide);
       meta.appendChild(badge(skill.category || "未分类"));
       meta.appendChild(badge(usageStatusLabel(usage.status), usageStatusTone(usage.status)));
-      if (skill.enabled) meta.appendChild(badge("启用", "green"));
+      if (skill.enabled && state.queue !== "pending") meta.appendChild(badge("启用", "green"));
       if (!skill.enabled && skillLifecycle(skill).lastDisabledAt) meta.appendChild(badge(disabledDurationLabel(skill), "orange"));
       if (skill.system) meta.appendChild(badge("系统", "orange"));
       if (skill.managed) meta.appendChild(badge("纳管", "blue"));
@@ -787,9 +860,13 @@ function renderRows() {
       if (skill.status === "missing") meta.appendChild(badge("缺失", "red"));
       row.addEventListener("click", () => {
         state.selected = skill.name;
+        state.mobileDetail = true;
         render();
       });
-      return row;
+      const item = document.createElement("li");
+      item.className = "skill-list-item";
+      item.appendChild(row);
+      return item;
     }),
   );
 }
@@ -1210,6 +1287,9 @@ function clearDetailDom() {
   $("previewToggle").setAttribute("aria-expanded", "false");
   $("previewToggle").textContent = "展开预览";
   resetChineseViewPanel();
+  $("confirmationMeta").textContent = "";
+  $("confirmButton").hidden = true;
+  $("confirmButton").disabled = true;
   $("enableButton").disabled = true;
   $("disableButton").disabled = true;
   $("enableButton").setAttribute("aria-disabled", "true");
@@ -1233,6 +1313,7 @@ function renderDetail() {
   }
   const usage = skillUsage(skill);
   const lifecycle = skillLifecycle(skill);
+  const confirmation = skillConfirmation(skill);
 
   if (state.descriptionSkill !== skill.name) {
     state.descriptionExpanded = false;
@@ -1254,6 +1335,7 @@ function renderDetail() {
   $("detailDescription").classList.toggle("expanded", state.descriptionExpanded);
   $("descriptionToggle").setAttribute("aria-expanded", state.descriptionExpanded ? "true" : "false");
   $("descriptionToggle").textContent = state.descriptionExpanded ? "收起描述" : "显示完整描述";
+  $("confirmationMeta").textContent = confirmationMetaText(confirmation);
   $("detailCategory").value = skill.category || "未分类";
   $("detailTags").value = (skill.tags || []).join(", ");
   $("detailDependencies").value = (skill.dependencies || []).join(", ");
@@ -1279,9 +1361,21 @@ function renderDetail() {
   $("disableButton").disabled = skill.system || !skill.enabled;
   $("enableButton").setAttribute("aria-disabled", $("enableButton").disabled ? "true" : "false");
   $("disableButton").setAttribute("aria-disabled", $("disableButton").disabled ? "true" : "false");
+  const confirmButton = $("confirmButton");
+  confirmButton.hidden = skill.system;
+  confirmButton.disabled = skill.system || skill.status === "missing" || confirmation.status === "unavailable";
+  confirmButton.dataset.action = confirmation.status === "confirmed" ? "unconfirm" : "confirm";
+  confirmButton.classList.toggle("secondary-button", confirmation.status === "confirmed");
+  confirmButton.querySelector("span").textContent =
+    confirmation.status === "confirmed"
+      ? "撤销确认"
+      : confirmation.status === "needs-review"
+        ? "重新确认"
+        : "标记已确认";
 
   const badges = [];
   badges.push(badge(skill.enabled ? "已启用" : "未启用", skill.enabled ? "green" : ""));
+  badges.push(badge(confirmationStatusLabel(confirmation.status), confirmationStatusTone(confirmation.status)));
   if (!skill.enabled && lifecycle.lastDisabledAt) badges.push(badge(disabledDurationLabel(skill), "orange"));
   badges.push(badge(sourceLabel(skill.source), skill.system ? "orange" : "blue"));
   badges.push(badge(usageStatusLabel(usage.status), usageStatusTone(usage.status)));
@@ -1291,6 +1385,8 @@ function renderDetail() {
   $("detailBadges").replaceChildren(...badges);
 
   const sourceRows = [
+    ["确认状态", confirmationStatusLabel(confirmation.status)],
+    ["确认时间", formatDateTime(confirmation.confirmedAt) || "无记录"],
     ["使用次数", usageCountText(usage)],
     ["涉及会话", `${usage.confirmedSessionCount || 0} 个`],
     ["使用天数", `${usage.confirmedDayCount || 0} 天`],
@@ -1350,17 +1446,26 @@ function renderStats() {
   const stats = state.data.stats;
   const tokenUsage = state.data.tokenUsage || {};
   const usageStats = state.data.usageStats || {};
-  const usageSummary = usageStats.stats || {};
   $("totalCount").textContent = stats.total;
   $("enabledCount").textContent = stats.enabled;
-  $("managedCount").textContent = stats.managed;
-  $("systemCount").textContent = stats.system;
-  $("usedCount").textContent = usageStats.enabled === false ? "关" : (usageSummary.active || 0) + (usageSummary.stale || 0);
+  $("pendingCount").textContent = stats.pendingConfirmation || 0;
+  $("confirmedCount").textContent = stats.confirmed || 0;
+  $("visibleCount").textContent = `${visibleSkills().length} 项`;
+  document.querySelectorAll("#queueSegments button").forEach((button) => {
+    const active = button.dataset.queue === state.queue;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  document.querySelectorAll("#filterSegments button").forEach((button) => {
+    const active = button.dataset.filter === state.filter;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
   $("enabledTokenCount").textContent = formatTokenCount(tokenUsage.totalTokens);
   $("tokenMetric").title = `当前 ${tokenUsage.enabledSkillCount || 0} 个已启用 skills 的索引，共 ${tokenUsage.totalTokens || 0} 预注入 token；全部按需加载约 ${tokenUsage.totalLazyTokens || 0} token；${tokenUsageMethodLabel(tokenUsage)}`;
   $("usageFilter").value = state.usageFilter;
   $("usageFilter").disabled = !usageStatsEnabled();
-  $("usageFilter").title = usageStatsEnabled() ? "按最近确认使用时间筛选技能" : "使用统计已关闭，可在设置页开启";
+  $("usageFilter").title = usageStatsEnabled() ? "按最近真实使用证据筛选技能" : "使用统计已关闭，可在设置页开启";
   $("sortSelect").value = state.sort;
   $("sortSelect").querySelectorAll("option").forEach((option) => {
     option.disabled = !usageStatsEnabled() && ["recent", "count"].includes(option.value);
@@ -1390,6 +1495,7 @@ function render() {
   if (!state.data) return;
   normalizeListControls();
   syncSelectionWithVisible();
+  document.querySelector(".shell").classList.toggle("mobile-detail-open", state.mobileDetail && Boolean(selectedSkill()));
   renderStats();
   renderCategories();
   renderRows();
@@ -1402,6 +1508,12 @@ function renderInstallPanel() {
   $("installToggleButton").setAttribute("aria-expanded", state.installOpen ? "true" : "false");
   $("installToggleButton").querySelector("use").setAttribute("href", state.installOpen ? "#icon-minus" : "#icon-plus");
   renderRepositoryPanel();
+}
+
+function setMobileMenuOpen(open) {
+  document.querySelector(".toolbar").classList.toggle("mobile-menu-open", open);
+  $("mobileMoreButton").setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) $("toolbarOverflow").querySelector("button, a")?.focus();
 }
 
 function renderRepositoryPanel() {
@@ -1532,7 +1644,7 @@ async function refreshUsageStats() {
     syncSelectionWithVisible();
     render();
     const stats = payload.stats || {};
-    setStatus(`使用统计已刷新：确认使用 ${(stats.active || 0) + (stats.stale || 0)} 个，需关注 ${stats.issues || 0} 个`);
+    setStatus(`使用统计已刷新：有真实使用证据 ${(stats.active || 0) + (stats.stale || 0)} 个，需关注 ${stats.issues || 0} 个`);
   } finally {
     setStatusBusy(false);
     $("usageRefreshButton").disabled = state.data?.usageStats?.enabled === false;
@@ -1580,6 +1692,7 @@ async function install() {
     state.historyCache.clear();
     clearGithubSourcesCache();
     state.chineseViewCache.clear();
+    state.queue = "all";
     state.selected = payload.installed[0] || state.selected;
     syncSelectionWithVisible();
     render();
@@ -1699,6 +1812,29 @@ async function toggleSkill(action) {
   setStatus(payload.message || "完成");
 }
 
+async function toggleConfirmation() {
+  const skill = selectedSkill();
+  if (!skill || skill.system) return;
+  const action = $("confirmButton").dataset.action || "confirm";
+  const name = skill.name;
+  $("confirmButton").disabled = true;
+  setStatus(action === "confirm" ? "正在记录确认结果" : "正在撤销确认");
+  const payload = await api(`/api/skills/${encodeURIComponent(name)}/${action}`, {
+    method: "POST",
+    body: "{}",
+  });
+  state.data = payload.state;
+  state.historyCache.delete(name);
+  syncSelectionWithVisible();
+  render();
+  const remaining = state.data.stats?.pendingConfirmation || 0;
+  setStatus(
+    action === "confirm"
+      ? `${name} 已确认，已从待确认队列移除；剩余 ${remaining} 个待确认`
+      : `${name} 已撤销确认，已重新进入待确认队列`,
+  );
+}
+
 async function loadContexts() {
   const skill = selectedSkill();
   if (!skill) return;
@@ -1773,6 +1909,29 @@ async function showAudit() {
 }
 
 function bindEvents() {
+  $("mobileMoreButton").addEventListener("click", () => {
+    const open = !document.querySelector(".toolbar").classList.contains("mobile-menu-open");
+    setMobileMenuOpen(open);
+  });
+  $("toolbarOverflow").addEventListener("click", (event) => {
+    if (event.target.closest("button, a")) setMobileMenuOpen(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && document.querySelector(".toolbar").classList.contains("mobile-menu-open")) {
+      setMobileMenuOpen(false);
+      $("mobileMoreButton").focus();
+    }
+  });
+  document.addEventListener("click", (event) => {
+    if (document.querySelector(".toolbar").classList.contains("mobile-menu-open") && !event.target.closest(".toolbar")) {
+      setMobileMenuOpen(false);
+    }
+  });
+  $("mobileBackButton").addEventListener("click", () => {
+    state.mobileDetail = false;
+    render();
+    requestAnimationFrame(() => document.querySelector(".list-pane")?.scrollIntoView({ block: "start" }));
+  });
   $("installToggleButton").addEventListener("click", () => {
     state.installOpen = !state.installOpen;
     renderInstallPanel();
@@ -1790,6 +1949,10 @@ function bindEvents() {
   $("repositoryTestButton").addEventListener("click", () => testRepositoryConfig().catch((error) => setStatus(error.message)));
   $("installSource").addEventListener("input", () => showInstallSourceError(""));
   $("saveButton").addEventListener("click", () => saveSkill().catch((error) => setStatus(error.message)));
+  $("confirmButton").addEventListener("click", () => toggleConfirmation().catch((error) => {
+    $("confirmButton").disabled = false;
+    setStatus(error.message);
+  }));
   $("enableButton").addEventListener("click", () => toggleSkill("enable").catch((error) => setStatus(error.message)));
   $("disableButton").addEventListener("click", () => toggleSkill("disable").catch((error) => setStatus(error.message)));
   $("descriptionToggle").addEventListener("click", toggleDescription);
@@ -1800,6 +1963,7 @@ function bindEvents() {
   $("githubSourcesButton").addEventListener("click", openGithubSources);
   $("githubSourcesRefreshButton").addEventListener("click", () => loadGithubSources(true).catch((error) => setStatus(error.message)));
   $("auditButton").addEventListener("click", () => showAudit().catch((error) => setStatus(error.message)));
+
   $("searchInput").addEventListener("input", (event) => {
     state.search = event.target.value;
     render();
@@ -1812,9 +1976,23 @@ function bindEvents() {
     state.sort = event.target.value;
     render();
   });
+  $("categorySelect").addEventListener("change", (event) => {
+    state.category = event.target.value;
+    render();
+  });
+  document.querySelectorAll("#queueSegments button").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.queue = button.dataset.queue || "pending";
+      state.mobileDetail = false;
+      if (state.queue !== "all" && state.filter === "system") state.filter = "all";
+      render();
+    });
+  });
   document.querySelectorAll("#filterSegments button").forEach((button) => {
     button.addEventListener("click", () => {
       state.filter = button.dataset.filter;
+      state.mobileDetail = false;
+      if (state.filter === "system") state.queue = "all";
       document.querySelectorAll("#filterSegments button").forEach((item) => item.classList.toggle("active", item === button));
       render();
     });
@@ -1838,12 +2016,15 @@ function bindEvents() {
     render();
   });
   $("resetFiltersButton").addEventListener("click", () => {
+    state.mobileDetail = false;
+    state.queue = "all";
     state.filter = "all";
     state.category = "全部";
     state.usageFilter = "all";
     state.sort = "default";
     $("usageFilter").value = state.usageFilter;
     $("sortSelect").value = state.sort;
+    $("categorySelect").value = state.category;
     document.querySelectorAll("#filterSegments button").forEach((item) => item.classList.toggle("active", item.dataset.filter === "all"));
     render();
   });
