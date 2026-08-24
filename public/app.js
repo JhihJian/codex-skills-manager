@@ -1325,7 +1325,7 @@ function renderDetail() {
   }
   if (state.contextSkill !== skill.name) {
     state.contextSkill = skill.name;
-    $("contextSummary").textContent = "点击“检索上下文”后读取本机 Codex 会话记录。";
+    $("contextSummary").textContent = "点击“检索上下文”后读取本机 Codex 与 Pi 会话记录。";
     $("contextResults").replaceChildren();
     $("emptyContexts").hidden = true;
   }
@@ -1854,7 +1854,7 @@ async function loadContexts() {
         node.className = "context-item";
         const title = document.createElement("h3");
         title.title = item.title;
-        title.textContent = item.title;
+        title.textContent = `${item.source === "pi" ? "Pi" : "Codex"} · ${item.title}`;
         const path = document.createElement("code");
         path.textContent = `${item.updatedAt} · ${item.path}`;
         node.append(title, path);

@@ -70,7 +70,7 @@ const reviews = {
       return `正在扫描本机会话，按 ${staleDays} 天阈值识别未真实使用的技能。`;
     },
     runningPolicy:
-      "正在读取 sessions 和 archived_sessions 中的结构化事件，只把 SKILL.md 读取工具调用计为真实使用证据。",
+      "正在读取 Codex 与 Pi 的结构化会话事件，把 SKILL.md 读取和 Pi /skill 命令加载计为真实使用证据。",
     buildBody() {
       return {
         staleDays: $("reviewStaleDays").value,
@@ -103,7 +103,9 @@ const reviews = {
           return item;
         }),
       );
-      $("reviewPolicy").textContent = `${payload.evidencePolicy || ""} 扫描 ${payload.scan?.scannedFiles || 0} 个会话文件，阈值 ${payload.staleDays} 天。`;
+      const codexFiles = payload.scan?.sources?.codex?.scannedFiles || 0;
+      const piFiles = payload.scan?.sources?.pi?.scannedFiles || 0;
+      $("reviewPolicy").textContent = `${payload.evidencePolicy || ""} 扫描 Codex ${codexFiles} 个、Pi ${piFiles} 个会话文件，阈值 ${payload.staleDays} 天。`;
 
       const interesting = (payload.entries || []).filter((item) => item.status !== "active");
       const entries = interesting.length ? interesting : payload.entries || [];
@@ -153,7 +155,8 @@ function renderUsageReviewItem(item) {
     for (const evidenceItem of evidence) {
       const row = document.createElement("p");
       const label = document.createElement("span");
-      label.textContent = `${evidenceItem.type === "skill-file-read" ? "确认" : "声明"} L${evidenceItem.line || "?"}`;
+      const source = evidenceItem.source === "pi" ? "Pi" : "Codex";
+      label.textContent = `${source} · ${evidenceItem.confidence === "confirmed" ? "确认" : "声明"} L${evidenceItem.line || "?"}`;
       row.append(label, document.createTextNode(evidenceItem.snippet || evidenceItem.title || ""));
       evidenceList.appendChild(row);
     }

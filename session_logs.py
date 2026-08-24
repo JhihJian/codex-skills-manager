@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,13 @@ LOW_VALUE_TEXT_MARKERS = (
     "process exited with code",
     "original token count",
 )
+
+
+@dataclass(frozen=True)
+class SessionLogFile:
+    source: str
+    path: Path
+    modified_at: float
 
 
 def normalize_bool(value: Any, default: bool = False) -> bool:
@@ -101,17 +109,72 @@ def read_session_index(session_index_file: Path) -> dict[str, dict[str, Any]]:
 
 
 def session_files(sessions_dir: Path, archived_sessions_dir: Path, limit: int = 400) -> list[Path]:
+    return session_files_from_roots((sessions_dir, archived_sessions_dir), limit=limit)
+
+
+def session_files_from_roots(roots: tuple[Path, ...], limit: int = 400) -> list[Path]:
     files: list[Path] = []
-    for root in (sessions_dir, archived_sessions_dir):
+    for root in roots:
         if root.exists():
             files.extend([p for p in root.rglob("*.jsonl") if p.is_file()])
-    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    files.sort(key=safe_mtime, reverse=True)
     return files[:limit]
+
+
+def safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def source_session_files(
+    codex_sessions_dir: Path,
+    codex_archived_sessions_dir: Path,
+    pi_sessions_dir: Path,
+    *,
+    limit_per_source: int = 400,
+) -> list[SessionLogFile]:
+    selected = [
+        SessionLogFile("codex", path, safe_mtime(path))
+        for path in session_files(codex_sessions_dir, codex_archived_sessions_dir, limit=limit_per_source)
+    ]
+    selected.extend(
+        SessionLogFile("pi", path, safe_mtime(path))
+        for path in session_files_from_roots((pi_sessions_dir,), limit=limit_per_source)
+    )
+    selected.sort(key=lambda item: item.modified_at, reverse=True)
+    return selected
 
 
 def session_id_from_path(path: Path) -> str:
     match = re.search(r"([0-9a-f]{8}-[0-9a-f-]{27,})", path.name)
     return match.group(1) if match else path.stem
+
+
+def pi_session_family(path: Path, parent_session: str = "", cache: dict[Path, str] | None = None) -> str:
+    cache = cache if cache is not None else {}
+    resolved = path.expanduser().resolve()
+    if resolved in cache:
+        return cache[resolved]
+    cache[resolved] = str(resolved)
+    parent = parent_session.strip()
+    if not parent:
+        try:
+            with resolved.open("r", encoding="utf-8", errors="replace") as f:
+                header = json.loads(f.readline())
+            if header.get("type") == "session":
+                parent = str(header.get("parentSession") or "").strip()
+        except (OSError, json.JSONDecodeError):
+            return str(resolved)
+    if not parent:
+        return str(resolved)
+    parent_path = Path(parent).expanduser()
+    if not parent_path.is_absolute():
+        parent_path = resolved.parent / parent_path
+    family = pi_session_family(parent_path, cache=cache)
+    cache[resolved] = family
+    return family
 
 
 def normalize_message_role(role: str) -> str:
@@ -212,6 +275,15 @@ def extract_message_text(item: dict[str, Any]) -> tuple[str, str]:
                 return "", role
             return text, role
         return "", str(payload.get("type") or item_type)
+    if item_type == "message":
+        message = item.get("message") if isinstance(item.get("message"), dict) else {}
+        role = normalize_message_role(str(message.get("role") or ""))
+        if not role:
+            return "", str(message.get("role") or item_type)
+        text = text_from_content(message.get("content"))
+        if is_low_value_context_text(text):
+            return "", role
+        return text, role
     return "", item_type
 
 

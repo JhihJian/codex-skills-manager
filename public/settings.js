@@ -67,8 +67,10 @@ function renderPaths() {
     ["统计缓存", paths.usageStats],
     ["Skills 仓库", repository.skillsRepoDir],
     ["Skills 目录", repository.skillsDir],
-    ["会话记录", paths.sessions],
-    ["归档会话", paths.archivedSessions],
+    ["Codex 会话", paths.sessions],
+    ["Codex 归档会话", paths.archivedSessions],
+    ["Pi Agent", paths.piAgent],
+    ["Pi 会话", paths.piSessions],
   ];
   $("settingsPaths").replaceChildren(
     ...rows.flatMap(([label, value]) => {

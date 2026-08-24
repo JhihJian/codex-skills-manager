@@ -33,11 +33,12 @@ from session_logs import (
     context_role_label,
     extract_message_text,
     normalize_context_text,
+    pi_session_family,
     read_session_index as read_codex_session_index,
-    session_files as list_codex_session_files,
     session_id_from_path,
+    source_session_files,
 )
-from usage_stats import UsageStatsService
+from usage_stats import UsageStatsService, build_skill_alias_map, canonical_skill_name
 from token_usage import calculate_skill_token_usage
 
 
@@ -57,11 +58,30 @@ AUDIT_FILE = DATA_DIR / "audit-log.jsonl"
 USAGE_STATS_FILE = DATA_DIR / "usage-stats.json"
 CHINESE_SKILL_VIEW_DB_FILE = DATA_DIR / "chinese-skill-views.sqlite3"
 
-CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve()
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve()
 CODEX_SKILLS_DIR = (CODEX_HOME / "skills").resolve()
 CODEX_SESSIONS_DIR = (CODEX_HOME / "sessions").resolve()
 CODEX_ARCHIVED_SESSIONS_DIR = (CODEX_HOME / "archived_sessions").resolve()
 SESSION_INDEX_FILE = CODEX_HOME / "session_index.jsonl"
+PI_AGENT_DIR = Path(os.environ.get("PI_CODING_AGENT_DIR", Path.home() / ".pi" / "agent")).expanduser().resolve()
+
+
+def resolve_pi_sessions_dir() -> Path:
+    configured = os.environ.get("CODEX_SKILL_PI_SESSIONS_DIR") or os.environ.get("PI_CODING_AGENT_SESSION_DIR")
+    if not configured:
+        try:
+            with (PI_AGENT_DIR / "settings.json").open("r", encoding="utf-8") as f:
+                pi_settings = json.load(f)
+            configured = str(pi_settings.get("sessionDir") or "").strip() if isinstance(pi_settings, dict) else ""
+        except (OSError, json.JSONDecodeError):
+            configured = ""
+    if not configured:
+        return (PI_AGENT_DIR / "sessions").resolve()
+    path = Path(configured).expanduser()
+    return (path if path.is_absolute() else Path.cwd() / path).resolve()
+
+
+PI_SESSIONS_DIR = resolve_pi_sessions_dir()
 INSTALLER_SCRIPT = (
     CODEX_SKILLS_DIR
     / ".system"
@@ -725,6 +745,7 @@ usage_stats_service = UsageStatsService(
     stats_file=USAGE_STATS_FILE,
     sessions_dir=CODEX_SESSIONS_DIR,
     archived_sessions_dir=CODEX_ARCHIVED_SESSIONS_DIR,
+    pi_sessions_dir=PI_SESSIONS_DIR,
     session_index_file=SESSION_INDEX_FILE,
     read_settings=read_settings,
     write_settings=write_settings,
@@ -1241,6 +1262,8 @@ def registry_view(registry: dict[str, Any]) -> dict[str, Any]:
             "codexSkills": str(CODEX_SKILLS_DIR),
             "sessions": str(CODEX_SESSIONS_DIR),
             "archivedSessions": str(CODEX_ARCHIVED_SESSIONS_DIR),
+            "piAgent": str(PI_AGENT_DIR),
+            "piSessions": str(PI_SESSIONS_DIR),
         },
         "codex": codex_health(),
         "stats": {
@@ -3707,6 +3730,8 @@ def settings_view() -> dict[str, Any]:
             "usageStats": str(USAGE_STATS_FILE),
             "sessions": str(CODEX_SESSIONS_DIR),
             "archivedSessions": str(CODEX_ARCHIVED_SESSIONS_DIR),
+            "piAgent": str(PI_AGENT_DIR),
+            "piSessions": str(PI_SESSIONS_DIR),
         },
     }
 
@@ -3722,8 +3747,13 @@ def read_session_index() -> dict[str, dict[str, Any]]:
     return read_codex_session_index(SESSION_INDEX_FILE)
 
 
-def session_files(limit: int = 400) -> list[Path]:
-    return list_codex_session_files(CODEX_SESSIONS_DIR, CODEX_ARCHIVED_SESSIONS_DIR, limit=limit)
+def bounded_query_int(query: dict[str, list[str]], key: str, default: int, maximum: int) -> int:
+    raw = (query.get(key) or [str(default)])[0]
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ApiError(f"{key} 必须是整数。") from exc
+    return max(1, min(maximum, value))
 
 
 def search_skill_contexts(name: str, query: dict[str, list[str]]) -> dict[str, Any]:
@@ -3734,32 +3764,41 @@ def search_skill_contexts(name: str, query: dict[str, list[str]]) -> dict[str, A
         raise ApiError("未找到该技能。", HTTPStatus.NOT_FOUND)
 
     extra_query = (query.get("q") or [""])[0].strip()
-    max_files = int((query.get("maxFiles") or ["400"])[0])
-    limit = int((query.get("limit") or ["60"])[0])
+    max_files = bounded_query_int(query, "maxFiles", 400, 10000)
+    limit = bounded_query_int(query, "limit", 60, 500)
     keywords = {name.lower()}
     frontmatter_name = str(entry.get("frontmatter", {}).get("name") or "").strip().lower()
     if frontmatter_name:
         keywords.add(frontmatter_name)
-    if extra_query:
-        keywords.add(extra_query.lower())
+    aliases = build_skill_alias_map(registry)
 
     index = read_session_index()
     results: list[dict[str, Any]] = []
     matched_sessions: set[str] = set()
-    seen_contexts: set[tuple[str, str, str]] = set()
+    seen_skill_events: set[tuple[str, str, str]] = set()
+    pi_family_cache: dict[Path, str] = {}
 
-    for file_path in session_files(limit=max_files):
+    for source_file in source_session_files(
+        CODEX_SESSIONS_DIR,
+        CODEX_ARCHIVED_SESSIONS_DIR,
+        PI_SESSIONS_DIR,
+        limit_per_source=max_files,
+    ):
         if len(results) >= limit:
             break
+        source = source_file.source
+        file_path = source_file.path
         dedupe_session_id = session_id_from_path(file_path)
         session_id = dedupe_session_id
-        snippets: list[dict[str, Any]] = []
+        session_family = pi_session_family(file_path, cache=pi_family_cache) if source == "pi" else session_id
+        candidates: list[dict[str, Any]] = []
+        evidence_lines: list[int] = []
+        seen_messages: set[tuple[str, str]] = set()
+        pi_title = ""
+        first_user_text = ""
         try:
             with file_path.open("r", encoding="utf-8", errors="replace") as f:
                 for line_number, line in enumerate(f, 1):
-                    lower_line = line.lower()
-                    if not any(keyword in lower_line for keyword in keywords):
-                        continue
                     try:
                         item = json.loads(line)
                     except json.JSONDecodeError:
@@ -3768,19 +3807,33 @@ def search_skill_contexts(name: str, query: dict[str, list[str]]) -> dict[str, A
                         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
                         session_id = str(payload.get("id") or session_id)
                         continue
+                    if source == "pi" and item.get("type") == "session":
+                        session_id = str(item.get("id") or session_id)
+                        continue
+                    if source == "pi" and item.get("type") == "session_info":
+                        pi_title = str(item.get("name") or "").strip()
+                        continue
+                    for read_event in usage_stats_service.extract_skill_read_evidence(item, source=source):
+                        if not any(canonical_skill_name(raw_name, aliases) == name for raw_name in read_event["names"]):
+                            continue
+                        event_id = str(read_event.get("eventId") or item.get("id") or f"{file_path}:{line_number}")
+                        event_key = (source, session_family, event_id)
+                        if event_key not in seen_skill_events:
+                            seen_skill_events.add(event_key)
+                            evidence_lines.append(line_number)
                     text, role = extract_message_text(item)
                     if not text:
                         continue
+                    if source == "pi" and role == "user" and not first_user_text:
+                        first_user_text = compact_snippet(text, "", width=80)
                     lower_text = text.lower()
                     match_keyword = next((k for k in keywords if k in lower_text), "")
-                    if not match_keyword:
-                        continue
                     normalized_text = normalize_context_text(text)
-                    dedupe_key = (dedupe_session_id, role, normalized_text)
-                    if dedupe_key in seen_contexts:
+                    message_key = (role, normalized_text)
+                    if message_key in seen_messages:
                         continue
-                    seen_contexts.add(dedupe_key)
-                    snippets.append(
+                    seen_messages.add(message_key)
+                    candidates.append(
                         {
                             "line": line_number,
                             "time": item.get("timestamp", ""),
@@ -3790,20 +3843,35 @@ def search_skill_contexts(name: str, query: dict[str, list[str]]) -> dict[str, A
                             "text": compact_snippet(text, match_keyword),
                         }
                     )
-                    if len(snippets) >= 4:
-                        break
         except OSError:
             continue
 
+        if evidence_lines:
+            if extra_query:
+                query_candidates = [item for item in candidates if extra_query.lower() in item["text"].lower()]
+                nearby = query_candidates
+            else:
+                nearby = candidates
+            nearby.sort(key=lambda item: (min(abs(item["line"] - line) for line in evidence_lines), item["line"]))
+            snippets = sorted(nearby[:4], key=lambda item: item["line"])
+        else:
+            snippets = [
+                item
+                for item in candidates
+                if item["keyword"] and (not extra_query or extra_query.lower() in item["text"].lower())
+            ][:4]
         if not snippets:
             continue
-        meta = index.get(session_id, {})
-        matched_sessions.add(session_id)
+        meta = index.get(session_id, {}) if source == "codex" else {}
+        session_key = f"{source}:{session_id}"
+        matched_sessions.add(session_key)
         results.append(
             {
+                "source": source,
                 "sessionId": session_id,
-                "title": meta.get("thread_name") or file_path.stem,
-                "updatedAt": meta.get("updated_at") or datetime.fromtimestamp(file_path.stat().st_mtime).isoformat(),
+                "sessionKey": session_key,
+                "title": meta.get("thread_name") or pi_title or first_user_text or file_path.stem,
+                "updatedAt": meta.get("updated_at") or datetime.fromtimestamp(source_file.modified_at).astimezone().isoformat(),
                 "path": str(file_path),
                 "snippets": snippets,
             }
@@ -3814,7 +3882,7 @@ def search_skill_contexts(name: str, query: dict[str, list[str]]) -> dict[str, A
         "query": extra_query,
         "matchedSessionCount": len(matched_sessions),
         "results": results,
-        "summary": "仅展示去重后的用户/助手正文，已过滤工具调用、函数输出、DOM 快照、浏览器自动化日志和长 JSON 输出。",
+        "summary": "已合并 Codex 与 Pi，仅展示去重后的用户/助手正文，并过滤工具调用、函数输出、DOM 快照、浏览器自动化日志和长 JSON 输出。",
     }
 
 

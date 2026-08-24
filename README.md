@@ -12,10 +12,10 @@
 - 顶部“自动分类”按钮会对当前未分类技能补跑识别；按住 Shift 点击该按钮可以强制重分已有分类。
 - 顶部“中文信息”按钮会为英文或中英混合的 skill 生成中文名称和中文触发条件，并保存到 registry 的本地化元数据；左侧可以在“中文/原文”视图间切换，详情页“中文”页签支持查看、生成和手动修正。该功能不修改原始 `SKILL.md`。
 - 安装或同步后会为 `SKILL.md` 自动生成完整中文阅读视图；详情页“中文原文”页签可查看或重新生成。译文只保存在管理器本地缓存，绝不会写入 skills 仓库、`.codex/skills` 或 Codex 实际加载的 skill。
-- 管理台可以展示技能使用频率。该功能已模块化为独立统计服务，可在“设置”页单独开启或关闭；开启后服务运行期间每天定时扫描一次本机 Codex 会话，结果缓存到 `data/usage-stats.json`。顶部“使用统计”按钮可手动刷新。
+- 管理台可以展示技能使用频率。该功能已模块化为独立统计服务，可在“设置”页单独开启或关闭；开启后服务运行期间每天定时扫描一次本机 Codex 与 Pi 会话，结果缓存到 `data/usage-stats.json`。顶部“使用统计”按钮可手动刷新。
 - 管理台会自动计算当前已启用 skills 的惰性加载 token：顶部“预注入 token”只统计启动时注入的技能索引，详情页“来源”中同时显示索引 token 和触发后按需加载的完整 `SKILL.md` token。统计优先使用本机 `tiktoken` 的 `o200k_base`/`cl100k_base` 编码；未安装时使用中英文 Unicode 估算。
-- 用户点击“检索上下文”后读取本机 Codex 会话 JSONL，快速查看某个 skill 在会话中的上下文片段，用于判断技能是否有效；切换到上下文页不会自动扫描会话。检索结果优先展示按会话、角色和正文去重后的用户/助手正文，并过滤工具调用、函数调用输出、DOM 快照、浏览器自动化日志和长 JSON 工具输出等低价值片段。
-- 顶部“技能审查”入口会打开独立问题审查页，用于扩展多个 skills 常见问题审查项；当前支持按需扫描本机 Codex 会话 JSONL，识别长期未真实触发使用的技能。审查不会把系统注入的技能列表、用户普通提及或上下文关键词命中当作使用；默认只有助手执行过程中的 `SKILL.md` 读取工具调用计为真实使用证据，助手明确使用某技能的声明仅作为辅助证据。
+- 用户点击“检索上下文”后读取本机 Codex 与 Pi 会话 JSONL，快速查看某个 skill 在会话中的上下文片段，用于判断技能是否有效；切换到上下文页不会自动扫描会话。检索结果会标明来源，优先展示按来源、事件和正文去重后的用户/助手正文，并过滤工具调用、函数调用输出、DOM 快照、浏览器自动化日志和长 JSON 工具输出等低价值片段。
+- 顶部“技能审查”入口会打开独立问题审查页，用于扩展多个 skills 常见问题审查项；当前支持按需扫描本机 Codex 与 Pi 会话 JSONL，识别长期未真实触发使用的技能。审查不会把系统注入的技能列表、用户普通提及或上下文关键词命中当作使用；助手执行的 `SKILL.md` 读取工具调用和 Pi `/skill:name` 命令加载计为真实使用证据，助手明确使用某技能的声明仅作为辅助证据。
 - 详情页“版本”页签会从 Git 提交记录展示当前 skill 的历史版本、提交时间、作者、提交说明和涉及文件的增删统计；如果仓库还没有提交记录，会在首次提交后开始展示。
 - 详情页“来源”页签可以按 GitHub 仓库聚合展示从哪些仓库安装了哪些 skills，并按需检查远端 `SKILL.md` 是否有更新；发现差异时可直接查看本地版本与 GitHub 当前版本的 diff。
 - 服务运行期间会监测独立 skills 仓库中的 `skills/` 和 `codex-skills-manager.sqlite3`。检测到受管技能变更后，如果 1 小时内没有继续变化，就自动执行一次限定路径的 Git 提交，提交信息会列出涉及的 skill 和文件数量；配置了 GitHub remote 时会尝试 push。
@@ -131,7 +131,8 @@ C:\Users\user\.codex\skills\.system\skill-installer\scripts\install-skill-from-g
 - `public/`：管理页面前端。
 - `app.py`：本地 API 与静态文件服务器。
 - `usage_stats.py`：技能使用频率分析、缓存、设置和调度服务。
-- `session_logs.py`：Codex 会话 JSONL 读取、正文抽取和低价值内容过滤等共享逻辑。
+- `session_logs.py`：Codex 与 Pi 会话 JSONL 枚举、正文抽取和低价值内容过滤等共享逻辑。
+- `test_usage_stats.py`、`test_session_logs.py`：双来源统计、证据去重、Pi 工具调用和上下文检索测试。
 
 ## 技能版本记录
 
@@ -277,7 +278,7 @@ codex exec --ephemeral --output-schema <schema> --output-last-message <file>
 
 ## 使用频率统计
 
-主页面在启用后展示最近一次使用统计缓存。统计口径与“技能审查”一致：只有助手执行过程中的 `SKILL.md` 读取工具调用计为真实使用证据，助手声明“使用某技能”只作为辅助证据。真实使用证据次数用于衡量触发频率，涉及会话和使用天数用于避免同一会话内重复读取造成误判；该证据与人工“已确认”状态无关。
+主页面在启用后展示最近一次使用统计缓存。统计同时读取 Codex 与 Pi 会话，且口径与“技能审查”一致：助手执行的 `SKILL.md` 读取工具调用和 Pi `/skill:name` 命令加载计为真实使用证据，助手声明“使用某技能”只作为辅助证据。真实使用证据次数用于衡量触发频率，涉及会话和使用天数用于避免同一会话内重复读取造成误判；该证据与人工“已确认”状态无关。Pi fork/clone 复制出的同源工具调用会按父会话链和事件 ID 去重，独立会话中的同名事件不会合并；Codex 与 Pi 即使出现相同会话 ID 也会按不同来源分别统计。
 
 主页面左侧“使用”筛选会复用这份统计缓存，支持查看 3 天、7 天或 15 天未使用的技能；没有真实使用证据或仅有助手声明的技能会被视为未使用，统计关闭时该筛选不可用。左侧“排序”支持默认顺序、名称、分类、最近使用和使用次数，其中最近使用、使用次数依赖使用统计数据。
 
@@ -287,7 +288,9 @@ codex exec --ephemeral --output-schema <schema> --output-last-message <file>
 http://127.0.0.1:8876/settings.html
 ```
 
-在设置页可以单独配置使用频率分析是否开启、是否每日自动刷新、刷新时间、扫描范围、是否包含系统技能、长期未用阈值和最大扫描文件数。页面配置写入 `data/settings.json` 的 `usageStats` 字段。
+在设置页可以单独配置使用频率分析是否开启、是否每日自动刷新、刷新时间、扫描范围、是否包含系统技能、长期未用阈值和每个来源的最大扫描文件数。页面配置写入 `data/settings.json` 的 `usageStats` 字段。为避免一个来源挤占另一个来源，`maxFiles` 会分别应用于 Codex 和 Pi，然后合并结果。
+
+Pi 会话目录按以下顺序确定：`CODEX_SKILL_PI_SESSIONS_DIR`、`PI_CODING_AGENT_SESSION_DIR`、`~/.pi/agent/settings.json` 中的 `sessionDir`、`~/.pi/agent/sessions`。`PI_CODING_AGENT_DIR` 可以改写 Pi agent 根目录。Pi 命令行临时传入的 `--session-dir` 无法被独立运行的管理器自动发现，需要同时设置 `CODEX_SKILL_PI_SESSIONS_DIR`。旧版只含 Codex 的 version 1 统计缓存会标记为过期，并在启动刷新或手动刷新后升级为双来源 version 2 缓存。
 
 开启“每日自动刷新”后，服务启动时会创建一个本地后台线程，在每天固定时间刷新 `data/usage-stats.json`。如果缓存不存在或超过 25 小时未更新，服务启动时会自动触发一次后台刷新。该调度只在本地管理服务运行期间生效，不会注册 Windows 计划任务。关闭使用频率分析后，主页面不再展示使用次数，手动刷新接口和后台调度都会跳过扫描。
 
@@ -308,7 +311,10 @@ http://127.0.0.1:8876/settings.html
 - `CODEX_SKILL_USAGE_STATS_SCOPE=all`：主页面统计范围，可选 `enabled`、`managed`、`all`。
 - `CODEX_SKILL_USAGE_STATS_INCLUDE_SYSTEM=1`：主页面统计是否包含系统技能。
 - `CODEX_SKILL_USAGE_STALE_DAYS=30`：默认长期未用阈值，单位天。
-- `CODEX_SKILL_USAGE_MAX_FILES=1000`：一次统计最多扫描的会话 JSONL 文件数。
+- `CODEX_SKILL_USAGE_MAX_FILES=1000`：一次统计中每个来源最多扫描的会话 JSONL 文件数。
+- `CODEX_SKILL_PI_SESSIONS_DIR`：显式指定管理器读取的 Pi 会话目录，优先级最高。
+- `PI_CODING_AGENT_DIR`：改写 Pi agent 根目录，默认 `~/.pi/agent`。
+- `PI_CODING_AGENT_SESSION_DIR`：改写 Pi 会话目录，优先级低于管理器专用变量。
 
 ## 技能审查
 
@@ -322,10 +328,10 @@ http://127.0.0.1:8876/reviews.html
 
 当前已支持的审查项是“长期未真实触发使用”：
 
-- 点击“开始审查”后才会读取 `C:\Users\user\.codex\sessions` 和 `C:\Users\user\.codex\archived_sessions`。
+- 点击“开始审查”后才会读取 Codex 的 `sessions`、`archived_sessions` 和 Pi 的 `sessions` 目录。
 - 审查运行期间会显示不定进度条和当前扫描提示；后端完成一次只读扫描后再切换为结果汇总。
 - 默认审查已启用技能，阈值为 30 天；可以在面板中切换为项目库纳管或全部技能，并选择是否包含系统技能。
-- 真实使用证据来自结构化会话事件里的工具调用，例如读取 `C:\Users\user\.codex\skills\<skill>\SKILL.md`、`<skills-repo>\skills\<skill>\SKILL.md` 或插件缓存中的 `skills\<skill>\SKILL.md`。
+- 真实使用证据来自两类结构化会话事件：Codex function call 或 Pi `toolCall` 读取 `.codex/skills/<skill>/SKILL.md`、`.pi/agent/skills/<skill>/SKILL.md`、`.agents/skills/<skill>/SKILL.md`、`<skills-repo>/skills/<skill>/SKILL.md` 或插件缓存中的 `skills/<skill>/SKILL.md`，以及 Pi `/skill:name` 展开形成的结构化 skill block。
 - 仅在用户消息、developer/system 注入内容、技能列表、普通关键词上下文或工具输出中出现 skill 名称，不会计为真实使用。
 - 审查结果分为“暂无真实使用证据”“仅有声明”“长期未用”和“近期使用”，并展示命中的会话文件、行号和证据片段。
 
@@ -336,7 +342,7 @@ http://127.0.0.1:8876/reviews.html
 可用环境变量：
 
 - `CODEX_SKILL_USAGE_STALE_DAYS=30`：默认长期未用阈值，单位天。
-- `CODEX_SKILL_USAGE_MAX_FILES=1000`：一次审查最多扫描的会话 JSONL 文件数。
+- `CODEX_SKILL_USAGE_MAX_FILES=1000`：一次审查中每个来源最多扫描的会话 JSONL 文件数。
 
 ## 注意事项
 
