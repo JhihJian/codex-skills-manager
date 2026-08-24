@@ -134,6 +134,7 @@ C:\Users\user\.codex\skills\.system\skill-installer\scripts\install-skill-from-g
 - `usage_stats.py`：技能使用频率分析、缓存、设置和调度服务。
 - `session_logs.py`：Codex 与 Pi 会话 JSONL 枚举、正文抽取和低价值内容过滤等共享逻辑。
 - `test_usage_stats.py`、`test_session_logs.py`：双来源统计、证据去重、Pi 工具调用和上下文检索测试。
+- `docs/skill-outcome-review-design.md`：技能使用结果检查、证据合同、自动评审和人工裁决的完整设计方案。
 
 ## 技能版本记录
 
