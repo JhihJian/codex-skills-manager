@@ -1443,6 +1443,11 @@ input.field-invalid {
   padding: 8px 16px;
   border-bottom: 1px solid var(--hair);
   overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.tabs::-webkit-scrollbar {
+  display: none;
 }
 
 .tabs button {
@@ -1922,6 +1927,108 @@ input:disabled {
   font-family: var(--mono);
   font-size: 10px;
   margin-right: 8px;
+}
+
+.usage-record-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.usage-record-head > div {
+  display: grid;
+  gap: 3px;
+}
+
+.usage-record-head span {
+  color: var(--ink-2);
+  font-size: 12px;
+}
+
+.usage-record-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0 0 14px;
+  border-block: 1px solid var(--hair);
+}
+
+.usage-record-metric {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  border-right: 1px solid var(--hair);
+}
+
+.usage-record-metric:last-child {
+  border-right: 0;
+}
+
+.usage-record-metric dt,
+.usage-record-metric dd {
+  margin: 0;
+  padding: 8px 10px;
+  min-width: 0;
+}
+
+.usage-record-metric dt {
+  color: var(--ink-2);
+}
+
+.usage-record-metric dd {
+  font-weight: 650;
+  text-align: right;
+}
+
+.usage-record-list {
+  display: grid;
+  gap: 8px;
+}
+
+.usage-record {
+  border: 1px solid var(--hair);
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--bg);
+  min-width: 0;
+}
+
+.usage-record-row-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ink-2);
+  font-size: 11px;
+}
+
+.usage-record-row-head strong {
+  color: var(--blue);
+}
+
+.usage-record h3 {
+  margin: 7px 0 4px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.usage-record code {
+  display: block;
+  color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-record p {
+  margin: 8px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--hair);
+  color: var(--ink-2);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .source-list {
@@ -2433,6 +2540,10 @@ input:disabled {
     grid-template-columns: 1fr;
   }
 
+  .usage-record-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .context-item,
   .history-item,
   .snippet,
@@ -2446,6 +2557,17 @@ input:disabled {
 
   .context-item code {
     white-space: normal;
+  }
+
+  .usage-record-row-head {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .usage-record code {
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   .table {

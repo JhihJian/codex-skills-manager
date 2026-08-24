@@ -3756,6 +3756,30 @@ def bounded_query_int(query: dict[str, list[str]], key: str, default: int, maxim
     return max(1, min(maximum, value))
 
 
+def skill_usage_details(name: str) -> dict[str, Any]:
+    name = safe_skill_name(name)
+    registry = read_registry_state()
+    if name not in registry.get("skills", {}):
+        raise ApiError("未找到该技能。", HTTPStatus.NOT_FOUND)
+    payload = usage_stats_service.read_stats()
+    entry = next((item for item in payload.get("entries", []) if item.get("name") == name), None)
+    if entry is None:
+        entry = {
+            "name": name,
+            **usage_stats_service.skill_summary(None),
+            "evidence": [],
+            "announcements": [],
+        }
+    return {
+        "skill": name,
+        "reviewedAt": payload.get("reviewedAt") or "",
+        "outdated": bool(payload.get("outdated")),
+        "entry": entry,
+        "evidencePolicy": payload.get("evidencePolicy") or "",
+        "scan": payload.get("scan") or {},
+    }
+
+
 def search_skill_contexts(name: str, query: dict[str, list[str]]) -> dict[str, Any]:
     name = safe_skill_name(name)
     registry = read_registry_state()
@@ -4008,7 +4032,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_json(install_skill(self.read_body()))
                 return True
 
-            skill_match = re.match(r"^/api/skills/([^/]+)(?:/(enable|disable|confirm|unconfirm|contexts|markdown|chinese-view|history|remote-diff|classify|localize))?$", path)
+            skill_match = re.match(r"^/api/skills/([^/]+)(?:/(enable|disable|confirm|unconfirm|usage|contexts|markdown|chinese-view|history|remote-diff|classify|localize))?$", path)
             if skill_match:
                 skill_name = skill_match.group(1)
                 action = skill_match.group(2)
@@ -4029,6 +4053,9 @@ class Handler(SimpleHTTPRequestHandler):
                     return True
                 if method == "GET" and action == "markdown":
                     self.send_json(read_skill_markdown(skill_name))
+                    return True
+                if method == "GET" and action == "usage":
+                    self.send_json(skill_usage_details(skill_name))
                     return True
                 if method == "GET" and action == "chinese-view":
                     self.send_json(get_chinese_skill_view(skill_name, include_markdown=True))

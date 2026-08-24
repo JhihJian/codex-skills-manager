@@ -3,7 +3,9 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+import app
 from usage_stats import UsageStatsService
 
 
@@ -162,6 +164,30 @@ class UsageStatsMultiSourceTests(unittest.TestCase):
             self.assertTrue(payload["outdated"])
             self.assertEqual(payload["version"], 2)
             self.assertIn("Codex 与 Pi", payload["evidencePolicy"])
+
+    def test_skill_usage_details_returns_cached_evidence(self) -> None:
+        cached = {
+            "version": 2,
+            "reviewedAt": "2026-08-24T00:00:00Z",
+            "entries": [
+                {
+                    "name": "demo",
+                    "confirmedEvidenceCount": 3,
+                    "confirmedSessionCount": 2,
+                    "evidence": [{"source": "pi", "type": "skill-file-read"}],
+                }
+            ],
+            "scan": {"sources": {"pi": {"scannedFiles": 1}}},
+            "evidencePolicy": "test",
+        }
+        with (
+            patch.object(app, "read_registry_state", return_value={"skills": {"demo": {}}}),
+            patch.object(app.usage_stats_service, "read_stats", return_value=cached),
+        ):
+            payload = app.skill_usage_details("demo")
+
+        self.assertEqual(payload["entry"]["confirmedEvidenceCount"], 3)
+        self.assertEqual(payload["entry"]["evidence"][0]["source"], "pi")
 
 
 if __name__ == "__main__":

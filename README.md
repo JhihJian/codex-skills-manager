@@ -13,6 +13,7 @@
 - 顶部“中文信息”按钮会为英文或中英混合的 skill 生成中文名称和中文触发条件，并保存到 registry 的本地化元数据；左侧可以在“中文/原文”视图间切换，详情页“中文”页签支持查看、生成和手动修正。该功能不修改原始 `SKILL.md`。
 - 安装或同步后会为 `SKILL.md` 自动生成完整中文阅读视图；详情页“中文原文”页签可查看或重新生成。译文只保存在管理器本地缓存，绝不会写入 skills 仓库、`.codex/skills` 或 Codex 实际加载的 skill。
 - 管理台可以展示技能使用频率。该功能已模块化为独立统计服务，可在“设置”页单独开启或关闭；开启后服务运行期间每天定时扫描一次本机 Codex 与 Pi 会话，结果缓存到 `data/usage-stats.json`。顶部“使用统计”按钮可手动刷新。
+- 技能列表会直接展示真实使用次数；详情页“使用记录”页签按需读取最近证据，显示 Codex/Pi 来源、会话标题、发生时间、日志位置和调用片段。
 - 管理台会自动计算当前已启用 skills 的惰性加载 token：顶部“预注入 token”只统计启动时注入的技能索引，详情页“来源”中同时显示索引 token 和触发后按需加载的完整 `SKILL.md` token。统计优先使用本机 `tiktoken` 的 `o200k_base`/`cl100k_base` 编码；未安装时使用中英文 Unicode 估算。
 - 用户点击“检索上下文”后读取本机 Codex 与 Pi 会话 JSONL，快速查看某个 skill 在会话中的上下文片段，用于判断技能是否有效；切换到上下文页不会自动扫描会话。检索结果会标明来源，优先展示按来源、事件和正文去重后的用户/助手正文，并过滤工具调用、函数调用输出、DOM 快照、浏览器自动化日志和长 JSON 工具输出等低价值片段。
 - 顶部“技能审查”入口会打开独立问题审查页，用于扩展多个 skills 常见问题审查项；当前支持按需扫描本机 Codex 与 Pi 会话 JSONL，识别长期未真实触发使用的技能。审查不会把系统注入的技能列表、用户普通提及或上下文关键词命中当作使用；助手执行的 `SKILL.md` 读取工具调用和 Pi `/skill:name` 命令加载计为真实使用证据，助手明确使用某技能的声明仅作为辅助证据。
@@ -300,6 +301,7 @@ Pi 会话目录按以下顺序确定：`CODEX_SKILL_PI_SESSIONS_DIR`、`PI_CODIN
 - `PUT /api/settings`：保存使用统计配置；请求体支持 `usageStats`，字段包括 `enabled`、`dailyEnabled`、`dailyHour`、`dailyMinute`、`staleDays`、`maxFiles`、`scope`、`includeSystem`。
 - `GET /api/usage-stats`：读取当前使用统计缓存。
 - `POST /api/usage-stats/refresh`：立即刷新使用统计缓存；请求体可覆盖 `staleDays`、`maxFiles`、`scope`、`includeSystem`。
+- `GET /api/skills/<skill-name>/usage`：读取单个技能的使用汇总和最近真实使用证据。
 - `GET /api/token-usage`：计算当前已启用 skills 的 `SKILL.md` token 占用。
 
 可用环境变量：

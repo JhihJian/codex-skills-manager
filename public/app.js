@@ -20,6 +20,9 @@ const state = {
   chineseViewCache: new Map(),
   chineseViewLoading: new Set(),
   contextSkill: null,
+  usageSkill: null,
+  usageCache: new Map(),
+  usageLoading: false,
   historySkill: null,
   historyCache: new Map(),
   historyLoading: false,
@@ -852,6 +855,7 @@ function renderRows() {
       row.append(rowMain, rowSide);
       meta.appendChild(badge(skill.category || "未分类"));
       meta.appendChild(badge(usageStatusLabel(usage.status), usageStatusTone(usage.status)));
+      if (usage.confirmedEvidenceCount) meta.appendChild(badge(usageCountText(usage), "blue"));
       if (skill.enabled && state.queue !== "pending") meta.appendChild(badge("启用", "green"));
       if (!skill.enabled && skillLifecycle(skill).lastDisabledAt) meta.appendChild(badge(disabledDurationLabel(skill), "orange"));
       if (skill.system) meta.appendChild(badge("系统", "orange"));
@@ -1233,6 +1237,107 @@ async function loadRemoteDiff(name) {
   );
 }
 
+function resetUsagePanel() {
+  state.usageSkill = null;
+  $("usageRecordMeta").textContent = "尚未读取";
+  $("usageRecordMetrics").replaceChildren();
+  $("usageRecordList").replaceChildren();
+  $("emptyUsageRecords").hidden = true;
+}
+
+function usageMetric(label, value) {
+  const group = document.createElement("div");
+  group.className = "usage-record-metric";
+  const dt = document.createElement("dt");
+  const dd = document.createElement("dd");
+  dt.textContent = label;
+  dd.textContent = value;
+  group.append(dt, dd);
+  return group;
+}
+
+function renderUsagePayload(skill, payload) {
+  if (selectedSkill()?.name !== skill.name) return;
+  const entry = payload?.entry || {};
+  const records = Array.isArray(entry.evidence) ? entry.evidence : [];
+  $("usageRecordMeta").textContent = payload.reviewedAt
+    ? `统计于 ${formatDateTime(payload.reviewedAt)} · 展示最近 ${records.length} 条`
+    : "使用统计尚未生成";
+  $("usageRecordMetrics").replaceChildren(
+    ...[
+      ["真实使用", `${entry.confirmedEvidenceCount || 0} 次`],
+      ["涉及会话", `${entry.confirmedSessionCount || 0} 个`],
+      ["使用天数", `${entry.confirmedDayCount || 0} 天`],
+      ["最近使用", formatRelativeUsage(entry)],
+    ].map(([label, value]) => usageMetric(label, value)),
+  );
+  $("emptyUsageRecords").hidden = records.length > 0;
+  $("usageRecordList").replaceChildren(
+    ...records.map((record) => {
+      const article = document.createElement("article");
+      article.className = "usage-record";
+      const head = document.createElement("div");
+      head.className = "usage-record-row-head";
+      const source = document.createElement("strong");
+      const sourceName = record.source === "pi" ? "Pi" : "Codex";
+      const eventType = record.type === "skill-command-load" ? "/skill 加载" : "SKILL.md 读取";
+      source.textContent = `${sourceName} · ${eventType}`;
+      const time = document.createElement("span");
+      time.textContent = formatDateTime(record.time) || "时间未知";
+      head.append(source, time);
+      const title = document.createElement("h3");
+      title.textContent = record.title || record.sessionId || "未命名会话";
+      const location = document.createElement("code");
+      location.textContent = `${record.path || ""}${record.line ? `:${record.line}` : ""}`;
+      const snippet = document.createElement("p");
+      snippet.textContent = record.snippet || "";
+      article.append(head, title, location, snippet);
+      return article;
+    }),
+  );
+}
+
+async function loadUsageDetails(force = false) {
+  const skill = selectedSkill();
+  if (!skill || state.usageLoading) return;
+  if (!force && state.usageCache.has(skill.name)) {
+    renderUsagePayload(skill, state.usageCache.get(skill.name));
+    return;
+  }
+  state.usageLoading = true;
+  $("usageRecordMeta").textContent = "正在读取";
+  try {
+    const payload = await api(`/api/skills/${encodeURIComponent(skill.name)}/usage`);
+    state.usageCache.set(skill.name, payload);
+    renderUsagePayload(skill, payload);
+  } finally {
+    state.usageLoading = false;
+  }
+}
+
+function renderUsageForSelected() {
+  const skill = selectedSkill();
+  if (!skill) {
+    resetUsagePanel();
+    return;
+  }
+  if (state.usageSkill !== skill.name) {
+    state.usageSkill = skill.name;
+    $("usageRecordMeta").textContent = "切换到使用记录页签后读取";
+    $("usageRecordMetrics").replaceChildren();
+    $("usageRecordList").replaceChildren();
+    $("emptyUsageRecords").hidden = true;
+  }
+  const cached = state.usageCache.get(skill.name);
+  if (cached) renderUsagePayload(skill, cached);
+  if (state.tab === "usage" && !cached && !state.usageLoading) {
+    loadUsageDetails().catch((error) => {
+      $("usageRecordMeta").textContent = error.message;
+      $("emptyUsageRecords").hidden = false;
+    });
+  }
+}
+
 function renderHistoryForSelected() {
   const skill = selectedSkill();
   if (!skill) {
@@ -1298,6 +1403,7 @@ function clearDetailDom() {
   $("sourceList").replaceChildren();
   $("dependencyGraph").replaceChildren();
   resetContextPanel();
+  resetUsagePanel();
   resetHistoryPanel();
   resetGithubSourcesPanel();
 }
@@ -1329,6 +1435,7 @@ function renderDetail() {
     $("contextResults").replaceChildren();
     $("emptyContexts").hidden = true;
   }
+  renderUsageForSelected();
   renderHistoryForSelected();
   $("detailTitle").textContent = displayTitle(skill);
   $("detailDescription").textContent = displayDescription(skill);
@@ -1639,6 +1746,7 @@ async function refreshUsageStats() {
       body: "{}",
     });
     state.data = await api("/api/state");
+    state.usageCache.clear();
     state.historyCache.clear();
     clearGithubSourcesCache();
     syncSelectionWithVisible();

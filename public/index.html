@@ -254,6 +254,7 @@
               <button class="active" data-tab="meta">资料</button>
               <button data-tab="localized">中文</button>
               <button data-tab="chineseView">中文原文</button>
+              <button data-tab="usage">使用记录</button>
               <button data-tab="history">版本</button>
               <button data-tab="contexts">上下文</button>
               <button data-tab="source">来源</button>
@@ -322,6 +323,18 @@
                 <div class="chinese-view-meta" id="chineseViewMeta">切换到此页签后生成或读取中文视图。</div>
                 <article class="preview markdown-preview" id="chineseSkillPreview" aria-label="中文 SKILL.md Markdown 视图"></article>
               </div>
+            </div>
+
+            <div class="tab-panel" id="tabUsage" hidden>
+              <div class="usage-record-head">
+                <div>
+                  <strong>真实使用记录</strong>
+                  <span id="usageRecordMeta">尚未读取</span>
+                </div>
+              </div>
+              <dl class="usage-record-metrics" id="usageRecordMetrics"></dl>
+              <div class="usage-record-list" id="usageRecordList"></div>
+              <div class="empty-state" id="emptyUsageRecords" hidden>没有发现真实使用记录</div>
             </div>
 
             <div class="tab-panel" id="tabHistory" hidden>
