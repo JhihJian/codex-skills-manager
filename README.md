@@ -337,6 +337,11 @@ Pi 会话目录按以下顺序确定：`CODEX_SKILL_PI_SESSIONS_DIR`、`PI_CODIN
 
 结果评审工作台位于 `http://127.0.0.1:8876/reviews.html`，包含加载检测、任务结果、人工队列、合同和指标五个视图。单案例详情按时间展示用户目标、技能加载、工具调用与结果、产物、确定性检查、assessment revision 和人工操作。
 
+相关设计文档：
+
+- [`docs/skill-outcome-review-design.md`](docs/skill-outcome-review-design.md)：技能结果评审总体设计。
+- [`docs/session-negative-feedback-design.md`](docs/session-negative-feedback-design.md)：会话负面反馈、过程异常、目标归属和解决闭环设计。
+
 ### 增量索引与结果模型
 
 `data/skill-effects.sqlite3` 保存规范事件、文件 generation、字节 checkpoint、provenance、Task Episode、Task Case、技能调用、归因、证据、检查、assessment 和人工追加记录。扫描器支持字节与时间预算；无变化文件从 checkpoint 继续，同尺寸替换、截断后增长、移动和删除会重建 generation 并使失去 provenance 的自动派生记录失效。人工裁决和审计记录继续保留。
