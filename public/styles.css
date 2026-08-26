@@ -2974,6 +2974,15 @@ input:disabled {
 .feedback-load-more {
   display: block;
   margin: 14px auto;
+  min-width: 180px;
+  min-height: 44px;
+}
+
+.feedback-evidence-pane .outcome-timeline-item .text-button {
+  grid-column: 2;
+  justify-self: start;
+  min-height: 32px;
+  white-space: nowrap;
 }
 
 .outcome-row-primary {
