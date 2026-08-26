@@ -247,7 +247,7 @@ async function renderFeedback(reset = true) {
     state.feedbackItems = [];
     state.feedbackNextCursor = null;
   }
-  const query = new URLSearchParams({ limit: "500" });
+  const query = new URLSearchParams({ limit: "100" });
   if (state.feedbackChannel) query.set("channel", state.feedbackChannel);
   if (state.feedbackSeverity) query.set("severity", state.feedbackSeverity);
   if (state.feedbackResolution) query.set("resolutionState", state.feedbackResolution);
@@ -382,6 +382,8 @@ async function openFeedback(signalId) {
     const item = timelineItem("目标", targetTitle(target), label(target.machine_status),
       `${label(target.relation)} · ${(Number(target.confidence || 0) * 100).toFixed(0)}%`);
     if (target.id === detail.current_confirmed_target_id) item.classList.add("confirmed-target");
+    const caseId = target.target_task_case_id || target.context_task_case_id;
+    if (caseId) item.append(actionButton("查看案例", () => openCase(caseId), "text-button"));
     evidence.append(item);
   }
   const history = element("section", "feedback-history-pane");
