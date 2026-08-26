@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 from auth import REDACTION_FAILED, redact_sensitive
+from feedback_detector import DETECTOR_VERSION as FEEDBACK_DETECTOR_VERSION
+from feedback_detector import detect_assistant_claims, detect_user_feedback
 
 
 ADAPTER_VERSION = "effect-adapters-v1"
@@ -156,6 +158,52 @@ def redact_value(value: Any, *, text_limit: int = DEFAULT_TEXT_LIMIT) -> Any:
                 return redact_value(parsed, text_limit=text_limit)
         return _redact_text(value, text_limit)
     return value
+
+
+def _feedback_candidates(content: Any, event_id: str) -> list[dict[str, Any]]:
+    try:
+        return [asdict(candidate) for candidate in detect_user_feedback(content, event_id=event_id)]
+    except (MemoryError, RecursionError, RuntimeError, TypeError, ValueError):
+        return []
+
+
+def _assistant_claims(content: Any, event_id: str) -> list[dict[str, Any]]:
+    try:
+        return [asdict(candidate) for candidate in detect_assistant_claims(content, event_id=event_id)]
+    except (MemoryError, RecursionError, RuntimeError, TypeError, ValueError):
+        return []
+
+
+def _process_details(value: Any, *, text_limit: int) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    selected: dict[str, Any] = {}
+    for key in ("mode", "agentScope", "projectAgentsDir", "status", "exitCode", "resultId", "childSessionId"):
+        if key in value:
+            selected[key] = value[key]
+    results: list[dict[str, Any]] = []
+    if isinstance(value.get("results"), list):
+        for result in value["results"]:
+            if not isinstance(result, Mapping):
+                continue
+            item = {
+                key: result[key] for key in (
+                    "agent", "agentSource", "exitCode", "stderr", "resultId",
+                    "childSessionId", "sessionId", "threadId", "status", "outcome",
+                    "error", "completed", "resultReturned",
+                ) if key in result
+            }
+            if isinstance(result.get("messages"), list):
+                item["messageCount"] = len(result["messages"])
+            if isinstance(result.get("usage"), Mapping):
+                item["usage"] = {
+                    key: result["usage"].get(key) for key in (
+                        "turns", "input", "output", "contextTokens"
+                    ) if key in result["usage"]
+                }
+            results.append(item)
+    selected["results"] = results
+    return redact_value(selected, text_limit=text_limit)
 
 
 def _canonical(value: Any) -> str:
@@ -403,6 +451,14 @@ def parse_codex_jsonl_line(
                     session_family=family,
                     role=role,
                     text=_text_content(payload.get("content"), text_limit=text_limit),
+                    metadata={
+                        "feedback_candidates": _feedback_candidates(payload.get("content"), payload_id)
+                        if role == "user" else [],
+                        "assistant_claims": _assistant_claims(payload.get("content"), payload_id)
+                        if role == "assistant" else [],
+                        "feedback_detector_version": FEEDBACK_DETECTOR_VERSION,
+                        "protocol_type": payload_type,
+                    },
                     fingerprint_payload=payload,
                 )
             ]
@@ -476,7 +532,12 @@ def parse_codex_jsonl_line(
                 session_family=family,
                 role=role,
                 text=_redact_text(text, text_limit),
-                metadata={"protocol_type": payload_type},
+                metadata={
+                    "protocol_type": payload_type,
+                    "feedback_candidates": _feedback_candidates(text, event_id) if role == "user" else [],
+                    "assistant_claims": _assistant_claims(text, event_id) if role == "assistant" else [],
+                    "feedback_detector_version": FEEDBACK_DETECTOR_VERSION,
+                },
                 fingerprint_payload=payload,
             )
         ]
@@ -556,6 +617,13 @@ def parse_pi_jsonl_line(
                 parent_id=parent_id,
                 role=role,
                 text=text,
+                metadata={
+                    "feedback_candidates": _feedback_candidates(content, item_id)
+                    if role == "user" else [],
+                    "assistant_claims": _assistant_claims(content, item_id)
+                    if role == "assistant" else [],
+                    "feedback_detector_version": FEEDBACK_DETECTOR_VERSION,
+                },
                 fingerprint_payload={"role": role, "content": content},
             )
         ]
@@ -637,6 +705,15 @@ def parse_pi_jsonl_line(
                 is_error=is_error,
                 is_cancelled=is_cancelled,
                 is_blocked=is_blocked,
+                metadata={
+                    "process_details": _process_details(message.get("details"), text_limit=text_limit),
+                    "outer_status": redact_value(
+                        {key: status_payload.get(key) for key in (
+                            "isError", "is_error", "error", "blocked", "cancelled", "status"
+                        ) if key in status_payload},
+                        text_limit=text_limit,
+                    ),
+                },
                 fingerprint_payload=message,
             )
         ]

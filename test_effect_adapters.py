@@ -8,6 +8,7 @@ from effect_adapters import (
     parse_codex_jsonl_line,
     parse_pi_jsonl_line,
 )
+from feedback_detector import detect_process_anomalies
 
 
 class EffectAdapterTests(unittest.TestCase):
@@ -72,6 +73,62 @@ class EffectAdapterTests(unittest.TestCase):
         self.assertLessEqual(len(events[0].text), 32)
         self.assertEqual((result.call_id, result.tool_name, result.outcome), ("pc1", "read", "blocked"))
         self.assertTrue(result.is_blocked)
+
+    def test_pi_feedback_candidates_and_subagent_details_are_preserved_safely(self) -> None:
+        user = parse_pi_jsonl_line({
+            "type": "message", "id": "feedback", "message": {
+                "role": "user", "content": [
+                    {"type": "text", "text": '<skill name="x" location="x/SKILL.md">测试失败</skill>'},
+                    {"type": "text", "text": "按钮还是没反应"},
+                ],
+            },
+        }, session_id="p", session_family="p")[0]
+        self.assertEqual(
+            [item["category"] for item in user.metadata["feedback_candidates"]],
+            ["observed-defect"],
+        )
+        assistant = parse_pi_jsonl_line({
+            "type": "message", "id": "assistant", "message": {
+                "role": "assistant", "content": "抱歉，我刚才判断错了。",
+            },
+        }, session_id="p", session_family="p")[0]
+        self.assertEqual(assistant.metadata["assistant_claims"][0]["channel"], "assistant-claim")
+        result = parse_pi_jsonl_line({
+            "type": "message", "id": "result", "message": {
+                "role": "toolResult", "toolCallId": "sub", "toolName": "functions.subagent",
+                "isError": False, "content": "Agent failed",
+                "details": {"mode": "parallel", "results": [{
+                    "agent": "designer", "agentSource": "unknown", "exitCode": 1,
+                    "stderr": "Unknown agent: designer. Available agents: reviewer, worker.",
+                    "messages": [], "usage": {"turns": 0, "input": 0, "output": 0},
+                }]},
+            },
+        }, session_id="p", session_family="p")[0]
+        details = result.metadata["process_details"]
+        self.assertEqual((details["mode"], details["results"][0]["agentSource"]), ("parallel", "unknown"))
+        self.assertEqual(details["results"][0]["messageCount"], 0)
+        self.assertEqual(details["results"][0]["usage"]["turns"], 0)
+
+    def test_projected_process_details_preserve_start_and_nested_failure(self) -> None:
+        result = parse_pi_jsonl_line({
+            "type": "message", "id": "result-contract", "message": {
+                "role": "toolResult", "toolCallId": "sub", "toolName": "functions.subagent",
+                "isError": False, "content": "done",
+                "details": {"mode": "parallel", "results": [{
+                    "agent": "worker", "agentSource": "user", "status": "failed",
+                    "messages": [{"role": "assistant", "content": "started"}],
+                    "usage": {"turns": 0},
+                }]},
+            },
+        }, session_id="p", session_family="p")[0]
+        details = result.metadata["process_details"]
+        found = detect_process_anomalies(
+            "functions.subagent", {"tasks": [{"agent": "worker"}]},
+            details, {"isError": False},
+        )
+        self.assertEqual(details["results"][0]["messageCount"], 1)
+        self.assertEqual(found[0].plan.started_count, 1)
+        self.assertIn("tool-error", [item.category for item in found])
 
     def test_parallel_wrapper_expands_nested_calls(self) -> None:
         events = parse_codex_jsonl_line({

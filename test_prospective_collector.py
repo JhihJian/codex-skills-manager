@@ -512,13 +512,17 @@ class ProspectiveCollectorTests(unittest.TestCase):
             ArtifactSelector(self.root, ("*.md",)), "after-artifacts",
             task_case_id=case["id"], observation_group_id="bound-cleanup",
         )
-        self.assertEqual(self.collector.materialize_cleanup_context(), 1)
+        self.assertEqual(self.collector.materialize_cleanup_context(), 2)
         with self.store.transaction():
             self.store.execute(
                 "UPDATE task_cases SET metadata_json=? WHERE id=?",
                 (json.dumps({"purged": True}), case["id"]),
             )
-        result = self.collector.cleanup(project_id="bound-project")
+        fresh_collector = ProspectiveCollector(
+            self.store, allowed_sources=["pi"], allowed_roots=[self.root],
+            collector_version="collector-test-1", environment={"profile": "test"},
+        )
+        result = fresh_collector.cleanup(project_id="bound-project")
         self.assertEqual(result["deletedEvents"], 1)
         self.assertEqual(result["deletedManifests"], 1)
         self.assertEqual(self.store.execute("SELECT COUNT(*) FROM prospective_events").fetchone()[0], 0)

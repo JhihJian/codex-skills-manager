@@ -131,6 +131,16 @@ class OutcomeReviewServiceTests(unittest.TestCase):
             "SELECT COUNT(*) FROM canonical_events WHERE orphaned=0"
         ).fetchone()[0], 0)
 
+    def test_pending_missing_result_derivation_keeps_scan_coverage_partial(self):
+        path = self.logs / "pending-missing.jsonl"
+        path.write_bytes(jsonl([self.pi_header("pending-missing"), self.pi_user(text="work")]))
+        with patch.object(
+            self.service, "_finalize_stale_missing_tool_results",
+            return_value={"processed": 1000, "signals": 1000, "pending": True},
+        ):
+            result = self.service.scan({"pi": path})
+        self.assertEqual((result["status"], result["coverage_status"]), ("partial", "partial"))
+
     def test_rewrite_removes_orphaned_machine_derived_records(self):
         path = self.logs / "derived.jsonl"
         base = [self.pi_header("derived"), self.pi_user(text="run")]
@@ -167,6 +177,98 @@ class OutcomeReviewServiceTests(unittest.TestCase):
         invocation = self.store.execute("SELECT load_status, skill_sha256 FROM skill_invocations").fetchone()
         self.assertEqual(tuple(invocation), ("result-missing", None))
         self.assertEqual(self.service.metric_snapshot_candidates(), [])
+
+    def test_deleted_generation_restores_invocation_episode_case_and_attribution(self):
+        skill = self.root / "skills" / "restored" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("# restored\n", encoding="utf-8")
+        path = self.logs / "restored.jsonl"
+        body = jsonl([
+            self.pi_header("restored-session"),
+            self.pi_user(text=(
+                f"完成业务任务\n<skill name=\"restored\" location=\"{skill}\">"
+                f"{skill.read_text()}</skill>"
+            )),
+        ])
+        path.write_bytes(body)
+        self.service.scan({"pi": self.logs})
+        invocation_id = self.store.execute("SELECT id FROM skill_invocations").fetchone()[0]
+        episode_id = self.store.execute("SELECT id FROM task_episodes").fetchone()[0]
+        case_id = self.store.execute("SELECT id FROM task_cases").fetchone()[0]
+
+        path.unlink()
+        self.service.scan({"pi": self.logs})
+        self.assertEqual(
+            self.store.execute("SELECT validity FROM skill_invocations WHERE id=?", (invocation_id,)).fetchone()[0],
+            "orphaned",
+        )
+        self.assertIsNotNone(self.store.execute(
+            "SELECT invalidated_at FROM task_episodes WHERE id=?", (episode_id,),
+        ).fetchone()[0])
+        self.assertIsNotNone(self.store.execute(
+            "SELECT invalidated_at FROM task_cases WHERE id=?", (case_id,),
+        ).fetchone()[0])
+
+        path.write_bytes(body)
+        self.service.scan({"pi": self.logs})
+        invocation = self.store.execute(
+            "SELECT validity FROM skill_invocations WHERE id=?", (invocation_id,),
+        ).fetchone()
+        episode = self.store.execute(
+            "SELECT invalidated_at FROM task_episodes WHERE id=?", (episode_id,),
+        ).fetchone()
+        case = self.store.execute(
+            "SELECT invalidated_at FROM task_cases WHERE id=?", (case_id,),
+        ).fetchone()
+        attribution = self.store.execute(
+            """SELECT status FROM attribution_links
+               WHERE task_case_id=? AND skill_invocation_id=?
+                 AND attribution_kind IN ('direct','shared','candidate')""",
+            (case_id, invocation_id),
+        ).fetchone()
+        self.assertEqual((invocation["validity"], episode["invalidated_at"], case["invalidated_at"], attribution["status"]),
+                         ("valid", None, None, "active"))
+        changes = self.store.execute(
+            """SELECT change_type FROM effect_derivation_changes
+               WHERE entity_id IN (?, ?) ORDER BY id""", (invocation_id, case_id),
+        ).fetchall()
+        self.assertIn("target-reactivated", [row["change_type"] for row in changes])
+        self.assertIn("case-reactivated", [row["change_type"] for row in changes])
+
+    def test_generation_restore_preserves_human_rejected_attribution_without_id_conflict(self):
+        skill = self.root / "skills" / "human-rejected" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("# human rejected\n", encoding="utf-8")
+        path = self.logs / "human-rejected.jsonl"
+        body = jsonl([
+            self.pi_header("human-rejected-session"),
+            self.pi_user(text=(
+                f"完成任务\n<skill name=\"human-rejected\" location=\"{skill}\">"
+                f"{skill.read_text()}</skill>"
+            )),
+        ])
+        path.write_bytes(body)
+        self.service.scan({"pi": self.logs})
+        original = self.store.execute(
+            "SELECT id, task_case_id, skill_invocation_id FROM attribution_links",
+        ).fetchone()
+        self.store.execute(
+            "UPDATE attribution_links SET attribution_kind='rejected', status='rejected' WHERE id=?",
+            (original["id"],),
+        )
+
+        path.unlink()
+        self.service.scan({"pi": self.logs})
+        path.write_bytes(body)
+        restored = self.service.scan({"pi": self.logs})
+        self.assertEqual(restored["failed_files"], 0, restored)
+        rows = self.store.execute(
+            """SELECT id, attribution_kind, status FROM attribution_links
+               WHERE task_case_id=? AND skill_invocation_id=? ORDER BY id""",
+            (original["task_case_id"], original["skill_invocation_id"]),
+        ).fetchall()
+        self.assertIn((original["id"], "rejected", "rejected"), [tuple(row) for row in rows])
+        self.assertIn(("direct", "active"), [(row["attribution_kind"], row["status"]) for row in rows])
 
     def test_codex_read_and_pi_invocation_capture_load_sha_and_direct_attribution(self):
         skill = self.root / "skills" / "demo" / "SKILL.md"
@@ -644,6 +746,142 @@ class OutcomeReviewServiceTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(edge), ("parent-agent", "child-agent", "subagent-result"))
 
+    def test_user_negative_followup_targets_previous_case_and_enters_feedback_queue(self):
+        path = self.logs / "negative-followup.jsonl"
+        path.write_bytes(jsonl([
+            self.pi_header("negative-followup"),
+            self.pi_user("goal", "实现权限校验"),
+            {"type": "message", "id": "answer", "timestamp": "2026-08-24T00:00:02Z",
+             "message": {"role": "assistant", "content": "已经完成。"}},
+            {"type": "message", "id": "feedback", "timestamp": "2026-08-24T00:00:03Z",
+             "message": {"role": "user", "content": "还是不行，权限校验漏了。"}},
+        ]))
+        scan = self.service.scan({"pi": path})
+        self.assertEqual(scan["feedback"]["newSignals"], 1)
+        signal = self.store.execute(
+            """SELECT s.*, r.category, r.channel FROM feedback_signals s
+               JOIN feedback_signal_revisions r ON r.id=s.current_machine_revision_id"""
+        ).fetchone()
+        self.assertEqual((signal["category"], signal["channel"]), ("requirement-gap", "user-feedback"))
+        target = self.store.execute(
+            "SELECT * FROM feedback_targets WHERE feedback_signal_id=?", (signal["id"],)
+        ).fetchone()
+        self.assertEqual((target["target_kind"], target["relation"]), ("assistant-result", "previous-episode-result"))
+        self.assertNotEqual(signal["feedback_case_id"], target["context_task_case_id"])
+        review = self.store.execute(
+            "SELECT * FROM review_tasks WHERE feedback_signal_id=?", (signal["id"],)
+        ).fetchone()
+        assessment = self.store.execute(
+            "SELECT * FROM outcome_assessments WHERE id=?", (review["assessment_id"],)
+        ).fetchone()
+        self.assertEqual(review["queue_reason"], "user-negative-feedback")
+        self.assertEqual(assessment["subject_key"], f"feedback:{signal['id']}")
+        self.assertEqual(self.service.get_case_detail(target["context_task_case_id"])["current_outcome"], None)
+
+    def test_pi_unknown_agent_outer_success_detects_zero_dispatch(self):
+        path = self.logs / "unknown-agent.jsonl"
+        call_id = "subagent-call"
+        path.write_bytes(jsonl([
+            self.pi_header("unknown-agent"), self.pi_user("goal", "并行评审"),
+            {"type": "message", "id": "call", "timestamp": "2026-08-24T00:00:02Z",
+             "message": {"role": "assistant", "content": [{"type": "toolCall", "id": call_id,
+                 "name": "functions.subagent", "arguments": {"tasks": [{"agent": "designer", "task": "review"}]}}]}},
+            {"type": "message", "id": "result", "timestamp": "2026-08-24T00:00:03Z",
+             "message": {"role": "toolResult", "toolCallId": call_id,
+                 "toolName": "functions.subagent", "isError": False,
+                 "content": [{"type": "text", "text": "Agent failed: Unknown agent: designer."}],
+                 "details": {"mode": "parallel", "results": [{"agent": "designer",
+                     "agentSource": "unknown", "exitCode": 1,
+                     "stderr": "Unknown agent: designer. Available agents: planner, reviewer, scout, worker.",
+                     "messages": [], "usage": {"turns": 0, "input": 0, "output": 0}}]}}},
+        ]))
+        self.service.scan({"pi": path})
+        rows = self.store.execute(
+            """SELECT r.category, r.channel, r.metadata_json FROM feedback_signal_revisions r
+               ORDER BY r.category"""
+        ).fetchall()
+        self.assertEqual([row["category"] for row in rows], ["agent-unavailable", "dispatch-not-executed"])
+        self.assertTrue(all(row["channel"] == "process-anomaly" for row in rows))
+        plans = [json.loads(row["metadata_json"])["plan"] for row in rows]
+        self.assertTrue(all((plan["planned_count"], plan["started_count"]) == (1, 0) for plan in plans))
+        self.assertEqual(self.store.execute(
+            "SELECT COUNT(*) FROM review_tasks WHERE feedback_signal_id IS NOT NULL AND status='open'"
+        ).fetchone()[0], 2)
+
+    def test_episode_boundary_detects_missing_tool_result(self):
+        path = self.logs / "missing-result-feedback.jsonl"
+        path.write_bytes(jsonl([
+            self.pi_header("missing-result"), self.pi_user("goal", "执行检查"),
+            {"type": "message", "id": "call", "timestamp": "2026-08-24T00:00:02Z",
+             "message": {"role": "assistant", "content": [{
+                 "type": "toolCall", "id": "missing-call", "name": "bash",
+                 "arguments": {"command": "run-check"},
+             }]}},
+            self.pi_user("follow-up", "继续处理"),
+        ]))
+        self.service.scan({"pi": path})
+        row = self.store.execute(
+            """SELECT r.category, r.channel FROM feedback_signal_revisions r
+               WHERE r.category='result-missing'"""
+        ).fetchone()
+        self.assertEqual(tuple(row), ("result-missing", "process-anomaly"))
+
+    def test_final_episode_missing_result_is_detected_and_late_result_resolves_it(self):
+        path = self.logs / "final-missing-result.jsonl"
+        items = [
+            self.pi_header("final-missing"), self.pi_user("goal", "执行检查"),
+            {"type": "message", "id": "call", "timestamp": "2026-08-24T00:00:02Z",
+             "message": {"role": "assistant", "content": [{
+                 "type": "toolCall", "id": "late-call", "name": "bash",
+                 "arguments": {"command": "run-check"},
+             }]}},
+        ]
+        path.write_bytes(jsonl(items))
+        scan = self.service.scan({"pi": path})
+        self.assertEqual(scan["feedback"]["missingResults"]["signals"], 1)
+        signal_id = self.store.execute(
+            """SELECT s.id FROM feedback_signals s JOIN feedback_signal_revisions r
+               ON r.id=s.current_machine_revision_id WHERE r.category='result-missing'"""
+        ).fetchone()[0]
+        late_result = {
+            "type": "message", "id": "late-result", "timestamp": "2026-08-24T00:10:00Z",
+            "message": {"role": "toolResult", "toolCallId": "late-call", "toolName": "bash",
+                        "content": "completed", "isError": False},
+        }
+        with path.open("ab") as handle:
+            handle.write(jsonl([late_result]))
+        self.service.scan({"pi": path})
+        signal = self.service.feedback.get_signal(signal_id)
+        self.assertEqual(signal["current_resolution_state"], "resolved-verified")
+        self.assertEqual(signal["actions"][-1]["reason_code"], "tool-result-arrived")
+        late_event_id = self.store.execute(
+            "SELECT id FROM canonical_events WHERE source_event_id='late-result'"
+        ).fetchone()[0]
+        with self.store.transaction():
+            self.store.execute("DELETE FROM event_provenance WHERE event_id=?", (late_event_id,))
+        self.service.feedback.process_changes()
+        reopened = self.service.feedback.get_signal(signal_id)
+        self.assertEqual((reopened["current_process_state"], reopened["current_resolution_state"]), ("queued", "unreviewed"))
+        self.assertEqual(reopened["actions"][-1]["reason_code"], "result-verification-lost")
+
+    def test_final_missing_result_without_protocol_timestamp_uses_created_time_grace(self):
+        path = self.logs / "missing-without-time.jsonl"
+        path.write_bytes(jsonl([
+            {"type": "session", "id": "missing-without-time"},
+            {"type": "message", "id": "goal", "message": {"role": "user", "content": "执行检查"}},
+            {"type": "message", "id": "call", "message": {"role": "assistant", "content": [{
+                "type": "toolCall", "id": "untimed-call", "name": "bash",
+                "arguments": {"command": "run-check"},
+            }]}},
+        ]))
+        self.service.scan({"pi": path})
+        result = self.service._finalize_stale_missing_tool_results(grace_seconds=0)
+        self.assertEqual(result["signals"], 1)
+        self.assertIsNotNone(self.store.execute(
+            """SELECT 1 FROM feedback_signal_revisions
+               WHERE category='result-missing' AND is_current=1"""
+        ).fetchone())
+
     def test_cleanup_purges_sensitive_derived_data_but_retains_manual_audit(self):
         _skill, invocation, case = self._scan_skill_case("cleanup")
         assessment = self.service.review_case(case, skill_invocation_id=invocation["id"])
@@ -726,6 +964,27 @@ class OutcomeReviewServiceTests(unittest.TestCase):
             "SELECT goal_text FROM task_episodes WHERE id=?", (invocation["task_episode_id"],)
         ).fetchone()
         self.assertIsNotNone(episode["goal_text"])
+
+    def test_older_than_cleanup_retains_old_case_with_recent_feedback_action(self):
+        _skill, _invocation, case = self._scan_skill_case("recent-feedback-retention")
+        with self.store.transaction():
+            self.store.execute(
+                "UPDATE task_cases SET created_at='2020-01-01T00:00:00Z' WHERE id=?", (case,),
+            )
+        event = self.store.upsert_event(
+            "recent-feedback-event", source="pi", session_family="recent-feedback-family",
+            event_type="user_message", payload_hash="recent-feedback-hash",
+            payload={"text": "这个结果完全不对", "metadata": {}},
+            protocol_time="2026-08-25T00:00:00Z",
+        )
+        self.service.feedback.derive_user_event(
+            event, case, {"previous_task_case_id": case},
+        )
+        result = self.service.cleanup_derived_data(older_than="2025-01-01T00:00:00Z")
+        self.assertEqual(result["cases"], 0)
+        self.assertIsNone(self.store.execute(
+            "SELECT invalidated_at FROM task_cases WHERE id=?", (case,)
+        ).fetchone()[0])
 
 
 if __name__ == "__main__":

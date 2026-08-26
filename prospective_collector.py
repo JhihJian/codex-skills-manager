@@ -137,6 +137,28 @@ def _validate_identifier(value: object, field: str, *, maximum: int = 256) -> st
     return value
 
 
+def validate_cleanup_criteria(
+    *, older_than: str | datetime | None = None,
+    project_id: str | None = None, skill_id: str | None = None,
+) -> dict[str, str | None]:
+    if older_than is None and project_id is None and skill_id is None:
+        raise CollectorValidationError("cleanup requires at least one filter")
+    cutoff_text: str | None = None
+    if isinstance(older_than, datetime):
+        if older_than.tzinfo is None or older_than.utcoffset() is None:
+            raise CollectorValidationError("older_than must include a timezone")
+        cutoff_text = older_than.astimezone(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+    elif older_than is not None:
+        _cutoff, cutoff_text = _parse_timestamp(older_than, "older_than")
+    return {
+        "olderThan": cutoff_text,
+        "projectId": _validate_identifier(project_id, "project_id") if project_id is not None else None,
+        "skillId": _validate_identifier(skill_id, "skill_id") if skill_id is not None else None,
+    }
+
+
 def _validate_json(value: Any, *, depth: int = 0, budget: list[int] | None = None) -> None:
     if budget is None:
         budget = [0]
@@ -266,7 +288,7 @@ class ProspectiveCollector:
         self.max_artifacts = self._positive_limit(max_artifacts, "max_artifacts")
         self.max_walk_entries = self._positive_limit(max_walk_entries, "max_walk_entries")
         self.environment_fingerprint = self._environment_fingerprint(environment)
-        self._cleanup_manifest_projects: dict[str, str] = {}
+
         self._ensure_audit_table()
 
     @staticmethod
@@ -697,8 +719,8 @@ class ProspectiveCollector:
                 """
                 INSERT INTO artifact_manifests(
                     id, task_case_id, phase, collector_version, environment_fingerprint,
-                    root_path_hash, manifest_json, manifest_sha256, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    root_path_hash, manifest_json, manifest_sha256, cleanup_project_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     row_id,
@@ -709,6 +731,7 @@ class ProspectiveCollector:
                     root_path_hash,
                     _canonical_json(manifest),
                     manifest_sha256,
+                    selected.project_id,
                     observed_at,
                 ),
             )
@@ -1158,21 +1181,16 @@ class ProspectiveCollector:
         project_id: str | None = None,
         skill_id: str | None = None,
     ) -> dict[str, Any]:
-        if older_than is None and project_id is None and skill_id is None:
-            raise CollectorValidationError("cleanup requires at least one filter")
-        cutoff: datetime | None = None
-        cutoff_text: str | None = None
-        if isinstance(older_than, datetime):
-            if older_than.tzinfo is None or older_than.utcoffset() is None:
-                raise CollectorValidationError("older_than must include a timezone")
-            cutoff = older_than.astimezone(timezone.utc)
-            cutoff_text = cutoff.isoformat(timespec="microseconds").replace("+00:00", "Z")
-        elif older_than is not None:
-            cutoff, cutoff_text = _parse_timestamp(older_than, "older_than")
-        if project_id is not None:
-            project_id = _validate_identifier(project_id, "project_id")
-        if skill_id is not None:
-            skill_id = _validate_identifier(skill_id, "skill_id")
+        normalized = validate_cleanup_criteria(
+            older_than=older_than, project_id=project_id, skill_id=skill_id,
+        )
+        cutoff_text = normalized["olderThan"]
+        cutoff = (
+            datetime.fromisoformat(cutoff_text.replace("Z", "+00:00"))
+            if cutoff_text else None
+        )
+        project_id = normalized["projectId"]
+        skill_id = normalized["skillId"]
 
         event_ids: list[str] = []
         manifest_ids: list[str] = []
@@ -1210,11 +1228,12 @@ class ProspectiveCollector:
                 if self._cleanup_matches(row["created_at"], context, cutoff, project_id, skill_id):
                     event_ids.append(row["id"])
             for row in self.store.execute(
-                "SELECT id, task_case_id, manifest_json, created_at FROM artifact_manifests"
+                """SELECT id, task_case_id, manifest_json, cleanup_project_id, created_at
+                   FROM artifact_manifests"""
             ).fetchall():
                 manifest = json.loads(row["manifest_json"])
                 selector = dict(manifest.get("selector", {})) if isinstance(manifest, dict) else {}
-                frozen_project = self._cleanup_manifest_projects.get(row["id"])
+                frozen_project = row["cleanup_project_id"]
                 if frozen_project and not selector.get("projectId"):
                     selector["projectId"] = frozen_project
                 if row["task_case_id"] and skill_id is not None and self.store.execute(
@@ -1299,7 +1318,12 @@ class ProspectiveCollector:
                 selector = manifest.get("selector") if isinstance(manifest, dict) else None
                 project_id = json.loads(row["metadata_json"]).get("projectId")
                 if isinstance(selector, dict) and not selector.get("projectId") and project_id:
-                    self._cleanup_manifest_projects[row["id"]] = project_id
+                    changed = self.store.execute(
+                        """UPDATE artifact_manifests SET cleanup_project_id=?
+                           WHERE id=? AND cleanup_project_id IS NULL""",
+                        (project_id, row["id"]),
+                    )
+                    updated += changed.rowcount
         return updated
 
     clear = cleanup

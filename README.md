@@ -348,6 +348,18 @@ Pi 会话目录按以下顺序确定：`CODEX_SKILL_PI_SESSIONS_DIR`、`PI_CODIN
 
 历史会话只有在日志中保存了精确且完整的 `SKILL.md` 内容时才绑定技能 SHA。Codex 完整读取结果和 Pi skill block 可提供该内容；带 offset/limit 或截断标记的 Codex 局部读取只记录加载成功，版本保持未知，当前工作区文件不会回填历史版本。加载失败、取消、阻止和结果缺失分别记录。技能审查、翻译、迁移和自测标记为维护调用并从业务归因排除；同一 Task Case 的后续技能默认记录为 shared。时间邻近、共享提交和纯文本相似只形成候选关系，不自动合并 Task Case。
 
+### 会话负面反馈
+
+工作台“负面反馈”视图分别展示用户反馈、过程异常和助手线索。确定性检测覆盖结果否定、持续故障、需求遗漏、返工纠正、过程批评，以及工具错误、阻止、超时、代理不可用、首轮计划未执行和部分并行执行。Pi `<skill>` 正文、引用日志、初始约束、取消指令、正向认可和助手自评使用独立来源口径。
+
+每条反馈保存脱敏 Span、机器 revision、目标候选和追加式 Action。高置信且目标明确的候选进入人工队列；用户 follow-up 即使形成新的 Task Case，也可通过上一助手结果和 session graph 指回被评价 Case。人工可领取、确认、标记误报、重新指向、记录修复、请求验证和关闭。后续用户明确认可或完整 Process Plan 重试可以形成已验证解决。
+
+反馈候选不会直接形成任务 hard failure，也不会直接计入技能失败率。正式反馈指标只纳入已确认或达到校准门槛的目标，冻结 scan、cutoff、机器 revision、Action revision、校准 profile 和 direct/shared 归因。覆盖 partial、目标歧义、证据失效和误报记录逐条排除。
+
+detector 升级时，截断的历史消息按 provenance 字节范围从配置会话根定向重解析，并校验 raw line hash、设备、inode、事件 ID 和 fingerprint。任何身份不一致都会保持 `needs-source-reparse`，同时阻止正式反馈快照。反馈快照还会校验当前配置的 scope fingerprint，并冻结 Span parser、目标解析器、语义模型 tuple 和实际 calibration profile。
+
+数据清理使用可恢复的 `cleanupRunId` 记录 materialize、feedback、outcome 和 prospective 阶段。中途失败可使用同一 ID重试，已完成结果和错误阶段保存在 SQLite；近期 Feedback revision/Action 与 shared 多技能 Case 受保留边界保护。
+
 ### 合同与结论
 
 Outcome Contract 存入 skills 仓库的 `codex-skills-manager.sqlite3`，按技能 ID、精确 SHA 和评审模式选择。每个技能版本只有一个 active 合同；发布版本不可修改。工作台提供 Gradle 和文档合同模板，也支持编辑自定义草稿。
@@ -369,6 +381,12 @@ Outcome Contract 存入 skills 仓库的 `codex-skills-manager.sqlite3`，按技
 主要接口：
 
 - `POST /api/effect-scan`：按预算增量扫描 Codex 与 Pi 会话。
+- `GET /api/feedback-signals`、`GET /api/feedback-signals/<id>`：筛选和读取反馈信号、目标及 Action 历史。
+- `POST /api/feedback-signals/<id>/claim`、`POST /api/feedback-signals/<id>/actions`：领取并处理反馈。
+- `POST /api/feedback-signals/<id>/semantic-classify`：显式运行本地语义复核；校准未达标时保持人工处理。
+- `GET /api/feedback-clusters`：读取已确认反馈的重复问题聚类。
+- `GET/POST /api/feedback-calibration-profiles`：读取或从人工语料生成校准 profile。
+- `GET/POST /api/feedback-metric-snapshots`：读取或封存不可变反馈指标。
 - `GET /api/effect-overview`、`GET /api/skill-use-events`：读取覆盖、加载和评审汇总。
 - `GET /api/task-cases/<id>`、`POST /api/task-cases/<id>/review`：读取带 Evidence ID、内容哈希和 generation/行号 locator 的案例证据，并生成 assessment revision。
 - `POST /api/task-cases/<id>/semantic-review`：使用本机 Codex 执行结构化语义评审并追加 assessment revision。

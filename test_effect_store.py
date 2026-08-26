@@ -32,6 +32,14 @@ class EffectStoreTests(unittest.TestCase):
             payload={"text": fingerprint},
         )
 
+    def test_rejects_database_from_newer_schema_version(self) -> None:
+        path = Path(self.tmp.name) / "future.sqlite3"
+        connection = sqlite3.connect(path)
+        connection.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+        connection.close()
+        with self.assertRaisesRegex(EffectStoreError, "newer than supported"):
+            EffectStore(path)
+
     def create_review(self) -> tuple[dict, dict, dict, dict]:
         actor = self.store.create_actor("Reviewer", roles=["reviewer", "admin"])
         case = self.store.create_task_case("case-1", task_type="coding")
@@ -122,6 +130,28 @@ class EffectStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(EffectStoreError, "schema does not match"):
             EffectStore(malformed_path)
 
+    def test_cross_version_migration_replaces_changed_managed_trigger(self) -> None:
+        path = Path(self.tmp.name) / "cross-version.sqlite3"
+        store = EffectStore(path)
+        store.close()
+        with sqlite3.connect(path) as connection:
+            connection.executescript(
+                """DROP TRIGGER provenance_insert_restores_event;
+                   CREATE TRIGGER provenance_insert_restores_event AFTER INSERT ON event_provenance
+                   BEGIN UPDATE canonical_events SET orphaned=0 WHERE id=NEW.event_id; END;"""
+            )
+            connection.execute(f"PRAGMA user_version={SCHEMA_VERSION - 1}")
+        migrated = EffectStore(path)
+        try:
+            trigger = migrated.execute(
+                """SELECT sql FROM sqlite_master WHERE type='trigger'
+                   AND name='provenance_insert_restores_event'"""
+            ).fetchone()[0]
+            self.assertIn("effect_derivation_changes", trigger)
+            self.assertEqual(migrated.pragma("user_version"), SCHEMA_VERSION)
+        finally:
+            migrated.close()
+
     def test_event_can_have_multiple_provenances_and_orphan_state_tracks_deletion(self) -> None:
         generation_1 = self.create_generation("g1")
         generation_2 = self.create_generation("g2")
@@ -144,6 +174,43 @@ class EffectStoreTests(unittest.TestCase):
         generation_3 = self.create_generation("g3")
         self.store.upsert_provenance(event["id"], generation_3["id"], 0)
         self.assertEqual(self.store.get_event(event["id"])["orphaned"], 0)
+
+    def test_same_raw_event_can_refresh_versioned_derived_payload(self) -> None:
+        first = self.store.upsert_event(
+            "payload-refresh", source="pi", session_family="family",
+            event_type="user_message", payload_hash="stable-raw-hash",
+            payload={"text": "same", "metadata": {"detector": "v1"}},
+        )
+        second = self.store.upsert_event(
+            "payload-refresh", source="pi", session_family="family",
+            event_type="user_message", payload_hash="stable-raw-hash",
+            payload={"text": "same", "metadata": {"detector": "v2"}},
+        )
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(second["payload"]["metadata"]["detector"], "v2")
+
+    def test_provenance_changes_emit_monotonic_feedback_derivation_events(self) -> None:
+        generation = self.create_generation("feedback-change")
+        event = self.create_event("feedback-change-event")
+        self.store.upsert_provenance(event["id"], generation["id"], 0)
+        inserted = self.store.execute(
+            "SELECT change_type, entity_id FROM effect_derivation_changes ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [row["change_type"] for row in inserted],
+            ["provenance-added", "event-reactivated"],
+        )
+        self.store.delete_generation(generation["id"])
+        changes = self.store.execute(
+            "SELECT id, change_type, entity_id FROM effect_derivation_changes ORDER BY id"
+        ).fetchall()
+        self.assertEqual([row["change_type"] for row in changes[:2]], ["provenance-added", "event-reactivated"])
+        self.assertEqual(
+            {row["change_type"] for row in changes[2:]},
+            {"provenance-removed", "event-orphaned"},
+        )
+        self.assertEqual([row["id"] for row in changes], sorted(row["id"] for row in changes))
+        self.assertTrue(all(row["entity_id"] == event["id"] for row in changes))
 
     def test_generation_deletion_does_not_delete_manual_decision(self) -> None:
         generation = self.create_generation()

@@ -1,4 +1,8 @@
-const state = { view: "loads", overview: null, selectedCase: null, skillFilter: "", busy: false };
+const state = {
+  view: "loads", overview: null, selectedCase: null, selectedFeedback: null,
+  skillFilter: "", feedbackChannel: "", feedbackSeverity: "",
+  feedbackResolution: "", feedbackItems: [], feedbackNextCursor: null, busy: false,
+};
 const $ = (id) => document.getElementById(id);
 
 function element(tag, className = "", text = "") {
@@ -28,9 +32,9 @@ function badge(text, tone = "") {
 }
 
 function toneFor(value) {
-  if (["pass", "assessable", "loaded", "complete", "active"].includes(value)) return "green";
-  if (["fail", "error", "blocked", "invalidated", "disputed"].includes(value)) return "red";
-  if (["partial", "needs-evidence", "unknown", "pending", "inconclusive", "exception-accepted"].includes(value)) return "orange";
+  if (["pass", "assessable", "loaded", "complete", "active", "resolved-verified"].includes(value)) return "green";
+  if (["fail", "error", "blocked", "invalidated", "disputed", "critical", "high", "action-required"].includes(value)) return "red";
+  if (["partial", "needs-evidence", "unknown", "pending", "inconclusive", "exception-accepted", "medium", "awaiting-verification", "fix-in-progress"].includes(value)) return "orange";
   return "";
 }
 
@@ -43,6 +47,30 @@ function label(value) {
     rejected: "已排除", "exception-accepted": "例外接受", disputed: "结论冲突",
     "resolved-by-correction": "已由纠正解决", "manual-decision": "人工裁决",
     "manual-disposition": "人工处置", automatic: "自动评审", exception: "业务例外",
+    "user-feedback": "用户反馈", "process-anomaly": "过程异常", "assistant-claim": "助手线索",
+    "result-rejection": "结果否定", "observed-defect": "故障反馈",
+    "requirement-gap": "需求遗漏", "rework-correction": "返工纠正",
+    "process-critique": "过程批评", "external-negative-acceptance": "外部拒绝",
+    "mixed-or-unclear": "混合评价", "agent-unavailable": "代理不可用",
+    "dispatch-not-executed": "计划未执行", "partial-dispatch": "部分执行",
+    "child-result-missing": "子结果缺失", "tool-error": "工具错误",
+    "tool-blocked": "工具阻止", "tool-timeout": "工具超时",
+    "task-result": "任务结果", "assistant-result": "助手结果",
+    "skill-invocation": "技能调用", "tool-call": "工具调用", "tool-result": "工具结果",
+    queued: "待处理", claimed: "已领取", triaged: "已确认", "action-required": "需要修复",
+    "fix-in-progress": "修复中", "awaiting-verification": "待验证", closed: "已关闭",
+    unreviewed: "未评审", "resolved-verified": "已验证解决",
+    "resolved-unverified": "未验证关闭", "false-positive": "误报",
+    duplicate: "重复", "not-actionable": "不可行动", critical: "严重", high: "高",
+    medium: "中", low: "低",
+    confirm: "确认反馈", exclude: "标记误报", retarget: "重新指向",
+    "mark-duplicate": "标记重复", "start-fix": "开始修复",
+    "request-verification": "请求验证", "resolve-verified": "验证解决",
+    "resolve-unverified": "未验证关闭", reopen: "重新打开", detected: "检测到",
+    superseded: "已替代", orphaned: "证据失效", reactivated: "证据恢复",
+    "target-disputed": "目标争议", "previous-episode-result": "上一轮结果",
+    "same-message-reference": "消息明确引用", "explicit-reference": "显式引用",
+    classified: "已分类", "needs-human": "需要人工",
     complete: "完整", partial_data: "部分数据", unknown: "未知",
   }[value] || value || "未知";
 }
@@ -69,7 +97,13 @@ function sectionHead(title, description = "") {
 function actionButton(text, action, className = "secondary-button") {
   const button = element("button", className, text);
   button.type = "button";
-  button.addEventListener("click", () => action().catch((error) => setStatus(error.message)));
+  button.addEventListener("click", async () => {
+    try {
+      await action();
+    } catch (error) {
+      setStatus(error.message);
+    }
+  });
   return button;
 }
 
@@ -169,6 +203,202 @@ async function renderOutcomes() {
   content.replaceChildren(head, table);
 }
 
+function feedbackTargetText(item) {
+  const identifier = item.skill_invocation_id || item.tool_call_id || item.tool_result_id
+    || item.target_task_case_id || item.context_task_case_id || "目标待确认";
+  return `${label(item.target_kind)} · ${String(identifier).slice(0, 12)}`;
+}
+
+function feedbackFilterBar() {
+  const bar = element("div", "outcome-filterbar feedback-filterbar");
+  const channel = element("select");
+  [["", "全部来源"], ["user-feedback", "用户反馈"], ["process-anomaly", "过程异常"]]
+    .forEach(([value, text]) => channel.append(new Option(text, value)));
+  channel.value = state.feedbackChannel;
+  const severity = element("select");
+  [["", "全部级别"], ["critical", "严重"], ["high", "高"], ["medium", "中"], ["low", "低"]]
+    .forEach(([value, text]) => severity.append(new Option(text, value)));
+  severity.value = state.feedbackSeverity;
+  const resolution = element("select");
+  [["", "全部状态"], ["unreviewed", "未评审"], ["action-required", "需要修复"],
+    ["fix-in-progress", "修复中"], ["awaiting-verification", "待验证"],
+    ["resolved-verified", "已验证解决"], ["false-positive", "误报"]]
+    .forEach(([value, text]) => resolution.append(new Option(text, value)));
+  resolution.value = state.feedbackResolution;
+  const apply = async () => {
+    state.feedbackChannel = channel.value;
+    state.feedbackSeverity = severity.value;
+    state.feedbackResolution = resolution.value;
+    await renderFeedback();
+  };
+  channel.addEventListener("change", () => apply().catch((error) => setStatus(error.message)));
+  severity.addEventListener("change", () => apply().catch((error) => setStatus(error.message)));
+  resolution.addEventListener("change", () => apply().catch((error) => setStatus(error.message)));
+  bar.append(channel, severity, resolution);
+  return bar;
+}
+
+async function renderFeedback(reset = true) {
+  const content = $("outcomeContent");
+  const head = sectionHead("会话负面反馈");
+  head.append(feedbackFilterBar());
+  content.replaceChildren(head, element("div", "loading-state", "正在读取反馈信号"));
+  if (reset) {
+    state.feedbackItems = [];
+    state.feedbackNextCursor = null;
+  }
+  const query = new URLSearchParams({ limit: "500" });
+  if (state.feedbackChannel) query.set("channel", state.feedbackChannel);
+  if (state.feedbackSeverity) query.set("severity", state.feedbackSeverity);
+  if (state.feedbackResolution) query.set("resolutionState", state.feedbackResolution);
+  if (!reset && state.feedbackNextCursor) query.set("cursor", state.feedbackNextCursor);
+  const payload = await api(`/api/feedback-signals?${query}`);
+  state.feedbackItems.push(...(payload.items || []));
+  state.feedbackNextCursor = payload.next_cursor || null;
+  const summary = state.overview?.feedback || {};
+  const band = element("section", "feedback-summary-band");
+  [["用户反馈", summary.user_feedback || 0], ["过程异常", summary.process_anomalies || 0],
+    ["待处理", summary.open || 0], ["待验证", summary.awaiting_verification || 0],
+    ["已解决", summary.resolved || 0], ["误报", summary.false_positives || 0]]
+    .forEach(([name, value]) => {
+      const metric = element("div", "feedback-summary-item");
+      metric.append(element("span", "", name), element("strong", "", value));
+      band.append(metric);
+    });
+  const table = element("div", "outcome-table feedback-table");
+  table.append(element("div", "outcome-table-head", "评价 / 类别 / 状态 / 目标 / 时间"));
+  for (const item of state.feedbackItems) {
+    const row = element("div", "outcome-table-row feedback-row");
+    const primary = element("div", "feedback-primary");
+    primary.append(element("strong", "", item.redacted_excerpt || "正文已清理"));
+    primary.append(element("span", "outcome-mono", `${label(item.channel)} · ${(item.confidence * 100).toFixed(0)}%`));
+    const classification = element("div", "feedback-badges");
+    classification.append(badge(label(item.category)), badge(label(item.severity), toneFor(item.severity)));
+    const status = element("div", "feedback-badges");
+    status.append(badge(label(item.current_process_state), toneFor(item.current_process_state)));
+    status.append(badge(label(item.current_resolution_state), toneFor(item.current_resolution_state)));
+    row.append(primary, classification, status, element("span", "", feedbackTargetText(item)),
+      element("time", "", dateText(item.observed_at)),
+      actionButton("查看", async () => openFeedback(item.id), "text-button"));
+    table.append(row);
+  }
+  if (!state.feedbackItems.length) table.append(element("div", "empty-state", "当前筛选条件下没有反馈信号。"));
+  if (state.feedbackNextCursor) {
+    table.append(actionButton("加载更多", () => renderFeedback(false), "secondary-button feedback-load-more"));
+  }
+  content.replaceChildren(head, band, table);
+}
+
+function targetTitle(target) {
+  const identifier = target.skill_invocation_id || target.tool_call_id || target.tool_result_id
+    || target.target_event_id || target.target_task_case_id || "未知";
+  return `${label(target.target_kind)} · ${String(identifier).slice(0, 16)}`;
+}
+
+function feedbackActionPanel(detail) {
+  const panel = element("section", "feedback-action-panel");
+  const revision = detail.current_action_revision;
+  const review = detail.review_task;
+  const currentTargets = (detail.targets || []).filter((item) => item.machine_status === "candidate");
+  const targetSelect = element("select");
+  currentTargets.forEach((target) => targetSelect.append(new Option(targetTitle(target), target.id)));
+  const reason = element("input");
+  reason.placeholder = "原因代码";
+  reason.value = "feedback-reviewed";
+  const actorId = window.skillAuth.state.actor?.uuid;
+  if (review?.claimed_by_actor_id && review.claimed_by_actor_id !== actorId) {
+    panel.append(element("p", "outcome-muted", "该反馈已由其他评审者领取。"));
+    return panel;
+  }
+  if (review && !review.claimed_by_actor_id && review.status === "open") {
+    panel.append(actionButton("领取", async () => {
+      await api(`/api/feedback-signals/${detail.id}/claim`, {
+        method: "POST", body: JSON.stringify({ expectedRevision: revision }),
+      });
+      await openFeedback(detail.id);
+    }, "primary-button"));
+    return panel;
+  }
+  panel.append(actionButton("语义复核", async () => {
+    await api(`/api/feedback-signals/${detail.id}/semantic-classify`, {
+      method: "POST", body: "{}",
+    });
+    await openFeedback(detail.id);
+  }));
+  const submit = async (action, binding = {}) => {
+    await api(`/api/feedback-signals/${detail.id}/actions`, {
+      method: "POST", body: JSON.stringify({
+        expectedRevision: revision, action, reasonCode: reason.value.trim(),
+        targetId: targetSelect.value || null, binding,
+      }),
+    });
+    await Promise.all([loadOverview(), openFeedback(detail.id)]);
+  };
+  const row = element("div", "outcome-action-row");
+  row.append(reason);
+  if (["queued", "claimed", "candidate", "triaged"].includes(detail.current_process_state)) {
+    if (currentTargets.length) row.append(targetSelect, actionButton("确认", () => submit("confirm"), "primary-button"));
+    if (currentTargets.length > 1) row.append(actionButton("重新指向", () => submit("retarget")));
+    row.append(actionButton("误报", () => submit("exclude"), "secondary-button danger-button"));
+    row.append(actionButton("重复", () => submit("mark-duplicate")));
+  }
+  if (detail.current_resolution_state === "action-required") row.append(actionButton("开始修复", () => submit("start-fix"), "primary-button"));
+  if (detail.current_resolution_state === "fix-in-progress") row.append(actionButton("请求验证", () => submit("request-verification"), "primary-button"));
+  if (detail.current_resolution_state === "awaiting-verification") {
+    const verification = element("input"); verification.placeholder = "验证 Evidence ID";
+    row.append(verification, actionButton("验证解决", () => {
+      const evidenceId = verification.value.trim();
+      if (!evidenceId) throw new Error("请输入验证 Evidence ID");
+      return submit("resolve", { evidenceId });
+    }, "primary-button"));
+    row.append(actionButton("未验证关闭", () => submit("resolve-unverified")));
+  }
+  if (["resolved-verified", "resolved-unverified", "false-positive", "duplicate", "not-actionable"].includes(detail.current_resolution_state)) {
+    row.append(actionButton("重新打开", () => submit("reopen")));
+  }
+  panel.append(row);
+  return panel;
+}
+
+async function openFeedback(signalId) {
+  state.selectedFeedback = signalId;
+  state.selectedCase = null;
+  const content = $("outcomeContent");
+  content.replaceChildren(element("div", "loading-state", "正在读取反馈详情"));
+  const detail = await api(`/api/feedback-signals/${encodeURIComponent(signalId)}`);
+  const current = (detail.machine_revisions || []).find((item) => item.is_current)
+    || detail.machine_revisions?.at(-1) || {};
+  const head = sectionHead(label(current.category), current.redacted_excerpt || "正文已清理");
+  head.append(actionButton("返回", async () => {
+    state.selectedFeedback = null;
+    await renderFeedback();
+  }, "text-button"));
+  const layout = element("div", "feedback-detail-layout");
+  const evidence = element("section", "feedback-evidence-pane");
+  evidence.append(element("h2", "", "信号与目标"));
+  evidence.append(timelineItem(label(current.channel), label(current.severity), dateText(current.observed_at),
+    `置信度 ${(Number(current.confidence || 0) * 100).toFixed(0)}% · ${current.detector_version}`));
+  for (const target of detail.targets || []) {
+    const item = timelineItem("目标", targetTitle(target), label(target.machine_status),
+      `${label(target.relation)} · ${(Number(target.confidence || 0) * 100).toFixed(0)}%`);
+    if (target.id === detail.current_confirmed_target_id) item.classList.add("confirmed-target");
+    evidence.append(item);
+  }
+  const history = element("section", "feedback-history-pane");
+  history.append(element("h2", "", "处理记录"));
+  for (const action of detail.actions || []) history.append(timelineItem(
+    label(action.action), action.reason_code, dateText(action.created_at),
+    `${label(action.from_resolution_state)} → ${label(action.to_resolution_state)}`,
+  ));
+  for (const review of detail.semantic_reviews || []) history.append(timelineItem(
+    "语义", label(review.verdict), dateText(review.created_at),
+    `${label(review.category)} · ${(Number(review.confidence || 0) * 100).toFixed(0)}% · ${review.model_version}`,
+  ));
+  history.append(feedbackActionPanel(detail));
+  layout.append(evidence, history);
+  content.replaceChildren(head, layout);
+}
+
 async function renderQueue() {
   const content = $("outcomeContent");
   const head = sectionHead("人工评审队列", "证据不足、适用性未知、确定性失败和冲突案例在此处理。");
@@ -178,11 +408,15 @@ async function renderQueue() {
   table.append(element("div", "outcome-table-head", "技能 / 队列原因 / 自动结论 / 操作"));
   for (const item of payload.items || []) {
     const row = element("div", "outcome-table-row queue-row");
-    row.append(element("strong", "", item.skill_id || "技能版本未知"));
+    row.append(element("strong", "", item.feedback_signal_id ? "会话负面反馈" : (item.skill_id || "技能版本未知")));
     row.append(badge(label(item.queue_reason), "orange"));
     row.append(badge(label(item.automated_verdict), toneFor(item.automated_verdict)));
     row.append(element("span", "", item.task_type || "任务类型未知"));
     row.append(actionButton(item.claimed_by_actor_id ? "继续评审" : "领取并评审", async () => {
+      if (item.feedback_signal_id) {
+        await openFeedback(item.feedback_signal_id);
+        return;
+      }
       if (!item.claimed_by_actor_id) {
         await api(`/api/review-tasks/${item.id}/claim`, { method: "POST", body: "{}" });
       }
@@ -211,7 +445,9 @@ async function submitReview(caseId, invocationId) {
 
 function reviewActions(detail) {
   const panel = element("div", "outcome-action-panel");
-  const current = [...(detail.assessments || [])].reverse().find((item) => item.is_current);
+  const current = [...(detail.assessments || [])].reverse().find(
+    (item) => item.is_current && !String(item.subject_key || "").startsWith("feedback:"),
+  );
   const task = (detail.review_tasks || []).find((item) => current && item.assessment_id === current.id);
   const invocation = (detail.invocations || []).find((item) => item.load_status === "loaded" && item.validity === "valid");
   const row = element("div", "outcome-action-row");
@@ -282,6 +518,7 @@ function reviewActions(detail) {
 
 async function openCase(caseId) {
   state.selectedCase = caseId;
+  state.selectedFeedback = null;
   const content = $("outcomeContent");
   content.replaceChildren(element("div", "loading-state", "正在读取案例证据"));
   const detail = await api(`/api/task-cases/${encodeURIComponent(caseId)}`);
@@ -298,6 +535,16 @@ async function openCase(caseId) {
     "语义", review.id, dateText(review.created_at),
     `${label(review.verdict)} · assessment ${review.assessment_id?.slice(0, 8) || "未知"} · ${review.model_version}`,
   ));
+  for (const feedback of detail.feedback || []) {
+    const revision = (feedback.machine_revisions || []).find((item) => item.is_current) || {};
+    const item = timelineItem(
+      label(revision.channel), label(revision.category), dateText(revision.observed_at),
+      `${revision.redacted_excerpt || "正文已清理"} · ${label(feedback.current_resolution_state)}`,
+    );
+    item.classList.add("feedback-timeline-item");
+    item.addEventListener("click", () => openFeedback(feedback.id).catch((error) => setStatus(error.message)));
+    timeline.append(item);
+  }
   for (const evidence of detail.evidence || []) {
     const locator = evidence.locator?.line ? `generation ${shortSha(evidence.locator.generationId)} · line ${evidence.locator.line}` : JSON.stringify(evidence.locator || {});
     timeline.append(timelineItem("证据", evidence.evidenceId, dateText(evidence.observedAt), `${shortSha(evidence.contentHash)} · ${locator}`));
@@ -410,9 +657,11 @@ async function renderMetrics() {
 
 async function renderView() {
   document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
+  if (state.selectedFeedback) return openFeedback(state.selectedFeedback);
   if (state.selectedCase) return openCase(state.selectedCase);
   if (state.view === "loads") return renderLoads();
   if (state.view === "outcomes") return renderOutcomes();
+  if (state.view === "feedback") return renderFeedback();
   if (state.view === "queue") return renderQueue();
   if (state.view === "contracts") return renderContracts();
   return renderMetrics();
@@ -425,7 +674,7 @@ async function runScan() {
   setStatus("正在增量扫描会话");
   try {
     const scan = await api("/api/effect-scan", { method: "POST", body: JSON.stringify({ budgetBytes: 268435456, budgetSeconds: 20 }) });
-    setStatus(`扫描完成：索引 ${scan.indexed_files} 个文件，待处理 ${scan.pending_files} 个`);
+    setStatus(`扫描完成：索引 ${scan.indexed_files} 个文件，新增反馈 ${scan.feedback?.newSignals || 0} 条`);
     await loadOverview();
     await renderView();
   } finally {
@@ -437,6 +686,7 @@ async function runScan() {
 document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => {
   state.view = button.dataset.view;
   state.selectedCase = null;
+  state.selectedFeedback = null;
   renderView().catch((error) => setStatus(error.message));
 }));
 $("effectScanButton").addEventListener("click", () => runScan().catch((error) => setStatus(error.message)));

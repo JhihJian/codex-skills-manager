@@ -2,10 +2,20 @@
 
 ## 文档状态
 
-- 状态：设计完成，待实施
+- 状态：已实现
 - 目标读者：产品负责人、架构维护者、后端与前端开发者、评审规则维护者
 - 关联设计：[`skill-outcome-review-design.md`](./skill-outcome-review-design.md)
 - 适用系统：Codex Skills Manager 的 Codex/Pi 会话效果索引与结果评审工作台
+
+实现入口：
+
+- `feedback_detector.py`：内容来源、确定性反馈规则与过程异常计划。
+- `feedback_service.py`：机器 revision、目标、Action、队列、聚类、派生恢复、清理和快照。
+- `feedback_semantic_classifier.py`：严格 schema 的本地语义分类与校准门禁。
+- `effect_store.py`：schema v7、派生变更流和不可变反馈指标。
+- `outcome_reviews.py`：扫描、跨 Case 目标上下文和 Case 详情投影。
+- `app.py`、`public/reviews.*`：认证 API 与负面反馈工作台。
+- `scripts/benchmark-feedback.py`：规模化存储和查询性能验收。
 
 ## 1. 摘要
 
@@ -827,6 +837,8 @@ candidate
 
 误报通过 correction 和 Feedback Action 追加记录。规则抑制范围扩大到其他信号时，需要独立治理和回归语料验证。
 
+人工 Action 的 `reasonCode` 仅接受最多 64 字符的小写字母、数字和短横线机器标识。自由文本、路径和凭据只能进入先脱敏且可治理清理的备注字段。
+
 ## 16. API 设计
 
 ### 16.1 查询接口
@@ -880,7 +892,7 @@ POST /api/feedback-detector/rebuild
     "queuedSignals": 0,
     "processAnomalies": 0,
     "pending": false,
-    "detectorVersion": "feedback-v1"
+    "detectorVersion": "feedback-v5"
   }
 }
 ```
@@ -1300,6 +1312,8 @@ reason code、actor、revision、分类版本和哈希审计摘要继续保留�
 | N8 | 语义分类、校准、不可变反馈快照和清理 | N3-N7 | 校准语料、scan/cutoff/revision 冻结、缓存/导出/备份清理测试 |
 
 工作包完成顺序由依赖关系约束。每个工作包都需要可运行的纵向测试，机器候选、人工动作和正式指标保持独立验收。
+
+当前实现已覆盖 N1-N8。自动高优先级语义准入继续受黄金语料门槛控制；本机样本未达到门槛时，语义输出保存为 `needs-human`。
 
 ## 25. 设计取舍
 

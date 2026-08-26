@@ -13,7 +13,7 @@ import time
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from auth import REDACTED, redact_sensitive
@@ -24,6 +24,7 @@ from effect_adapters import (
     parse_jsonl_line,
 )
 from effect_store import EffectStore, EffectStoreError, RevisionConflict
+from feedback_service import FeedbackService
 from outcome_contracts import OutcomeContractInterpreter, OutcomeContractStore
 from semantic_reviewer import SCHEMA_VERSION as SEMANTIC_SCHEMA_VERSION
 
@@ -134,6 +135,7 @@ class OutcomeReviewService:
         self.skill_roots = tuple(Path(root).expanduser().resolve() for root in skill_roots)
         self.parser_version = str(parser_version)
         self.interpreter = OutcomeContractInterpreter()
+        self.feedback = FeedbackService(self.store)
     def close(self) -> None:
         if self._owns_store:
             self.store.close()
@@ -190,6 +192,7 @@ class OutcomeReviewService:
                 )),
             },
         )
+        feedback_before = self.store.execute("SELECT COUNT(*) FROM feedback_signals").fetchone()[0]
         started = time.monotonic()
         files, scopes, discovery_errors = self._discover(entries)
         indexed_files = indexed_bytes = failed_files = 0
@@ -216,7 +219,17 @@ class OutcomeReviewService:
                 self._cleanup_failed_generation(run["id"], source, path)
                 failed_files += 1
                 errors.append({"source": source, "file": path.name, "error": type(exc).__name__, "message": str(exc)[:300]})
-        complete_enumeration = not discovery_errors and pending_files == 0 and failed_files == 0
+        remaining_seconds = (
+            max(0.0, float(seconds) - (time.monotonic() - started))
+            if seconds is not None else 1.0
+        )
+        missing_results = self._finalize_stale_missing_tool_results(
+            max_seconds=min(1.0, remaining_seconds)
+        )
+        complete_enumeration = (
+            not discovery_errors and pending_files == 0 and failed_files == 0
+            and not missing_results["pending"]
+        )
         if complete_enumeration:
             self._delete_missing(scopes, discovered_paths)
         self._derive_candidate_attributions()
@@ -232,6 +245,18 @@ class OutcomeReviewService:
             coverage_status="complete" if complete_enumeration else "partial",
             errors=errors,
         )
+        feedback_state = self.feedback.process_changes(
+            max_changes=5000,
+            max_seconds=min(2.0, max(0.0, float(seconds))) if seconds is not None else 2.0,
+            last_scan_run_id=run["id"],
+        )
+        feedback_after = self.store.execute("SELECT COUNT(*) FROM feedback_signals").fetchone()[0]
+        finished["feedback"] = {
+            **feedback_state,
+            "newSignals": max(0, feedback_after - feedback_before),
+            "missingResults": missing_results,
+            "overview": self.feedback.overview(),
+        }
         return _safe_public(finished)
     scan_incremental = scan
     def _source_entries(self, sources: Mapping[str, Any] | Iterable[Any]) -> list[tuple[str, Path]]:
@@ -435,7 +460,7 @@ class OutcomeReviewService:
                         canonical_event = self._persist_event(
                             event, generation["id"], complete_offset,
                             complete_offset + len(raw_line), line_number + completed_lines + 1,
-                            scan_run_id,
+                            scan_run_id, raw_line_sha256=hashlib.sha256(raw_line).hexdigest(),
                         )
                         if canonical_event["event_fingerprint"] != event.fingerprint:
                             event = replace(event, fingerprint=canonical_event["event_fingerprint"])
@@ -636,19 +661,33 @@ class OutcomeReviewService:
         with self.store.transaction():
             for row in rows:
                 exists = self.store.execute(
-                    """SELECT 1 FROM attribution_links WHERE task_case_id=? AND skill_invocation_id=?
+                    """SELECT id, status FROM attribution_links WHERE task_case_id=? AND skill_invocation_id=?
                        AND attribution_kind='candidate' LIMIT 1""",
                     (row["task_case_id"], row["skill_invocation_id"]),
                 ).fetchone()
                 if exists is None:
+                    rejected_ids = tuple(row["id"] for row in self.store.execute(
+                        """SELECT id FROM attribution_links
+                           WHERE task_case_id=? AND skill_invocation_id=?
+                             AND attribution_kind='rejected' AND status='rejected'
+                           ORDER BY id""",
+                        (row["task_case_id"], row["skill_invocation_id"]),
+                    ).fetchall())
                     self.store.execute(
                         """INSERT INTO attribution_links(id, task_case_id, skill_invocation_id,
                                attribution_kind, confidence, status, created_at)
                            VALUES (?, ?, ?, 'candidate', 0.5, 'active', ?)""",
                         (
-                            _stable_id("candidate-attribution", row["task_case_id"], row["skill_invocation_id"], row["edge_id"]),
+                            _stable_id(
+                                "candidate-attribution-v2", row["task_case_id"],
+                                row["skill_invocation_id"], row["edge_id"], rejected_ids,
+                            ),
                             row["task_case_id"], row["skill_invocation_id"], now,
                         ),
+                    )
+                elif exists["status"] == "rejected":
+                    self.store.execute(
+                        "UPDATE attribution_links SET status='active' WHERE id=?", (exists["id"],),
                     )
     # --------------------------------------------------------------- derivation
     def _persist_event(
@@ -659,6 +698,7 @@ class OutcomeReviewService:
         byte_end: int,
         line_number: int,
         scan_run_id: str,
+        raw_line_sha256: str | None = None,
     ) -> dict[str, Any]:
         payload = {
             "role": event.role, "text": event.text, "tool_name": event.tool_name,
@@ -685,7 +725,10 @@ class OutcomeReviewService:
         )
         self.store.upsert_provenance(
             stored["id"], generation_id, byte_start, byte_end=byte_end,
-            line_number=line_number, locator={"line": line_number, "source": event.source},
+            line_number=line_number, locator={
+                "line": line_number, "source": event.source,
+                "rawLineSha256": raw_line_sha256,
+            },
         )
         return stored
     def _derive(self, event: NormalizedEvent, stored: Mapping[str, Any]) -> None:
@@ -705,17 +748,18 @@ class OutcomeReviewService:
         self._derive_edge(event, stored["id"], session_id)
         episode = None
         if event.event_type == "user_message":
+            self._finalize_missing_tool_results(session_id)
             episode_fp = _stable_id("episode", event.source, family, source_session_id, event.fingerprint)
             episode_id = episode_fp
             now = _now()
             self.store.execute(
-                """INSERT INTO task_episodes( id, episode_fingerprint, session_id, start_event_id, end_event_id, goal_text, process_state, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'indexed', '{}', ?, ?) ON CONFLICT(episode_fingerprint) DO UPDATE SET end_event_id=excluded.end_event_id, goal_text=COALESCE(task_episodes.goal_text, excluded.goal_text), updated_at=excluded.updated_at""",
+                """INSERT INTO task_episodes( id, episode_fingerprint, session_id, start_event_id, end_event_id, goal_text, process_state, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'indexed', '{}', ?, ?) ON CONFLICT(episode_fingerprint) DO UPDATE SET start_event_id=excluded.start_event_id, end_event_id=excluded.end_event_id, goal_text=COALESCE(task_episodes.goal_text, excluded.goal_text), updated_at=excluded.updated_at""",
                 (episode_id, episode_fp, session_id, stored["id"], stored["id"], event.text, now, now),
             )
             episode = self.store.execute("SELECT * FROM task_episodes WHERE episode_fingerprint = ?", (episode_fp,)).fetchone()
         else:
             episode = self.store.execute(
-                "SELECT * FROM task_episodes WHERE session_id = ? AND invalidated_at IS NULL ORDER BY created_at DESC LIMIT 1",
+                "SELECT * FROM task_episodes WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
                 (session_id,),
             ).fetchone()
         if episode is None and event.event_type not in {"session_meta", "session_info"}:
@@ -729,8 +773,20 @@ class OutcomeReviewService:
         if episode is None:
             return
         self.store.execute("UPDATE task_episodes SET end_event_id = ?, updated_at = ? WHERE id = ?", (stored["id"], _now(), episode["id"]))
+        self._restore_episode_if_live(episode["id"])
+        episode = self.store.execute("SELECT * FROM task_episodes WHERE id=?", (episode["id"],)).fetchone()
         case = self._ensure_case(episode)
         self._derive_facts(case, event, stored["id"])
+        feedback_event = {
+            **event.to_dict(), "id": stored["id"],
+            "event_fingerprint": stored["event_fingerprint"],
+            "protocol_time": event.timestamp or None,
+            "created_at": stored["created_at"],
+        }
+        if event.event_type == "user_message":
+            self.feedback.derive_user_event(feedback_event, case["id"])
+        elif event.event_type == "assistant_message":
+            self.feedback.derive_assistant_event(feedback_event, case["id"])
         if event.event_type == "tool_call":
             self._derive_tool_call(case, episode, event, stored)
         elif event.event_type == "tool_result":
@@ -739,6 +795,87 @@ class OutcomeReviewService:
             spec = self._skill_spec(event)
             if spec:
                 self._derive_invocation(case, episode, event, stored, spec, "loaded")
+
+    def _finalize_missing_tool_results(self, session_id: str) -> None:
+        episode = self.store.execute(
+            """SELECT * FROM task_episodes WHERE session_id=? AND invalidated_at IS NULL
+               ORDER BY created_at DESC LIMIT 1""", (session_id,),
+        ).fetchone()
+        if episode is None:
+            return
+        case = self.store.execute(
+            """SELECT task_case_id FROM task_case_episodes WHERE task_episode_id=?
+               ORDER BY relationship='primary' DESC LIMIT 1""", (episode["id"],),
+        ).fetchone()
+        rows = self.store.execute(
+            """SELECT c.*, e.* FROM tool_calls c JOIN canonical_events e ON e.id=c.event_id
+               WHERE c.task_episode_id=?
+                 AND NOT EXISTS (SELECT 1 FROM tool_results r WHERE r.tool_call_id=c.id)""",
+            (episode["id"],),
+        ).fetchall()
+        for row in rows:
+            event = _decode(row)
+            event["id"] = row["event_id"]
+            self.feedback.derive_process_result(
+                event,
+                {"stored_tool_call_id": row["id"], "tool_name": row["tool_name"],
+                 "args": json.loads(row["arguments_json"]), "episode_closed": True},
+                {"own_case_id": case["task_case_id"] if case else None},
+            )
+
+    def _finalize_stale_missing_tool_results(
+        self, *, grace_seconds: int = 300, limit: int = 1000, max_seconds: float = 1.0,
+    ) -> dict[str, int | bool]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=grace_seconds)).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        rows = self.store.execute(
+            """SELECT c.id AS stored_tool_call_id, c.task_episode_id, c.tool_name,
+                      c.arguments_json, e.id AS event_id, e.event_fingerprint, e.source,
+                      e.session_family, e.protocol_time, e.payload_hash, e.payload_json,
+                      e.created_at
+               FROM tool_calls c JOIN canonical_events e ON e.id=c.event_id
+               WHERE NOT EXISTS (SELECT 1 FROM tool_results r WHERE r.tool_call_id=c.id)
+                 AND NOT EXISTS (
+                   SELECT 1 FROM feedback_targets target
+                   JOIN feedback_signals signal ON signal.id=target.feedback_signal_id
+                   JOIN feedback_signal_revisions revision
+                     ON revision.id=signal.current_machine_revision_id
+                   WHERE target.tool_call_id=c.id AND target.machine_status='candidate'
+                     AND revision.category='result-missing' AND revision.orphaned=0
+                 )
+                 AND COALESCE(c.called_at,e.protocol_time,e.created_at)<=?
+               ORDER BY COALESCE(c.called_at,e.protocol_time,e.created_at), c.id LIMIT ?""",
+            (cutoff, limit + 1),
+        ).fetchall()
+        started = time.monotonic()
+        processed = signals = 0
+        for row in rows[:limit]:
+            if time.monotonic() - started >= max_seconds:
+                break
+            case = self.store.execute(
+                """SELECT task_case_id FROM task_case_episodes WHERE task_episode_id=?
+                   ORDER BY relationship='primary' DESC LIMIT 1""", (row["task_episode_id"],),
+            ).fetchone()
+            event = {
+                "id": row["event_id"], "event_fingerprint": row["event_fingerprint"],
+                "source": row["source"], "session_family": row["session_family"],
+                "protocol_time": row["protocol_time"], "payload_hash": row["payload_hash"],
+                "payload": json.loads(row["payload_json"]), "created_at": row["created_at"],
+            }
+            found = self.feedback.derive_process_result(
+                event,
+                {"stored_tool_call_id": row["stored_tool_call_id"],
+                 "tool_name": row["tool_name"], "args": json.loads(row["arguments_json"]),
+                 "episode_closed": True},
+                {"own_case_id": case["task_case_id"] if case else None},
+            )
+            signals += len(found)
+            processed += 1
+        return {
+            "processed": processed, "signals": signals,
+            "pending": len(rows) > processed,
+        }
     def _derive_edge(self, event: NormalizedEvent, event_id: str, child_id: str) -> None:
         if event.event_type != "session_meta":
             return
@@ -767,7 +904,51 @@ class OutcomeReviewService:
             "INSERT OR IGNORE INTO task_case_episodes(task_case_id, task_episode_id, relationship) VALUES (?, ?, 'primary')",
             (case_fp, episode["id"]),
         )
+        previous = self.store.execute(
+            "SELECT invalidated_at FROM task_cases WHERE id=?", (case_fp,),
+        ).fetchone()
+        if previous is not None and previous["invalidated_at"] is not None and episode["invalidated_at"] is None:
+            self.store.execute(
+                "UPDATE task_cases SET invalidated_at=NULL, updated_at=? WHERE id=?",
+                (now, case_fp),
+            )
+            self._record_derivation_change("case-reactivated", "task-case", case_fp)
         return _decode(self.store.execute("SELECT * FROM task_cases WHERE id = ?", (case_fp,)).fetchone())
+
+    def _restore_episode_if_live(self, episode_id: str) -> bool:
+        row = self.store.execute(
+            "SELECT invalidated_at FROM task_episodes WHERE id=?", (episode_id,),
+        ).fetchone()
+        if row is None or row["invalidated_at"] is None:
+            return False
+        missing = self.store.execute(
+            """SELECT 1 FROM task_episodes ep
+               WHERE ep.id=? AND (
+                 EXISTS (SELECT 1 FROM canonical_events e
+                         WHERE e.id IN (ep.start_event_id, ep.end_event_id) AND e.orphaned=1)
+                 OR EXISTS (SELECT 1 FROM skill_invocations i JOIN canonical_events e ON e.id=i.event_id
+                            WHERE i.task_episode_id=ep.id AND e.orphaned=1)
+               )""",
+            (episode_id,),
+        ).fetchone()
+        if missing is not None:
+            return False
+        now = _now()
+        self.store.execute(
+            "UPDATE task_episodes SET invalidated_at=NULL, updated_at=? WHERE id=?",
+            (now, episode_id),
+        )
+        self._record_derivation_change("episode-reactivated", "task-episode", episode_id)
+        return True
+
+    def _record_derivation_change(self, change_type: str, entity_kind: str, entity_id: str) -> None:
+        self.store.execute(
+            """INSERT INTO effect_derivation_changes(
+                   change_type, entity_kind, entity_id, binding_json, created_at)
+               VALUES (?, ?, ?, '{}', ?)""",
+            (change_type, entity_kind, entity_id, _now()),
+        )
+
     def _derive_facts(self, case: Mapping[str, Any], event: NormalizedEvent, event_id: str) -> None:
         for fact in extract_task_facts([event]):
             fact_id = _stable_id("fact", case["id"], fact.predicate, fact.value, fact.evidence_fingerprint)
@@ -877,6 +1058,22 @@ class OutcomeReviewService:
                        VALUES (?, ?, ?, 'subagent-result', ?, ?, '{}')""",
                     (_stable_id("edge", session_id, child_id, "subagent-result"), session_id, child_id, stored["id"], _now()),
                 )
+        case = self.store.execute(
+            """SELECT task_case_id FROM task_case_episodes WHERE task_episode_id=?
+               ORDER BY relationship='primary' DESC LIMIT 1""", (call["task_episode_id"],),
+        ).fetchone()
+        feedback_event = {
+            **event.to_dict(), "id": stored["id"],
+            "event_fingerprint": stored["event_fingerprint"],
+            "protocol_time": event.timestamp or None,
+            "created_at": stored["created_at"],
+        }
+        self.feedback.derive_process_result(
+            feedback_event,
+            {"stored_tool_call_id": call["id"], "tool_name": call["tool_name"],
+             "args": json.loads(call["arguments_json"]), "episode_closed": True},
+            {"own_case_id": case["task_case_id"] if case else None},
+        )
         invocation = self.store.execute("SELECT * FROM skill_invocations WHERE event_id = ?", (call["event_id"],)).fetchone()
         if invocation is None:
             return
@@ -989,6 +1186,10 @@ class OutcomeReviewService:
             goal,
         )
         invocation_kind = "skill-maintenance" if maintenance_target else "business-use"
+        previous_invocation = self.store.execute(
+            "SELECT id, validity FROM skill_invocations WHERE invocation_fingerprint=?",
+            (invocation_fp,),
+        ).fetchone()
         self.store.execute(
             """INSERT INTO skill_invocations( id, invocation_fingerprint, task_episode_id, event_id, skill_id, skill_sha256, skill_path, invocation_kind, load_status, validity, created_at, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'valid', ?, ?) ON CONFLICT(invocation_fingerprint) DO UPDATE SET skill_sha256=COALESCE(skill_invocations.skill_sha256, excluded.skill_sha256), skill_path=excluded.skill_path, invocation_kind=excluded.invocation_kind, load_status=CASE WHEN skill_invocations.load_status='loaded' THEN 'loaded' ELSE excluded.load_status END, validity='valid', metadata_json=excluded.metadata_json""",
             (invocation_id, invocation_fp, episode["id"], stored["id"], spec["skill_id"],
@@ -997,6 +1198,8 @@ class OutcomeReviewService:
         invocation = self.store.execute(
             "SELECT id FROM skill_invocations WHERE invocation_fingerprint = ?", (invocation_fp,)
         ).fetchone()
+        if previous_invocation is not None and previous_invocation["validity"] == "orphaned":
+            self._record_derivation_change("target-reactivated", "skill-invocation", invocation["id"])
         existing_links = self.store.execute(
             """SELECT attribution_kind FROM attribution_links WHERE task_case_id=? AND status='active'
                AND evidence_id IS NULL ORDER BY created_at, id""", (case["id"],)
@@ -1014,14 +1217,45 @@ class OutcomeReviewService:
                      )""",
                 (case["id"],),
             )
-        exists = self.store.execute(
-            """SELECT 1 FROM attribution_links WHERE task_case_id = ? AND skill_invocation_id = ? AND evidence_id IS NULL AND attribution_kind = ? AND status = 'active'""",
+        exact_link = self.store.execute(
+            """SELECT id, status FROM attribution_links
+               WHERE task_case_id=? AND skill_invocation_id=? AND evidence_id IS NULL
+                 AND attribution_kind=? ORDER BY created_at, id LIMIT 1""",
             (case["id"], invocation["id"], attribution_kind),
         ).fetchone()
-        if exists is None:
+        machine_link = self.store.execute(
+            """SELECT id, attribution_kind, status FROM attribution_links
+               WHERE task_case_id=? AND skill_invocation_id=? AND evidence_id IS NULL
+                 AND attribution_kind IN ('direct','shared','candidate')
+               ORDER BY created_at, id LIMIT 1""",
+            (case["id"], invocation["id"]),
+        ).fetchone()
+        if attribution_kind == "rejected" and exact_link is not None:
+            return
+        if exact_link is not None:
+            self.store.execute(
+                "UPDATE attribution_links SET status='active' WHERE id=?", (exact_link["id"],),
+            )
+        elif machine_link is not None:
+            self.store.execute(
+                """UPDATE attribution_links SET attribution_kind=?, status='active'
+                   WHERE id=?""",
+                (attribution_kind, machine_link["id"]),
+            )
+        else:
+            rejected_ids = tuple(row["id"] for row in self.store.execute(
+                """SELECT id FROM attribution_links
+                   WHERE task_case_id=? AND skill_invocation_id=?
+                     AND attribution_kind='rejected' AND status='rejected'
+                   ORDER BY id""",
+                (case["id"], invocation["id"]),
+            ).fetchall())
             self.store.execute(
                 """INSERT INTO attribution_links( id, task_case_id, skill_invocation_id, evidence_id, attribution_kind, confidence, status, created_at) VALUES (?, ?, ?, NULL, ?, ?, 'active', ?)""",
-                (_stable_id("attribution", case["id"], invocation["id"], attribution_kind),
+                (_stable_id(
+                    "machine-attribution-v2", case["id"], invocation["id"],
+                    attribution_kind, rejected_ids,
+                ),
                  case["id"], invocation["id"], attribution_kind,
                  0.0 if attribution_kind == "rejected" else 1.0, _now()),
             )
@@ -1397,6 +1631,11 @@ class OutcomeReviewService:
     def decision(self, review_task_id: str, *, actor_id: str, expected_revision: int, verdict: str, reason_code: str, note: str | None = None) -> dict[str, Any]:
         if verdict not in {"pass", "partial", "fail"}:
             raise ValueError("decision verdict must be pass, partial, or fail")
+        feedback_task = self.store.execute(
+            "SELECT feedback_signal_id FROM review_tasks WHERE id=?", (review_task_id,)
+        ).fetchone()
+        if feedback_task is not None and feedback_task["feedback_signal_id"]:
+            raise EffectStoreError("feedback review tasks require the feedback Action API")
         return _safe_public(self.store.write_manual_decision(
             review_task_id, actor_id=actor_id, expected_revision=expected_revision,
             action="decision", verdict=verdict, reason_code=reason_code,
@@ -1404,11 +1643,21 @@ class OutcomeReviewService:
         ))
     submit_decision = decision
     def claim(self, review_task_id: str, *, actor_id: str) -> dict[str, Any]:
+        feedback_task = self.store.execute(
+            "SELECT feedback_signal_id FROM review_tasks WHERE id=?", (review_task_id,)
+        ).fetchone()
+        if feedback_task is not None and feedback_task["feedback_signal_id"]:
+            raise EffectStoreError("feedback review tasks require the feedback Action API")
         return _safe_public(self.store.claim_review_task(review_task_id, actor_id=actor_id))
     claim_review_task = claim
     def disposition(self, review_task_id: str, *, actor_id: str, expected_revision: int, disposition: str, reason_code: str, note: str | None = None) -> dict[str, Any]:
         if disposition not in {"not-assessable", "needs-evidence"}:
             raise ValueError("disposition must be not-assessable or needs-evidence")
+        feedback_task = self.store.execute(
+            "SELECT feedback_signal_id FROM review_tasks WHERE id=?", (review_task_id,)
+        ).fetchone()
+        if feedback_task is not None and feedback_task["feedback_signal_id"]:
+            raise EffectStoreError("feedback review tasks require the feedback Action API")
         with self.store.transaction():
             decision = self.store.write_manual_decision(
                 review_task_id, actor_id=actor_id, expected_revision=expected_revision,
@@ -1557,9 +1806,25 @@ class OutcomeReviewService:
                      UNION ALL SELECT 1 FROM task_case_episodes ce JOIN tool_calls call
                        ON call.task_episode_id=ce.task_episode_id JOIN tool_results recent
                        ON recent.tool_call_id=call.id WHERE ce.task_case_id=c.id AND recent.completed_at>=?
+                     UNION ALL SELECT 1 FROM feedback_signals signal
+                       JOIN feedback_signal_revisions recent ON recent.feedback_signal_id=signal.id
+                       WHERE recent.created_at>=? AND (
+                         signal.feedback_case_id=c.id OR EXISTS (
+                           SELECT 1 FROM feedback_targets target WHERE target.feedback_signal_id=signal.id
+                             AND COALESCE(target.target_task_case_id,target.context_task_case_id)=c.id
+                         )
+                       )
+                     UNION ALL SELECT 1 FROM feedback_actions recent
+                       JOIN feedback_signals signal ON signal.id=recent.feedback_signal_id
+                       WHERE recent.created_at>=? AND (
+                         signal.feedback_case_id=c.id OR EXISTS (
+                           SELECT 1 FROM feedback_targets target WHERE target.feedback_signal_id=signal.id
+                             AND COALESCE(target.target_task_case_id,target.context_task_case_id)=c.id
+                         )
+                       )
                    )"""
             )
-            parameters.extend([older_than] * 12)
+            parameters.extend([older_than] * 14)
         if skill_id:
             conditions.append(
                 "EXISTS (SELECT 1 FROM attribution_links l JOIN skill_invocations i "
@@ -1791,7 +2056,9 @@ class OutcomeReviewService:
         return {"auditId": audit_id, "criteriaSha256": criteria_hash, **summary}
     # ---------------------------------------------------------------- queries
     def overview(self) -> dict[str, Any]:
-        return _safe_public(self.store.overview())
+        result = self.store.overview()
+        result["feedback"] = self.feedback.overview()
+        return _safe_public(result)
     get_overview = overview
     def list_events(self, **filters: Any) -> dict[str, Any]:
         return _safe_public(self.store.list_events(**filters))
@@ -1872,6 +2139,7 @@ class OutcomeReviewService:
             "checks": [_decode(row) for row in checks],
             "artifacts": [_decode(row) for row in artifacts],
             "semantic_reviews": [_decode(row) for row in semantic_reviews],
+            "feedback": self.feedback.case_feedback(task_case_id),
             "evidence": [
                 {
                     "evidenceId": f"event:{row['id']}", "eventId": row["id"],
@@ -1893,7 +2161,10 @@ class OutcomeReviewService:
             invocation["skill_path"] = f"{invocation['skill_id']}/SKILL.md" if invocation.get("skill_path") else None
         for assessment in result["assessments"]:
             assessment.update(self.effective_projection(assessment["id"]))
-        current = next((item for item in reversed(result["assessments"]) if item.get("is_current")), None)
+        current = next((
+            item for item in reversed(result["assessments"])
+            if item.get("is_current") and not str(item.get("subject_key") or "").startswith("feedback:")
+        ), None)
         result["current_outcome"] = ({
             "assessmentId": current["id"], "effectiveVerdict": current["effective_verdict"],
             "effectiveSource": current["effective_source"], "conflictState": current["conflict_state"],

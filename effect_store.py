@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
 
@@ -304,6 +304,12 @@ CREATE TABLE IF NOT EXISTS evidence_items (
     locator_json TEXT NOT NULL DEFAULT '{}',
     excerpt TEXT,
     validity TEXT NOT NULL DEFAULT 'valid',
+    polarity TEXT,
+    category TEXT,
+    confidence REAL,
+    rule_id TEXT,
+    producer_version TEXT,
+    observed_at TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -395,6 +401,9 @@ CREATE TABLE IF NOT EXISTS review_tasks (
     task_case_id TEXT NOT NULL REFERENCES task_cases(id) ON DELETE CASCADE,
     assessment_id TEXT NOT NULL,
     queue_reason TEXT NOT NULL,
+    trigger_evidence_id TEXT REFERENCES evidence_items(id) ON DELETE SET NULL,
+    feedback_signal_id TEXT REFERENCES feedback_signals(id) ON DELETE SET NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'open',
     claimed_by_actor_id TEXT REFERENCES actors(id) ON DELETE SET NULL,
     current_decision_revision INTEGER NOT NULL DEFAULT 0 CHECK (current_decision_revision >= 0),
@@ -471,6 +480,7 @@ CREATE TABLE IF NOT EXISTS artifact_manifests (
     root_path_hash TEXT NOT NULL,
     manifest_json TEXT NOT NULL,
     manifest_sha256 TEXT NOT NULL,
+    cleanup_project_id TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -501,6 +511,18 @@ CREATE TABLE IF NOT EXISTS data_cleanup_audits (
     affected_case_count INTEGER NOT NULL,
     summary_json TEXT NOT NULL,
     criteria_sha256 TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS effect_cleanup_runs (
+    id TEXT PRIMARY KEY,
+    criteria_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'failed', 'completed')),
+    stage TEXT NOT NULL,
+    result_json TEXT NOT NULL DEFAULT '{}',
+    error_json TEXT NOT NULL DEFAULT '{}',
+    started_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS metric_snapshots (
@@ -535,26 +557,326 @@ CREATE TABLE IF NOT EXISTS metric_snapshot_cases (
     PRIMARY KEY (snapshot_id, task_case_id, skill_id, attribution_kind)
 );
 
+CREATE TABLE IF NOT EXISTS effect_derivation_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_type TEXT NOT NULL,
+    entity_kind TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    generation_id TEXT,
+    scan_run_id TEXT REFERENCES scan_runs(id) ON DELETE SET NULL,
+    binding_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS feedback_signals (
+    id TEXT PRIMARY KEY,
+    logical_fingerprint TEXT NOT NULL UNIQUE,
+    feedback_event_id TEXT NOT NULL REFERENCES canonical_events(id) ON DELETE RESTRICT,
+    feedback_case_id TEXT REFERENCES task_cases(id) ON DELETE SET NULL,
+    current_machine_revision_id TEXT,
+    current_confirmed_target_id TEXT,
+    current_process_state TEXT NOT NULL DEFAULT 'candidate',
+    current_resolution_state TEXT NOT NULL DEFAULT 'unreviewed',
+    current_action_revision INTEGER NOT NULL DEFAULT 0 CHECK (current_action_revision >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(current_machine_revision_id, id)
+        REFERENCES feedback_signal_revisions(id, feedback_signal_id)
+        DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(current_confirmed_target_id, id)
+        REFERENCES feedback_targets(id, feedback_signal_id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE IF NOT EXISTS feedback_signal_revisions (
+    id TEXT PRIMARY KEY,
+    feedback_signal_id TEXT NOT NULL REFERENCES feedback_signals(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    revision_fingerprint TEXT NOT NULL UNIQUE,
+    channel TEXT NOT NULL CHECK (channel IN ('user-feedback', 'process-anomaly', 'assistant-claim')),
+    category TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('critical', 'high', 'medium', 'low', 'unknown')),
+    authority TEXT NOT NULL CHECK (authority IN ('user', 'external', 'tool', 'assistant', 'unknown')),
+    source TEXT NOT NULL,
+    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    excerpt_hash TEXT NOT NULL,
+    redacted_excerpt TEXT,
+    locator_json TEXT NOT NULL DEFAULT '{}',
+    detector_id TEXT NOT NULL,
+    detector_version TEXT NOT NULL,
+    span_parser_version TEXT NOT NULL DEFAULT 'unknown',
+    resolver_version TEXT NOT NULL DEFAULT 'unknown',
+    suppression_reason TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    orphaned INTEGER NOT NULL DEFAULT 0 CHECK (orphaned IN (0, 1)),
+    is_current INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0, 1)),
+    supersedes_id TEXT,
+    observed_at TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(feedback_signal_id, revision),
+    UNIQUE(id, feedback_signal_id),
+    FOREIGN KEY(supersedes_id, feedback_signal_id)
+        REFERENCES feedback_signal_revisions(id, feedback_signal_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS feedback_targets (
+    id TEXT PRIMARY KEY,
+    feedback_signal_id TEXT NOT NULL REFERENCES feedback_signals(id) ON DELETE CASCADE,
+    signal_revision_id TEXT NOT NULL,
+    target_fingerprint TEXT NOT NULL UNIQUE,
+    rank INTEGER NOT NULL CHECK (rank >= 1),
+    target_kind TEXT NOT NULL,
+    context_task_case_id TEXT REFERENCES task_cases(id) ON DELETE SET NULL,
+    target_task_case_id TEXT REFERENCES task_cases(id) ON DELETE SET NULL,
+    target_event_id TEXT REFERENCES canonical_events(id) ON DELETE SET NULL,
+    skill_invocation_id TEXT REFERENCES skill_invocations(id) ON DELETE SET NULL,
+    tool_call_id TEXT REFERENCES tool_calls(id) ON DELETE SET NULL,
+    tool_result_id TEXT REFERENCES tool_results(id) ON DELETE SET NULL,
+    relation TEXT NOT NULL,
+    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    machine_status TEXT NOT NULL CHECK (machine_status IN ('candidate', 'rejected', 'superseded', 'orphaned')),
+    resolver_version TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(feedback_signal_id, rank, signal_revision_id),
+    UNIQUE(id, feedback_signal_id),
+    FOREIGN KEY(signal_revision_id, feedback_signal_id)
+        REFERENCES feedback_signal_revisions(id, feedback_signal_id) ON DELETE CASCADE,
+    CHECK (
+        (target_kind = 'task-result' AND (target_task_case_id IS NOT NULL OR machine_status='orphaned')
+          AND target_event_id IS NULL AND skill_invocation_id IS NULL
+          AND tool_call_id IS NULL AND tool_result_id IS NULL)
+        OR
+        (target_kind IN ('assistant-result', 'process-plan') AND target_task_case_id IS NULL
+          AND (target_event_id IS NOT NULL OR machine_status='orphaned') AND skill_invocation_id IS NULL
+          AND tool_call_id IS NULL AND tool_result_id IS NULL)
+        OR
+        (target_kind = 'skill-invocation' AND target_task_case_id IS NULL
+          AND (skill_invocation_id IS NOT NULL OR machine_status='orphaned') AND target_event_id IS NULL
+          AND tool_call_id IS NULL AND tool_result_id IS NULL)
+        OR
+        (target_kind = 'tool-call' AND target_task_case_id IS NULL
+          AND (tool_call_id IS NOT NULL OR machine_status='orphaned') AND target_event_id IS NULL
+          AND skill_invocation_id IS NULL AND tool_result_id IS NULL)
+        OR
+        (target_kind = 'tool-result' AND target_task_case_id IS NULL
+          AND (tool_result_id IS NOT NULL OR machine_status='orphaned') AND target_event_id IS NULL
+          AND skill_invocation_id IS NULL AND tool_call_id IS NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS feedback_actions (
+    id TEXT PRIMARY KEY,
+    feedback_signal_id TEXT NOT NULL REFERENCES feedback_signals(id) ON DELETE RESTRICT,
+    actor_id TEXT REFERENCES actors(id) ON DELETE RESTRICT,
+    producer_kind TEXT NOT NULL CHECK (producer_kind IN ('detector', 'queue', 'reviewer', 'system')),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    action TEXT NOT NULL,
+    from_process_state TEXT,
+    to_process_state TEXT,
+    from_resolution_state TEXT,
+    to_resolution_state TEXT,
+    reason_code TEXT NOT NULL,
+    note TEXT,
+    target_id TEXT,
+    supersedes_id TEXT,
+    binding_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(feedback_signal_id, revision),
+    UNIQUE(id, feedback_signal_id),
+    FOREIGN KEY(target_id, feedback_signal_id)
+        REFERENCES feedback_targets(id, feedback_signal_id) ON DELETE RESTRICT,
+    FOREIGN KEY(supersedes_id, feedback_signal_id)
+        REFERENCES feedback_actions(id, feedback_signal_id) ON DELETE RESTRICT,
+    CHECK (
+        (producer_kind = 'reviewer' AND actor_id IS NOT NULL)
+        OR (producer_kind IN ('detector', 'queue', 'system') AND actor_id IS NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS feedback_derivation_state (
+    detector_id TEXT PRIMARY KEY,
+    detector_version TEXT NOT NULL,
+    change_cursor INTEGER NOT NULL DEFAULT 0 CHECK (change_cursor >= 0),
+    bootstrap_complete INTEGER NOT NULL DEFAULT 0 CHECK (bootstrap_complete IN (0, 1)),
+    last_scan_run_id TEXT REFERENCES scan_runs(id) ON DELETE SET NULL,
+    status TEXT NOT NULL,
+    stats_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS feedback_clusters (
+    id TEXT PRIMARY KEY,
+    cluster_key TEXT NOT NULL UNIQUE,
+    skill_id TEXT,
+    skill_sha256 TEXT,
+    task_type TEXT,
+    category TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    normalized_reason_code TEXT NOT NULL,
+    member_count INTEGER NOT NULL DEFAULT 0 CHECK (member_count >= 0),
+    open_count INTEGER NOT NULL DEFAULT 0 CHECK (open_count >= 0),
+    first_observed_at TEXT,
+    last_observed_at TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS feedback_cluster_members (
+    cluster_id TEXT NOT NULL REFERENCES feedback_clusters(id) ON DELETE CASCADE,
+    feedback_signal_id TEXT NOT NULL REFERENCES feedback_signals(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(cluster_id, feedback_signal_id)
+);
+
+CREATE TABLE IF NOT EXISTS feedback_calibration_profiles (
+    id TEXT PRIMARY KEY,
+    detector_version TEXT NOT NULL,
+    resolver_version TEXT NOT NULL,
+    language TEXT NOT NULL,
+    category TEXT NOT NULL,
+    model_version TEXT NOT NULL DEFAULT 'deterministic',
+    prompt_version TEXT NOT NULL DEFAULT 'deterministic',
+    rubric_version TEXT NOT NULL DEFAULT 'deterministic',
+    corpus_sha256 TEXT NOT NULL,
+    sample_count INTEGER NOT NULL CHECK (sample_count >= 0),
+    major_category_sample_count INTEGER NOT NULL CHECK (major_category_sample_count >= 0),
+    precision_lower_bound REAL NOT NULL CHECK (precision_lower_bound >= 0 AND precision_lower_bound <= 1),
+    target_accuracy_lower_bound REAL NOT NULL CHECK (target_accuracy_lower_bound >= 0 AND target_accuracy_lower_bound <= 1),
+    eligible INTEGER NOT NULL CHECK (eligible IN (0, 1)),
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(detector_version, resolver_version, language, category, corpus_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS feedback_semantic_reviews (
+    id TEXT PRIMARY KEY,
+    feedback_signal_id TEXT NOT NULL REFERENCES feedback_signals(id) ON DELETE CASCADE,
+    signal_revision_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    rubric_version TEXT NOT NULL,
+    calibration_profile_id TEXT REFERENCES feedback_calibration_profiles(id) ON DELETE SET NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('classified', 'needs-human')),
+    category TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+    target_id TEXT,
+    review_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(feedback_signal_id, signal_revision_id, model_version, prompt_version, rubric_version),
+    FOREIGN KEY(signal_revision_id, feedback_signal_id)
+        REFERENCES feedback_signal_revisions(id, feedback_signal_id) ON DELETE CASCADE,
+    FOREIGN KEY(target_id, feedback_signal_id)
+        REFERENCES feedback_targets(id, feedback_signal_id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS feedback_metric_snapshot_items (
+    snapshot_id TEXT NOT NULL REFERENCES metric_snapshots(id) ON DELETE RESTRICT,
+    feedback_signal_id TEXT NOT NULL REFERENCES feedback_signals(id) ON DELETE RESTRICT,
+    signal_machine_revision INTEGER NOT NULL,
+    target_id TEXT,
+    target_status TEXT,
+    target_resolver_version TEXT,
+    action_revision INTEGER,
+    resolution_state TEXT NOT NULL,
+    target_task_case_id TEXT,
+    task_case_revision INTEGER,
+    calibration_profile_id TEXT REFERENCES feedback_calibration_profiles(id) ON DELETE RESTRICT,
+    metric_eligible INTEGER NOT NULL CHECK (metric_eligible IN (0, 1)),
+    exclusion_reason TEXT,
+    frozen_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(snapshot_id, feedback_signal_id),
+    FOREIGN KEY(feedback_signal_id, signal_machine_revision)
+        REFERENCES feedback_signal_revisions(feedback_signal_id, revision),
+    FOREIGN KEY(feedback_signal_id, action_revision)
+        REFERENCES feedback_actions(feedback_signal_id, revision),
+    FOREIGN KEY(target_id, feedback_signal_id)
+        REFERENCES feedback_targets(id, feedback_signal_id)
+);
+
+CREATE TABLE IF NOT EXISTS feedback_metric_snapshot_attributions (
+    snapshot_id TEXT NOT NULL,
+    feedback_signal_id TEXT NOT NULL,
+    skill_invocation_id TEXT NOT NULL,
+    skill_id TEXT NOT NULL,
+    skill_sha256 TEXT,
+    attribution_kind TEXT NOT NULL,
+    metric_eligible INTEGER NOT NULL CHECK (metric_eligible IN (0, 1)),
+    exclusion_reason TEXT,
+    frozen_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(snapshot_id, feedback_signal_id, skill_invocation_id),
+    FOREIGN KEY(snapshot_id, feedback_signal_id)
+        REFERENCES feedback_metric_snapshot_items(snapshot_id, feedback_signal_id) ON DELETE RESTRICT
+);
+
 CREATE INDEX IF NOT EXISTS idx_generations_file ON log_file_generations(log_file_id, status);
 CREATE INDEX IF NOT EXISTS idx_locations_path ON log_file_locations(path, is_current);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_generation ON file_checkpoints(generation_id, byte_offset DESC);
 CREATE INDEX IF NOT EXISTS idx_events_time ON canonical_events(protocol_time, id);
 CREATE INDEX IF NOT EXISTS idx_events_type ON canonical_events(event_type, protocol_time);
+CREATE INDEX IF NOT EXISTS idx_events_family_type_time ON canonical_events(session_family, event_type, protocol_time DESC, id);
 CREATE INDEX IF NOT EXISTS idx_events_orphaned ON canonical_events(orphaned) WHERE orphaned = 1;
 CREATE INDEX IF NOT EXISTS idx_provenance_generation ON event_provenance(generation_id);
 CREATE INDEX IF NOT EXISTS idx_cases_type ON task_cases(task_type, updated_at);
+CREATE INDEX IF NOT EXISTS idx_case_episodes_episode ON task_case_episodes(task_episode_id, relationship, task_case_id);
 CREATE INDEX IF NOT EXISTS idx_invocations_skill ON skill_invocations(skill_id, skill_sha256);
+CREATE INDEX IF NOT EXISTS idx_invocations_event ON skill_invocations(event_id);
+CREATE INDEX IF NOT EXISTS idx_episodes_start_event ON task_episodes(start_event_id);
+CREATE INDEX IF NOT EXISTS idx_episodes_end_event ON task_episodes(end_event_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_event ON tool_calls(event_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_episode ON tool_calls(task_episode_id);
+CREATE INDEX IF NOT EXISTS idx_tool_results_event ON tool_results(event_id);
 CREATE INDEX IF NOT EXISTS idx_assessments_case ON outcome_assessments(task_case_id, revision DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_current_assessment_subject
 ON outcome_assessments(task_case_id, subject_key) WHERE is_current = 1;
 CREATE INDEX IF NOT EXISTS idx_review_queue ON review_tasks(status, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_manual_case ON manual_decisions(task_case_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_snapshot_cutoff ON metric_snapshots(cutoff_at, id);
+CREATE INDEX IF NOT EXISTS idx_cleanup_run_status ON effect_cleanup_runs(status, updated_at, id);
+CREATE INDEX IF NOT EXISTS idx_derivation_change_entity ON effect_derivation_changes(entity_kind, entity_id, id);
+CREATE INDEX IF NOT EXISTS idx_feedback_signal_queue ON feedback_signals(current_resolution_state, current_process_state, updated_at, id);
+CREATE INDEX IF NOT EXISTS idx_feedback_signal_process ON feedback_signals(current_process_state, updated_at, id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_current_feedback_signal_revision
+ON feedback_signal_revisions(feedback_signal_id) WHERE is_current = 1;
+CREATE INDEX IF NOT EXISTS idx_feedback_revision_channel ON feedback_signal_revisions(channel, observed_at DESC, id DESC) WHERE is_current = 1 AND orphaned = 0;
+CREATE INDEX IF NOT EXISTS idx_feedback_revision_time ON feedback_signal_revisions(observed_at DESC, id DESC) WHERE is_current = 1 AND orphaned = 0;
+CREATE INDEX IF NOT EXISTS idx_feedback_revision_category ON feedback_signal_revisions(category, observed_at DESC, id DESC) WHERE is_current = 1 AND orphaned = 0;
+CREATE INDEX IF NOT EXISTS idx_feedback_revision_severity ON feedback_signal_revisions(severity, observed_at DESC, id DESC) WHERE is_current = 1 AND orphaned = 0;
+CREATE INDEX IF NOT EXISTS idx_feedback_revision_authority_source ON feedback_signal_revisions(authority, source, observed_at DESC, id DESC) WHERE is_current = 1 AND orphaned = 0;
+CREATE INDEX IF NOT EXISTS idx_feedback_revision_source ON feedback_signal_revisions(source, observed_at DESC, id DESC) WHERE is_current = 1 AND orphaned = 0;
+CREATE INDEX IF NOT EXISTS idx_feedback_revision_confidence ON feedback_signal_revisions(confidence DESC, observed_at DESC, id DESC) WHERE is_current = 1 AND orphaned = 0;
+CREATE INDEX IF NOT EXISTS idx_feedback_revision_excerpt ON feedback_signal_revisions(channel, excerpt_hash, feedback_signal_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_target_signal ON feedback_targets(feedback_signal_id, machine_status, rank);
+CREATE INDEX IF NOT EXISTS idx_feedback_target_kind ON feedback_targets(target_kind, machine_status, feedback_signal_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_target_case ON feedback_targets(target_task_case_id, machine_status);
+CREATE INDEX IF NOT EXISTS idx_feedback_target_skill ON feedback_targets(skill_invocation_id, machine_status);
+CREATE INDEX IF NOT EXISTS idx_feedback_target_tool_call ON feedback_targets(tool_call_id, machine_status);
+CREATE INDEX IF NOT EXISTS idx_feedback_target_tool_result ON feedback_targets(tool_result_id, machine_status);
+CREATE INDEX IF NOT EXISTS idx_feedback_action_revision ON feedback_actions(feedback_signal_id, revision DESC);
+CREATE INDEX IF NOT EXISTS idx_feedback_cluster_list ON feedback_clusters(open_count DESC, last_observed_at DESC, id);
+CREATE INDEX IF NOT EXISTS idx_feedback_semantic_signal ON feedback_semantic_reviews(feedback_signal_id, created_at DESC);
 
 CREATE TRIGGER IF NOT EXISTS provenance_insert_restores_event
 AFTER INSERT ON event_provenance
 BEGIN
+    INSERT INTO effect_derivation_changes(change_type, entity_kind, entity_id, generation_id, binding_json, created_at)
+    VALUES ('provenance-added', 'canonical-event', NEW.event_id, NEW.generation_id,
+            json_object('provenanceId', NEW.id), NEW.observed_at);
+    INSERT INTO effect_derivation_changes(change_type, entity_kind, entity_id, generation_id, binding_json, created_at)
+    SELECT 'event-reactivated', 'canonical-event', NEW.event_id, NEW.generation_id,
+           json_object('provenanceId', NEW.id), NEW.observed_at
+    WHERE (SELECT orphaned FROM canonical_events WHERE id=NEW.event_id) = 1;
     UPDATE canonical_events SET orphaned = 0, updated_at = NEW.observed_at WHERE id = NEW.event_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS provenance_delete_records_change
+AFTER DELETE ON event_provenance
+BEGIN
+    INSERT INTO effect_derivation_changes(change_type, entity_kind, entity_id, generation_id, binding_json, created_at)
+    VALUES ('provenance-removed', 'canonical-event', OLD.event_id, OLD.generation_id,
+            json_object('provenanceId', OLD.id), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 END;
 
 CREATE TRIGGER IF NOT EXISTS provenance_delete_orphans_event
@@ -563,6 +885,106 @@ WHEN NOT EXISTS (SELECT 1 FROM event_provenance WHERE event_id = OLD.event_id)
 BEGIN
     UPDATE canonical_events SET orphaned = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
     WHERE id = OLD.event_id;
+    INSERT INTO effect_derivation_changes(change_type, entity_kind, entity_id, generation_id, binding_json, created_at)
+    VALUES ('event-orphaned', 'canonical-event', OLD.event_id, OLD.generation_id,
+            json_object('provenanceId', OLD.id), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_current_revision_guard
+BEFORE UPDATE OF current_machine_revision_id ON feedback_signals
+WHEN NEW.current_machine_revision_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM feedback_signal_revisions r
+    WHERE r.id=NEW.current_machine_revision_id AND r.feedback_signal_id=NEW.id AND r.is_current=1
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'feedback current revision must be current and belong to signal');
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_action_no_update
+BEFORE UPDATE ON feedback_actions
+WHEN NOT (
+    OLD.note IS NOT NULL AND NEW.note IS NULL
+    AND NEW.id IS OLD.id
+    AND NEW.feedback_signal_id IS OLD.feedback_signal_id
+    AND NEW.actor_id IS OLD.actor_id
+    AND NEW.producer_kind IS OLD.producer_kind
+    AND NEW.revision IS OLD.revision
+    AND NEW.action IS OLD.action
+    AND NEW.from_process_state IS OLD.from_process_state
+    AND NEW.to_process_state IS OLD.to_process_state
+    AND NEW.from_resolution_state IS OLD.from_resolution_state
+    AND NEW.to_resolution_state IS OLD.to_resolution_state
+    AND NEW.reason_code IS OLD.reason_code
+    AND NEW.target_id IS OLD.target_id
+    AND NEW.supersedes_id IS OLD.supersedes_id
+    AND NEW.binding_json IS OLD.binding_json
+    AND NEW.created_at IS OLD.created_at
+)
+BEGIN
+    SELECT RAISE(ABORT, 'feedback actions are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_action_no_delete
+BEFORE DELETE ON feedback_actions
+BEGIN
+    SELECT RAISE(ABORT, 'feedback actions are append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_tool_call_before_delete
+BEFORE DELETE ON tool_calls
+BEGIN
+    INSERT INTO effect_derivation_changes(change_type, entity_kind, entity_id, binding_json, created_at)
+    SELECT 'target-invalidated', 'feedback-target', id,
+           json_object('reason','tool-call-deleted','toolCallId',OLD.id),
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    FROM feedback_targets WHERE tool_call_id=OLD.id;
+    UPDATE feedback_targets SET machine_status='orphaned',
+        evidence_json=json_set(evidence_json, '$.invalidatedToolCallId', OLD.id)
+    WHERE tool_call_id=OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_tool_result_before_delete
+BEFORE DELETE ON tool_results
+BEGIN
+    INSERT INTO effect_derivation_changes(change_type, entity_kind, entity_id, binding_json, created_at)
+    SELECT 'target-invalidated', 'feedback-target', id,
+           json_object('reason','tool-result-deleted','toolResultId',OLD.id),
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    FROM feedback_targets WHERE tool_result_id=OLD.id;
+    UPDATE feedback_targets SET machine_status='orphaned',
+        evidence_json=json_set(evidence_json, '$.invalidatedToolResultId', OLD.id)
+    WHERE tool_result_id=OLD.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_tool_call_after_insert
+AFTER INSERT ON tool_calls
+BEGIN
+    INSERT INTO effect_derivation_changes(change_type, entity_kind, entity_id, binding_json, created_at)
+    SELECT 'target-reactivated', 'feedback-target', id,
+           json_object('reason','tool-call-restored','toolCallId',NEW.id),
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    FROM feedback_targets
+    WHERE machine_status='orphaned' AND tool_call_id IS NULL
+      AND json_extract(evidence_json, '$.invalidatedToolCallId')=NEW.id;
+    UPDATE feedback_targets SET tool_call_id=NEW.id
+    WHERE machine_status='orphaned' AND tool_call_id IS NULL
+      AND json_extract(evidence_json, '$.invalidatedToolCallId')=NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_tool_result_after_insert
+AFTER INSERT ON tool_results
+BEGIN
+    INSERT INTO effect_derivation_changes(change_type, entity_kind, entity_id, binding_json, created_at)
+    SELECT 'target-reactivated', 'feedback-target', id,
+           json_object('reason','tool-result-restored','toolResultId',NEW.id),
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    FROM feedback_targets
+    WHERE machine_status='orphaned' AND tool_result_id IS NULL
+      AND json_extract(evidence_json, '$.invalidatedToolResultId')=NEW.id;
+    UPDATE feedback_targets SET tool_result_id=NEW.id
+    WHERE machine_status='orphaned' AND tool_result_id IS NULL
+      AND json_extract(evidence_json, '$.invalidatedToolResultId')=NEW.id;
 END;
 
 CREATE TRIGGER IF NOT EXISTS metric_snapshot_no_update
@@ -600,6 +1022,44 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS metric_snapshot_case_no_delete
 BEFORE DELETE ON metric_snapshot_cases
+BEGIN
+    SELECT RAISE(ABORT, 'metric snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_snapshot_item_only_before_seal
+BEFORE INSERT ON feedback_metric_snapshot_items
+WHEN (SELECT sealed FROM metric_snapshots WHERE id = NEW.snapshot_id) <> 0
+BEGIN
+    SELECT RAISE(ABORT, 'metric snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_snapshot_item_no_update
+BEFORE UPDATE ON feedback_metric_snapshot_items
+BEGIN
+    SELECT RAISE(ABORT, 'metric snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_snapshot_item_no_delete
+BEFORE DELETE ON feedback_metric_snapshot_items
+BEGIN
+    SELECT RAISE(ABORT, 'metric snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_snapshot_attribution_only_before_seal
+BEFORE INSERT ON feedback_metric_snapshot_attributions
+WHEN (SELECT sealed FROM metric_snapshots WHERE id = NEW.snapshot_id) <> 0
+BEGIN
+    SELECT RAISE(ABORT, 'metric snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_snapshot_attribution_no_update
+BEFORE UPDATE ON feedback_metric_snapshot_attributions
+BEGIN
+    SELECT RAISE(ABORT, 'metric snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS feedback_snapshot_attribution_no_delete
+BEFORE DELETE ON feedback_metric_snapshot_attributions
 BEGIN
     SELECT RAISE(ABORT, 'metric snapshot is immutable');
 END;
@@ -741,8 +1201,12 @@ class EffectStore:
         if self._transaction_depth:
             raise EffectStoreError("migration cannot run inside another transaction")
         current_version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+        if current_version > SCHEMA_VERSION:
+            raise EffectStoreError(
+                f"database schema v{current_version} is newer than supported v{SCHEMA_VERSION}"
+            )
         repair_statements: list[str] = []
-        if current_version == SCHEMA_VERSION and SCHEMA == _EXPECTED_SCHEMA:
+        if SCHEMA == _EXPECTED_SCHEMA:
             expected_shape = _expected_schema_shape()
             actual_shape = _schema_shape(self.connection)
             tables_complete = all(
@@ -753,7 +1217,7 @@ class EffectStore:
                 all(actual_shape[object_type].get(name) == sql for name, sql in expected_shape[object_type].items())
                 for object_type in ("index", "trigger")
             )
-            if tables_complete and guarded_objects_complete:
+            if current_version == SCHEMA_VERSION and tables_complete and guarded_objects_complete:
                 self._secure_files()
                 return SCHEMA_VERSION
             for object_type in ("index", "trigger"):
@@ -768,8 +1232,7 @@ class EffectStore:
         calibration_rebuild_sql = ""
         if calibration_rebuild:
             calibration_rebuild_sql = """
-            ALTER TABLE calibration_profiles RENAME TO calibration_profiles_legacy;
-            CREATE TABLE calibration_profiles (
+            CREATE TABLE calibration_profiles_migrated (
                 id TEXT PRIMARY KEY, contract_version_id TEXT NOT NULL, task_type TEXT NOT NULL,
                 source TEXT NOT NULL, model_version TEXT NOT NULL, prompt_version TEXT NOT NULL,
                 rubric_version TEXT NOT NULL, corpus_sha256 TEXT NOT NULL,
@@ -781,15 +1244,16 @@ class EffectStore:
                 UNIQUE(contract_version_id, task_type, source, model_version, prompt_version,
                        rubric_version, corpus_sha256)
             );
-            INSERT INTO calibration_profiles(
+            INSERT INTO calibration_profiles_migrated(
                 id, contract_version_id, task_type, source, model_version, prompt_version,
                 rubric_version, corpus_sha256, sample_count, major_task_sample_count,
                 pass_precision_lower_bound, eligible, metrics_json, created_at
             ) SELECT id, contract_version_id, task_type, source, model_version, prompt_version,
                 rubric_version, COALESCE(json_extract(metrics_json, '$.corpusSha256'), 'legacy-' || id),
                 sample_count, major_task_sample_count, pass_precision_lower_bound, eligible,
-                metrics_json, created_at FROM calibration_profiles_legacy;
-            DROP TABLE calibration_profiles_legacy;
+                metrics_json, created_at FROM calibration_profiles;
+            DROP TABLE calibration_profiles;
+            ALTER TABLE calibration_profiles_migrated RENAME TO calibration_profiles;
             """
         additions = {
             "task_facts": {
@@ -815,6 +1279,31 @@ class EffectStore:
             "check_runs": {
                 "case_revision": "INTEGER NOT NULL DEFAULT 1 CHECK (case_revision >= 1)",
             },
+            "evidence_items": {
+                "polarity": "TEXT",
+                "category": "TEXT",
+                "confidence": "REAL",
+                "rule_id": "TEXT",
+                "producer_version": "TEXT",
+                "observed_at": "TEXT",
+            },
+            "review_tasks": {
+                "trigger_evidence_id": "TEXT REFERENCES evidence_items(id) ON DELETE SET NULL",
+                "feedback_signal_id": "TEXT REFERENCES feedback_signals(id) ON DELETE SET NULL",
+                "priority": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "feedback_calibration_profiles": {
+                "model_version": "TEXT NOT NULL DEFAULT 'deterministic'",
+                "prompt_version": "TEXT NOT NULL DEFAULT 'deterministic'",
+                "rubric_version": "TEXT NOT NULL DEFAULT 'deterministic'",
+            },
+            "feedback_signal_revisions": {
+                "span_parser_version": "TEXT NOT NULL DEFAULT 'unknown'",
+                "resolver_version": "TEXT NOT NULL DEFAULT 'unknown'",
+            },
+            "artifact_manifests": {
+                "cleanup_project_id": "TEXT",
+            },
         }
         alter_statements: list[str] = []
         for table, columns in additions.items():
@@ -836,6 +1325,7 @@ class EffectStore:
         BEGIN IMMEDIATE;
         {''.join(repair_statements)}
         {calibration_rebuild_sql}
+
         {''.join(alter_statements)}
         {SCHEMA}
         INSERT OR IGNORE INTO schema_migrations(version, applied_at)
@@ -853,7 +1343,7 @@ class EffectStore:
             self._secure_files()
         if SCHEMA == _EXPECTED_SCHEMA and not _schema_conforms(self.connection):
             raise EffectStoreError(
-                "database schema does not match v4; restore from backup or run a supported migration"
+                "database schema does not match v7; restore from backup or run a supported migration"
             )
         return SCHEMA_VERSION
 
@@ -1113,6 +1603,7 @@ class EffectStore:
                     protocol_time = COALESCE(excluded.protocol_time, canonical_events.protocol_time),
                     parent_event_id = COALESCE(excluded.parent_event_id, canonical_events.parent_event_id),
                     call_id = COALESCE(excluded.call_id, canonical_events.call_id),
+                    payload_json = excluded.payload_json,
                     last_seen_scan_id = COALESCE(excluded.last_seen_scan_id, canonical_events.last_seen_scan_id),
                     updated_at = excluded.updated_at
                 """,
@@ -1163,6 +1654,10 @@ class EffectStore:
             cursor = self.connection.execute("DELETE FROM log_file_generations WHERE id = ?", (generation_id,))
             if cursor.rowcount:
                 now = _utc_now()
+                orphan_invocations = [row[0] for row in self.connection.execute(
+                    """SELECT id FROM skill_invocations WHERE validity!='orphaned'
+                       AND event_id IN (SELECT id FROM canonical_events WHERE orphaned=1)"""
+                ).fetchall()]
                 self.connection.execute(
                     """UPDATE skill_invocations SET validity = 'orphaned'
                        WHERE event_id IN (SELECT id FROM canonical_events WHERE orphaned = 1)"""
@@ -1177,6 +1672,15 @@ class EffectStore:
                        )""",
                     (now, now),
                 )
+                invalid_cases = [row[0] for row in self.connection.execute(
+                    """SELECT id FROM task_cases WHERE invalidated_at IS NULL AND EXISTS (
+                         SELECT 1 FROM task_case_episodes ce WHERE ce.task_case_id=task_cases.id
+                       ) AND NOT EXISTS (
+                         SELECT 1 FROM task_case_episodes ce JOIN task_episodes ep
+                           ON ep.id=ce.task_episode_id
+                         WHERE ce.task_case_id=task_cases.id AND ep.invalidated_at IS NULL
+                       )"""
+                ).fetchall()]
                 self.connection.execute(
                     """UPDATE task_cases SET invalidated_at = ?, updated_at = ?
                        WHERE invalidated_at IS NULL AND EXISTS (
@@ -1197,6 +1701,20 @@ class EffectStore:
                     """UPDATE review_tasks SET status = 'open', queue_reason = 'source-invalidated', updated_at = ?
                        WHERE task_case_id IN (SELECT id FROM task_cases WHERE invalidated_at IS NOT NULL)""",
                     (now,),
+                )
+                self.connection.executemany(
+                    """INSERT INTO effect_derivation_changes(
+                           change_type, entity_kind, entity_id, generation_id,
+                           binding_json, created_at)
+                       VALUES ('target-invalidated','skill-invocation',?,?, '{}',?)""",
+                    ((invocation_id, generation_id, now) for invocation_id in orphan_invocations),
+                )
+                self.connection.executemany(
+                    """INSERT INTO effect_derivation_changes(
+                           change_type, entity_kind, entity_id, generation_id,
+                           binding_json, created_at)
+                       VALUES ('case-invalidated','task-case',?,?, '{}',?)""",
+                    ((case_id, generation_id, now) for case_id in invalid_cases),
                 )
         return cursor.rowcount == 1
 

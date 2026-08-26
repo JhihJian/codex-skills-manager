@@ -73,6 +73,18 @@ class AppAuthOutcomeApiTests(unittest.TestCase):
             app.Handler.required_roles("POST", "/api/review-tasks/example/claim"),
             ("reviewer",),
         )
+        self.assertEqual(
+            app.Handler.required_roles("GET", "/api/feedback-signals/example"),
+            ("reviewer",),
+        )
+        self.assertEqual(
+            app.Handler.required_roles("GET", "/api/task-cases/example"),
+            ("reviewer",),
+        )
+        self.assertEqual(app.Handler.required_roles("GET", "/api/effect-events"), ("reviewer",))
+        self.assertEqual(app.Handler.required_roles("GET", "/api/review-tasks"), ("reviewer",))
+        self.assertEqual(app.Handler.required_roles("GET", "/api/skill-use-events"), ("reviewer",))
+        self.assertEqual(app.Handler.required_roles("GET", "/api/effect-metrics"), ("reviewer",))
         status, payload, _headers = self.request("GET", "/api/auth/status")
         self.assertEqual((status, payload["authenticated"]), (200, False))
         status, payload, _headers = self.request("GET", "/api/effect-overview")
@@ -134,6 +146,95 @@ class AppAuthOutcomeApiTests(unittest.TestCase):
         )
         self.assertEqual((status, payload["authenticated"]), (200, False))
         self.assertIn("Max-Age=0", headers["Set-Cookie"])
+
+    def test_configured_missing_archive_root_keeps_scan_partial_and_in_scope(self):
+        self.codex_archived_logs.rmdir()
+        cookie, csrf = self.login()
+        status, scan, _headers = self.request(
+            "POST", "/api/effect-scan", {"budgetBytes": 100000, "budgetSeconds": 2},
+            headers={"Cookie": cookie, "X-CSRF-Token": csrf},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual((scan["status"], scan["coverage_status"]), ("partial", "partial"))
+        self.assertGreaterEqual(scan["failed_files"], 1)
+        self.assertEqual(
+            scan["metadata"]["scopeFingerprint"], app.configured_session_scope_fingerprint(),
+        )
+
+    def test_cleanup_run_records_failure_and_can_be_retried_idempotently(self):
+        cookie, csrf = self.login()
+        headers = {"Cookie": cookie, "X-CSRF-Token": csrf}
+        body = {"cleanupRunId": "cleanup-run-test", "olderThan": "2020-01-01T00:00:00Z"}
+        with patch("feedback_service.FeedbackService.cleanup", side_effect=RuntimeError("failed stage")):
+            status, _failed, _response_headers = self.request(
+                "POST", "/api/effect-data/cleanup", body, headers=headers,
+            )
+        self.assertEqual(status, 500)
+        status, run, _response_headers = self.request(
+            "GET", "/api/effect-data/cleanup-runs/cleanup-run-test", headers={"Cookie": cookie},
+        )
+        self.assertEqual((status, run["status"], run["stage"]), (200, "failed", "feedback"))
+        status, completed, _response_headers = self.request(
+            "POST", "/api/effect-data/cleanup", body, headers=headers,
+        )
+        self.assertEqual((status, completed["cleanupRunId"]), (200, "cleanup-run-test"))
+        status, replay, _response_headers = self.request(
+            "POST", "/api/effect-data/cleanup", body, headers=headers,
+        )
+        self.assertEqual((status, replay), (200, completed))
+
+    def test_cleanup_rejects_invalid_criteria_before_creating_run(self):
+        cookie, csrf = self.login()
+        headers = {"Cookie": cookie, "X-CSRF-Token": csrf}
+        status, _payload, _response_headers = self.request(
+            "POST", "/api/effect-data/cleanup",
+            {"cleanupRunId": "invalid-cleanup", "olderThan": "2020-01-01"},
+            headers=headers,
+        )
+        self.assertEqual(status, 400)
+        status, _missing, _response_headers = self.request(
+            "GET", "/api/effect-data/cleanup-runs/invalid-cleanup",
+            headers={"Cookie": cookie},
+        )
+        self.assertEqual(status, 404)
+
+    def test_cleanup_retry_resumes_failed_stage_without_repeating_completed_stages(self):
+        cookie, csrf = self.login()
+        headers = {"Cookie": cookie, "X-CSRF-Token": csrf}
+        body = {"cleanupRunId": "cleanup-run-resume", "olderThan": "2020-01-01T00:00:00Z"}
+
+        class FakeCollector:
+            cleanup_calls = 0
+
+            def materialize_cleanup_context(self):
+                return {"updated": 1}
+
+            def cleanup(self, **_criteria):
+                self.cleanup_calls += 1
+                if self.cleanup_calls == 1:
+                    raise RuntimeError("prospective failed")
+                return {"deleted": 3}
+
+        collector = FakeCollector()
+        with (
+            patch("app.prospective_collector", return_value=collector),
+            patch("feedback_service.FeedbackService.cleanup", return_value={"deleted": 1}) as feedback,
+            patch("outcome_reviews.OutcomeReviewService.cleanup_derived_data", return_value={"deleted": 2}) as outcome,
+        ):
+            status, _failed, _response_headers = self.request(
+                "POST", "/api/effect-data/cleanup", body, headers=headers,
+            )
+            self.assertEqual(status, 500)
+            status, completed, _response_headers = self.request(
+                "POST", "/api/effect-data/cleanup", body, headers=headers,
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual((feedback.call_count, outcome.call_count, collector.cleanup_calls), (1, 1, 2))
+        self.assertEqual(
+            (completed["feedback"]["deleted"], completed["derived"]["deleted"],
+             completed["prospective"]["deleted"]),
+            (1, 2, 3),
+        )
 
     def test_http_review_vertical_flow(self):
         skill_dir = self.skills / "http-review"
@@ -259,6 +360,127 @@ class AppAuthOutcomeApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIsNone(invalidated["current_outcome"])
         self.assertEqual(invalidated["assessments"][-1]["process_state"], "invalidated")
+
+    def test_http_negative_feedback_vertical_flow(self):
+        session = self.logs / "negative-feedback.jsonl"
+        events = [
+            {"type": "session", "id": "feedback-session", "timestamp": "2026-08-24T00:00:00Z"},
+            {"type": "message", "id": "goal", "timestamp": "2026-08-24T00:00:01Z",
+             "message": {"role": "user", "content": "实现权限校验"}},
+            {"type": "message", "id": "answer", "timestamp": "2026-08-24T00:00:02Z",
+             "message": {"role": "assistant", "content": "已经完成"}},
+            {"type": "message", "id": "feedback", "timestamp": "2026-08-24T00:00:03Z",
+             "message": {"role": "user", "content": "还是不行，权限校验漏了。"}},
+        ]
+        session.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in events), encoding="utf-8")
+        cookie, csrf = self.login()
+        headers = {"Cookie": cookie, "X-CSRF-Token": csrf}
+        status, scan, _response_headers = self.request(
+            "POST", "/api/effect-scan", {"budgetBytes": 100000, "budgetSeconds": 2},
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(scan["feedback"]["newSignals"], 1)
+        status, listing, _response_headers = self.request(
+            "GET", "/api/feedback-signals?channel=user-feedback&processState=queued&limit=20",
+            headers={"Cookie": cookie},
+        )
+        self.assertEqual((status, len(listing["items"])), (200, 1))
+        signal = listing["items"][0]
+        status, rejected_decision, _response_headers = self.request(
+            "PUT", f"/api/review-tasks/{signal['review_task_id']}/decision",
+            {"expectedRevision": 0, "verdict": "fail", "reasonCode": "wrong-api"},
+            headers=headers,
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("feedback Action API", rejected_decision["error"])
+        status, rejected_claim, _response_headers = self.request(
+            "POST", f"/api/review-tasks/{signal['review_task_id']}/claim", {},
+            headers=headers,
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("feedback Action API", rejected_claim["error"])
+        status, detail, _response_headers = self.request(
+            "GET", f"/api/feedback-signals/{signal['id']}", headers={"Cookie": cookie},
+        )
+        self.assertEqual(status, 200)
+        target = next(item for item in detail["targets"] if item["machine_status"] == "candidate")
+        class FakeFeedbackModel:
+            model_id = "fake-feedback"
+            model_version = "fake-v1"
+
+            def review(self, request, output_schema):
+                lock_available = []
+                def probe_lock():
+                    acquired = app.OUTCOME_WRITE_LOCK.acquire(blocking=False)
+                    lock_available.append(acquired)
+                    if acquired:
+                        app.OUTCOME_WRITE_LOCK.release()
+                probe = threading.Thread(target=probe_lock)
+                probe.start()
+                probe.join(timeout=1)
+                if lock_available != [True]:
+                    raise AssertionError("semantic model executed while outcome write lock was held")
+                payload = request["payload"]
+                return {
+                    "schema_version": "1.0", "category": "requirement-gap",
+                    "severity": "high", "confidence": 0.95,
+                    "span_ids": [payload["evidence_spans"][0]["id"]],
+                    "target_id": payload["target_ids"][0], "rationale": "missing requirement",
+                    "prompt_injection_detected": False,
+                }
+
+        with patch.object(app, "CodexFeedbackModel", return_value=FakeFeedbackModel()):
+            status, semantic, _response_headers = self.request(
+                "POST", f"/api/feedback-signals/{signal['id']}/semantic-classify", {},
+                headers=headers,
+            )
+        self.assertEqual((status, semantic["verdict"]), (200, "needs-human"))
+        self.assertEqual(semantic["reason"], "calibration-profile-missing")
+        status, claimed, _response_headers = self.request(
+            "POST", f"/api/feedback-signals/{signal['id']}/claim",
+            {"expectedRevision": detail["current_action_revision"]}, headers=headers,
+        )
+        self.assertEqual((status, claimed["action"]), (200, "claimed"))
+        status, confirmed, _response_headers = self.request(
+            "POST", f"/api/feedback-signals/{signal['id']}/actions",
+            {"expectedRevision": claimed["revision"], "action": "confirm",
+             "reasonCode": "user-confirmed", "targetId": target["id"]}, headers=headers,
+        )
+        self.assertEqual((status, confirmed["action"]), (200, "confirm"))
+        status, clusters, _response_headers = self.request(
+            "GET", "/api/feedback-clusters", headers={"Cookie": cookie},
+        )
+        self.assertEqual((status, len(clusters["items"])), (200, 1))
+        status, profile, _response_headers = self.request(
+            "POST", "/api/feedback-calibration-profiles", {}, headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(profile["items"])
+        self.assertTrue(all(not item["eligible"] for item in profile["items"]))
+        status, snapshot, _response_headers = self.request(
+            "POST", "/api/feedback-metric-snapshots", {}, headers=headers,
+        )
+        self.assertEqual((status, snapshot["sealed"]), (200, 1))
+        self.assertEqual(snapshot["dimensions"]["metricKind"], "session-negative-feedback")
+        status, feedback_snapshots, _response_headers = self.request(
+            "GET", "/api/feedback-metric-snapshots", headers={"Cookie": cookie},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(feedback_snapshots["items"][0]["id"], snapshot["id"])
+        self.assertIn("item_count", feedback_snapshots["items"][0])
+        self.assertNotIn("items", feedback_snapshots["items"][0])
+        status, outcome_metrics, _response_headers = self.request(
+            "GET", "/api/effect-metrics", headers={"Cookie": cookie},
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn(snapshot["id"], [item["id"] for item in outcome_metrics["snapshots"]])
+        target_case = target["context_task_case_id"]
+        status, case_detail, _response_headers = self.request(
+            "GET", f"/api/task-cases/{target_case}", headers={"Cookie": cookie},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(case_detail["feedback"][0]["id"], signal["id"])
 
 
 if __name__ == "__main__":
