@@ -1437,6 +1437,7 @@ function renderDetail() {
   }
   renderUsageForSelected();
   renderHistoryForSelected();
+  $("qualityReviewLink").href = `/reviews.html?view=quality&skill=${encodeURIComponent(skill.name)}`;
   $("detailTitle").textContent = displayTitle(skill);
   $("detailDescription").textContent = displayDescription(skill);
   $("detailDescription").classList.toggle("expanded", state.descriptionExpanded);

@@ -183,6 +183,62 @@ class AppAuthOutcomeApiTests(unittest.TestCase):
         )
         self.assertEqual((status, replay), (200, completed))
 
+    def test_quality_api_assigns_and_records_trial_judgment(self):
+        skill = self.skills / "trial-quality" / "SKILL.md"
+        skill.parent.mkdir()
+        skill.write_text("# trial quality\n", encoding="utf-8")
+        session = self.logs / "trial-quality.jsonl"
+        session.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in [
+            {"type": "session", "id": "trial-quality-session", "timestamp": "2026-08-26T00:00:00Z"},
+            {"type": "message", "id": "trial-quality-user", "timestamp": "2026-08-26T00:00:01Z", "message": {
+                "role": "user", "content": [{"type": "text", "text": "完成报告"}],
+            }},
+            {"type": "message", "id": "trial-quality-skill", "timestamp": "2026-08-26T00:00:02Z", "message": {
+                "role": "user", "content": [{"type": "text", "text":
+                    f'<skill name="trial-quality" location="{skill}">{skill.read_text()}</skill>'}],
+            }},
+        ]), encoding="utf-8")
+        cookie, csrf = self.login()
+        headers = {"Cookie": cookie, "X-CSRF-Token": csrf}
+        status, scan, _headers = self.request(
+            "POST", "/api/effect-scan", {"budgetBytes": 100000, "budgetSeconds": 2}, headers=headers,
+        )
+        self.assertEqual((status, scan["coverage_status"]), (200, "complete"))
+        status, directory, _headers = self.request("GET", "/api/skill-quality?skillId=trial-quality", headers={"Cookie": cookie})
+        self.assertEqual((status, len(directory["items"])), (200, 1))
+        self.assertEqual(directory["items"][0]["quality_status"], "evidence-insufficient")
+        status, filtered, _headers = self.request(
+            "GET", "/api/skill-quality?skillId=trial-quality&source=pi&from=2020-01-01T00:00:00Z&to=2030-01-01T00:00:00Z",
+            headers={"Cookie": cookie},
+        )
+        self.assertEqual((status, len(filtered["items"])), (200, 1))
+        status, invalid_source, _headers = self.request(
+            "GET", "/api/skill-quality?source=unknown", headers={"Cookie": cookie},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("source", invalid_source["error"])
+        status, uses, _headers = self.request("GET", "/api/skill-use-events?skill=trial-quality", headers={"Cookie": cookie})
+        self.assertEqual((status, len(uses["items"])), (200, 1))
+        invocation_id = uses["items"][0]["id"]
+        status, assignment, _headers = self.request(
+            "POST", "/api/skill-use-judgment-assignments", {"skillInvocationId": invocation_id}, headers=headers,
+        )
+        self.assertEqual((status, assignment["status"]), (200, "active"))
+        status, trial_users, _headers = self.request("GET", "/api/trial-users", headers={"Cookie": cookie})
+        self.assertEqual(status, 200)
+        self.assertIn(self.auth.actor.uuid, [item["id"] for item in trial_users["items"]])
+        status, judgment, _headers = self.request(
+            "POST", "/api/skill-use-judgments", {
+                "skillInvocationId": invocation_id, "expectedRevision": 0,
+                "verdict": "helpful", "attributionRelation": "direct-skill-use",
+            }, headers=headers,
+        )
+        self.assertEqual((status, judgment["revision"], judgment["verdict"]), (200, 1, "helpful"))
+        status, assignments, _headers = self.request(
+            "GET", "/api/skill-use-judgment-assignments/current", headers={"Cookie": cookie},
+        )
+        self.assertEqual((status, assignments["items"][0]["skill_invocation_id"]), (200, invocation_id))
+
     def test_cleanup_rejects_invalid_criteria_before_creating_run(self):
         cookie, csrf = self.login()
         headers = {"Cookie": cookie, "X-CSRF-Token": csrf}

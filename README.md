@@ -361,6 +361,20 @@ detector 升级时，截断的历史消息按 provenance 字节范围从配置�
 
 数据清理使用可恢复的 `cleanupRunId` 记录 materialize、feedback、outcome 和 prospective 阶段。中途失败可使用同一 ID重试，已完成结果和错误阶段保存在 SQLite；近期 Feedback revision/Action 与 shared 多技能 Case 受保留边界保护。
 
+### 技能质量判断
+
+工作台默认进入“技能质量”目录，按精确 `skill_id + SHA` 展示调用、Case、合同证据、已确认反馈和试用体验。目录与详情支持观察状态、参与关系、任务类型、来源和时间范围筛选，并在 URL 中保留当前范围。来自技能管理详情的入口先按技能名筛选观察版本，避免把当前工作区内容错误当作历史调用版本。
+
+质量结论与加载、合同结果、试用体验和负面反馈分别保存：加载只证明内容被读取；合同结果仅使用完整 scope 的已封存 `metric_eligible` Case；试用体验由显式 assignment 的 `trial_user` 追加，并通过独立不可变质量快照统计；未确认、shared、版本未知和 Evidence 失效项始终单列。partial 扫描、合同缺失、样本不足、多个统计键或未封存体验不会生成“好用/不好用”结论。
+
+主要接口：
+
+- `GET /api/skill-quality`、`/detail`、`/cases`、`/feedback`、`/compare`：读取版本质量目录、下钻和同口径比较。
+- `POST /api/skill-use-judgment-assignments`、`GET /api/skill-use-judgment-assignments/current`：管理并读取试用 assignment。
+- `POST /api/skill-use-judgments`、`POST /api/skill-use-judgments/withdraw`：追加或撤销本人的试用判断。
+- `POST /api/judgment-feedback-referrals/<id>/decision`：由 reviewer 将显式负面试用转介链接、转换或关闭。
+- `POST /api/skill-quality-snapshots`：在 complete scope 和派生游标追平后封存体验统计。
+
 ### 合同与结论
 
 Outcome Contract 存入 skills 仓库的 `codex-skills-manager.sqlite3`，按技能 ID、精确 SHA 和评审模式选择。每个技能版本只有一个 active 合同；发布版本不可修改。工作台提供 Gradle 和文档合同模板，也支持编辑自定义草稿。

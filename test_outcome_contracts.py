@@ -88,6 +88,21 @@ class OutcomeContractStoreTests(unittest.TestCase):
                 {"artifacts": [{"id": "always", "selector": {}, "minCount": 0}]}, "author",
             )
 
+    def test_quality_thresholds_require_conservative_ranges(self) -> None:
+        invalids = [
+            {"minimumSample": 49, "passRateLowerBound": 0.9, "failRateUpperBound": 0.1},
+            {"minimumSample": 50, "passRateLowerBound": -0.1, "failRateUpperBound": 0.1},
+            {"minimumSample": 50, "passRateLowerBound": 0.9, "failRateUpperBound": 1.1},
+        ]
+        for thresholds in invalids:
+            with self.subTest(thresholds=thresholds), self.assertRaises(OutcomeContractError):
+                self.store.create_draft("demo", SHA_A, {"requirements": [], "qualityThresholds": thresholds}, "author")
+        draft = self.store.create_draft("demo", SHA_A, {
+            "requirements": [],
+            "qualityThresholds": {"minimumSample": 50, "passRateLowerBound": 0.95, "failRateUpperBound": 0.05},
+        }, "author")
+        self.assertEqual(draft["contract"]["qualityThresholds"]["minimumSample"], 50)
+
 
 class OutcomeContractInterpreterTests(unittest.TestCase):
     def evaluate(self, contract, **kwargs):

@@ -56,7 +56,7 @@ class AuthServiceTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.actor_file.stat().st_mode), 0o600)
         self.assertEqual(
             set(self.actor.roles),
-            {"admin", "contract-owner", "reviewer"},
+            {"admin", "contract-owner", "reviewer", "trial_user"},
         )
         self.assertEqual(self.actor.operator_name, "测试操作者")
 

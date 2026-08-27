@@ -650,6 +650,7 @@ class FeedbackService:
         targets: Sequence[Mapping[str, Any]],
         *,
         source: str,
+        queue: bool = True,
     ) -> dict[str, Any]:
         span = _mapping(candidate.get("span"))
         channel = str(candidate.get("channel") or "user-feedback")
@@ -829,7 +830,7 @@ class FeedbackService:
                 binding={"detectorId": selected_detector_id, "detectorVersion": selected_detector_version,
                          "machineRevisionId": revision_id},
             )
-            queued = confidence >= 0.85 and bool(inserted_targets)
+            queued = queue and confidence >= 0.85 and bool(inserted_targets)
             if queued:
                 queued = self._ensure_queue(
                     signal_id, revision_id, inserted_targets[0], candidate
@@ -2848,6 +2849,7 @@ class FeedbackService:
                FROM feedback_signals s JOIN feedback_signal_revisions r ON r.id=s.current_machine_revision_id
                LEFT JOIN feedback_targets t ON t.id=s.current_confirmed_target_id
                WHERE COALESCE(r.observed_at,r.created_at)<=? AND r.created_at<=?
+                 AND r.channel<>'trial-experience'
                  AND (? IS NULL OR EXISTS (
                    SELECT 1 FROM event_provenance provenance
                    JOIN log_file_generations generation ON generation.id=provenance.generation_id

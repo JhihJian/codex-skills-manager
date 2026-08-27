@@ -76,6 +76,9 @@ class EffectStoreTests(unittest.TestCase):
             "semantic_reviews", "outcome_assessments", "review_tasks", "manual_decisions",
             "corrections", "exceptions", "actors", "metric_snapshots",
             "metric_snapshot_cases", "prospective_events",
+            "skill_use_judgment_assignments", "use_evidence_snapshots",
+            "skill_use_judgments", "judgment_feedback_referrals",
+            "skill_quality_snapshots", "skill_quality_snapshot_items",
         }
         self.assertTrue(expected <= tables)
         self.assertEqual(

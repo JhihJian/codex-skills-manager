@@ -4183,6 +4183,20 @@ class Handler(SimpleHTTPRequestHandler):
     def required_roles(method: str, path: str) -> tuple[str, ...]:
         if path.startswith("/api/effect-data/cleanup-runs"):
             return ("admin",)
+        if path == "/api/skill-use-judgment-assignments/current":
+            return ()
+        if path.startswith("/api/skill-use-judgment-assignments"):
+            return ("admin",)
+        if path == "/api/trial-users":
+            return ("admin",)
+        if path.startswith("/api/skill-use-judgments"):
+            return ()
+        if path.startswith("/api/judgment-feedback-referrals"):
+            return ("reviewer",)
+        if path.startswith("/api/skill-quality-snapshots"):
+            return ("admin",) if method != "GET" else ("reviewer",)
+        if path.startswith("/api/skill-quality"):
+            return ("reviewer",)
         if method in {"GET", "HEAD"}:
             if (
                 path.startswith("/api/feedback-")
@@ -4430,6 +4444,160 @@ class Handler(SimpleHTTPRequestHandler):
                     self.send_json({
                         "items": [EffectStore._row(row) for row in rows]
                     })
+                return True
+
+            if method == "GET" and path == "/api/skill-quality":
+                with outcome_service() as service:
+                    self.send_json(service.quality.directory(
+                        skill_id=(query.get("skillId") or [None])[0],
+                        observation=(query.get("observation") or [None])[0],
+                        attribution=(query.get("attribution") or [None])[0],
+                        task_type=(query.get("taskType") or [None])[0],
+                        source=(query.get("source") or [None])[0],
+                        from_at=(query.get("from") or [None])[0],
+                        to_at=(query.get("to") or [None])[0],
+                        limit=bounded_query_int(query, "limit", 100, 200),
+                        cursor=(query.get("cursor") or [None])[0],
+                    ))
+                return True
+            if method == "GET" and path == "/api/skill-quality/detail":
+                skill_id = str((query.get("skillId") or [""])[0]).strip()
+                if not skill_id:
+                    raise ApiError("skillId 是必填项。")
+                sha_value = (query.get("sha") or [None])[0]
+                with outcome_service() as service:
+                    self.send_json(service.quality.detail(
+                        skill_id, sha_value or None,
+                        task_type=(query.get("taskType") or [None])[0],
+                        attribution=(query.get("attribution") or [None])[0],
+                        source=(query.get("source") or [None])[0],
+                        from_at=(query.get("from") or [None])[0],
+                        to_at=(query.get("to") or [None])[0],
+                    ))
+                return True
+            if method == "GET" and path == "/api/skill-quality/cases":
+                skill_id = str((query.get("skillId") or [""])[0]).strip()
+                if not skill_id:
+                    raise ApiError("skillId 是必填项。")
+                with outcome_service() as service:
+                    self.send_json(service.quality.cases(
+                        skill_id, (query.get("sha") or [None])[0] or None,
+                        task_type=(query.get("taskType") or [None])[0],
+                        attribution=(query.get("attribution") or [None])[0],
+                        source=(query.get("source") or [None])[0],
+                        from_at=(query.get("from") or [None])[0],
+                        to_at=(query.get("to") or [None])[0],
+                        limit=bounded_query_int(query, "limit", 50, 100),
+                        cursor=(query.get("cursor") or [None])[0],
+                    ))
+                return True
+            if method == "GET" and path == "/api/skill-quality/feedback":
+                skill_id = str((query.get("skillId") or [""])[0]).strip()
+                if not skill_id:
+                    raise ApiError("skillId 是必填项。")
+                with outcome_service() as service:
+                    self.send_json(service.quality.feedback_items(
+                        skill_id, (query.get("sha") or [None])[0] or None,
+                        task_type=(query.get("taskType") or [None])[0],
+                        attribution=(query.get("attribution") or [None])[0],
+                        source=(query.get("source") or [None])[0],
+                        from_at=(query.get("from") or [None])[0],
+                        to_at=(query.get("to") or [None])[0],
+                        limit=bounded_query_int(query, "limit", 50, 100),
+                        cursor=(query.get("cursor") or [None])[0],
+                    ))
+                return True
+            if method == "GET" and path == "/api/skill-quality/compare":
+                raw_subjects = query.get("subject") or []
+                subjects = []
+                for value in raw_subjects:
+                    skill_id, separator, sha = str(value).partition("@")
+                    if not skill_id or not separator:
+                        raise ApiError("subject 必须是 skillId@sha。")
+                    subjects.append({"skillId": skill_id, "sha": sha or None})
+                with outcome_service() as service:
+                    self.send_json(service.quality.compare(
+                        subjects, task_type=(query.get("taskType") or [None])[0],
+                        attribution=str((query.get("attribution") or ["direct"])[0]),
+                        source=(query.get("source") or [None])[0],
+                        from_at=(query.get("from") or [None])[0],
+                        to_at=(query.get("to") or [None])[0],
+                    ))
+                return True
+            if method == "GET" and path == "/api/skill-use-judgment-assignments/current":
+                with outcome_service() as service:
+                    self.send_json(service.quality.assignments(actor.uuid))
+                return True
+            if method == "GET" and path == "/api/trial-users":
+                with outcome_service() as service:
+                    rows = service.store.execute(
+                        """SELECT id, display_name, roles_json FROM actors WHERE active=1
+                           ORDER BY display_name, id"""
+                    ).fetchall()
+                    self.send_json({"items": [
+                        {"id": row["id"], "displayName": row["display_name"]}
+                        for row in rows
+                        if "trial_user" in json.loads(row["roles_json"])
+                        or "admin" in json.loads(row["roles_json"])
+                    ]})
+                return True
+            if method == "POST" and path == "/api/skill-use-judgment-assignments":
+                body = self.read_body()
+                target_actor = str(body.get("actorId") or actor.uuid)
+                with OUTCOME_WRITE_LOCK, outcome_service() as service:
+                    self.send_json(service.quality.assign(
+                        str(body.get("skillInvocationId") or ""), actor_id=target_actor,
+                        assigned_by_actor_id=actor.uuid, expires_at=body.get("expiresAt"),
+                    ))
+                return True
+            if method == "GET" and path == "/api/skill-use-judgments":
+                invocation_id = str((query.get("skillInvocationId") or [""])[0]).strip()
+                with outcome_service() as service:
+                    if invocation_id:
+                        self.send_json(service.quality.judgments(invocation_id, actor_id=actor.uuid))
+                    else:
+                        self.send_json(service.quality.assignments(actor.uuid))
+                return True
+            if method == "POST" and path == "/api/skill-use-judgments":
+                body = self.read_body()
+                with OUTCOME_WRITE_LOCK, outcome_service() as service:
+                    self.send_json(service.quality.submit_judgment(
+                        str(body.get("skillInvocationId") or ""), actor_id=actor.uuid,
+                        expected_revision=int(body.get("expectedRevision", 0)),
+                        verdict=str(body.get("verdict") or ""),
+                        attribution_relation=str(body.get("attributionRelation") or ""),
+                        reason_code=str(body.get("reasonCode") or "") or None,
+                        note=str(body.get("note") or "") or None,
+                    ))
+                return True
+            if method == "POST" and path == "/api/skill-use-judgments/withdraw":
+                body = self.read_body()
+                with OUTCOME_WRITE_LOCK, outcome_service() as service:
+                    self.send_json(service.quality.withdraw_judgment(
+                        str(body.get("skillInvocationId") or ""), actor_id=actor.uuid,
+                        expected_revision=int(body.get("expectedRevision", 0)),
+                    ))
+                return True
+            referral_match = re.match(r"^/api/judgment-feedback-referrals/([^/]+)/decision$", path)
+            if method == "POST" and referral_match:
+                body = self.read_body()
+                with OUTCOME_WRITE_LOCK, outcome_service() as service:
+                    self.send_json(service.quality.decide_referral(
+                        referral_match.group(1), actor_id=actor.uuid,
+                        action=str(body.get("action") or ""), reason_code=str(body.get("reasonCode") or ""),
+                        feedback_signal_id=body.get("feedbackSignalId"), note=str(body.get("note") or "") or None,
+                    ))
+                return True
+            if method == "POST" and path == "/api/skill-quality-snapshots":
+                with OUTCOME_WRITE_LOCK, outcome_service() as service:
+                    self.send_json(service.quality.seal_snapshot(
+                        expected_scope_fingerprint=configured_session_scope_fingerprint(),
+                    ))
+                return True
+            quality_snapshot_match = re.match(r"^/api/skill-quality-snapshots/([^/]+)$", path)
+            if method == "GET" and quality_snapshot_match:
+                with outcome_service() as service:
+                    self.send_json(service.quality.quality_snapshot(quality_snapshot_match.group(1)))
                 return True
 
             feedback_match = re.match(r"^/api/feedback-signals/([^/]+)(?:/(claim|actions|retarget|semantic-classify))?$", path)
@@ -5014,6 +5182,9 @@ class Handler(SimpleHTTPRequestHandler):
             return True
         except ApiError as exc:
             self.send_json({"error": exc.message}, exc.status)
+            return True
+        except KeyError as exc:
+            self.send_json({"error": f"未找到对象：{exc.args[0]}"}, HTTPStatus.NOT_FOUND)
             return True
         except Exception as exc:  # noqa: BLE001
             self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)

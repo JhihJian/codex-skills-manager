@@ -1,7 +1,16 @@
+const initialRoute = new URLSearchParams(window.location.search);
 const state = {
-  view: "loads", overview: null, selectedCase: null, selectedFeedback: null,
-  skillFilter: "", feedbackChannel: "", feedbackSeverity: "",
+  view: initialRoute.get("view") || "quality", overview: null, selectedCase: initialRoute.get("case"), selectedFeedback: initialRoute.get("feedback"),
+  skillFilter: initialRoute.get("skill") || "", feedbackChannel: "", feedbackSeverity: "",
   feedbackResolution: "", feedbackItems: [], feedbackNextCursor: null, busy: false,
+  qualitySubject: initialRoute.get("skill") && initialRoute.get("sha") ? {
+    skillId: initialRoute.get("skill"), sha: initialRoute.get("sha") || null,
+  } : null,
+  qualityTab: initialRoute.get("tab") || "overview", qualityObservation: initialRoute.get("observation") || "",
+  qualityAttribution: initialRoute.get("attribution") || "", qualityTaskType: initialRoute.get("taskType") || "",
+  qualitySource: initialRoute.get("source") || "", qualityFrom: initialRoute.get("from") || "", qualityTo: initialRoute.get("to") || "",
+  qualityCompare: [], qualityJudgmentInvocation: null, qualityReturnCase: null,
+  qualityItems: [], qualityNextCursor: null,
 };
 const $ = (id) => document.getElementById(id);
 
@@ -41,6 +50,11 @@ function toneFor(value) {
 function label(value) {
   return {
     loaded: "加载成功", pending: "等待结果", "result-missing": "结果缺失", error: "加载错误",
+    unobserved: "尚未观察", "only-loaded": "仅检测到加载", "evidence-insufficient": "证据不足",
+    directional: "方向性结论", "judgment-supported": "证据支持达到合同阈值", "threshold-not-met": "证据支持未达到合同阈值", "not-publishable": "不可发布",
+    helpful: "有帮助", "not-helpful": "没帮助", "cannot-judge": "无法判断",
+    "not-applicable": "不适用", "direct-skill-use": "该技能调用直接相关",
+    "task-result-only": "仅与任务结果相关", "cannot-attribute": "无法归因",
     blocked: "已阻止", cancelled: "已取消", pass: "通过", partial: "部分通过", fail: "失败",
     unset: "未形成结论", assessable: "可评审", "needs-evidence": "证据不足",
     "not-assessable": "不可评审", direct: "直接参与", shared: "共享参与", candidate: "候选关系",
@@ -77,6 +91,10 @@ function label(value) {
 
 function shortSha(value) {
   return value ? String(value).slice(0, 10) : "版本未知";
+}
+
+function coverageLabel(value) {
+  return { complete: "完整覆盖", partial: "部分覆盖", unknown: "覆盖未知" }[value] || "覆盖未知";
 }
 
 function dateText(value) {
@@ -116,7 +134,7 @@ function renderOverview() {
     ["可评审", overview.assessable_count || 0],
     ["证据不足", overview.needs_evidence_count || 0],
     ["待人工", overview.open_review_count || 0],
-    ["覆盖", label(scan.coverage_status || "unknown")],
+    ["覆盖", coverageLabel(scan.coverage_status || "unknown")],
   ];
   $("effectOverview").replaceChildren(...metrics.map(([name, value]) => {
     const metric = element("div", "outcome-overview-item");
@@ -139,7 +157,15 @@ function filterBar({ skill = true, status = false } = {}) {
     input.type = "search";
     input.placeholder = "筛选技能名称";
     input.value = state.skillFilter;
-    input.addEventListener("change", () => { state.skillFilter = input.value.trim(); renderView(); });
+    let timer = null;
+    input.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { state.skillFilter = input.value.trim(); renderView(); }, 250);
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") { clearTimeout(timer); state.skillFilter = input.value.trim(); renderView(); }
+      if (event.key === "Escape") { clearTimeout(timer); input.value = ""; state.skillFilter = ""; renderView(); }
+    });
     bar.append(input);
   }
   if (status) {
@@ -168,7 +194,9 @@ function resultRow(item, mode) {
     row.append(element("span", "outcome-mono", item.contract_version_id ? item.contract_version_id.slice(0, 8) : "无合同"));
   }
   row.append(element("time", "", dateText(item.created_at)));
-  row.append(actionButton("查看", async () => openCase(item.task_case_id), "text-button"));
+  if (item.task_case_id) row.append(actionButton("查看", async () => openCase(item.task_case_id), "text-button"));
+  else row.append(element("span", "outcome-muted", "尚未形成 Case"));
+  row.append(actionButton("质量", async () => openQuality(item.skill_id, item.skill_sha256 || null), "text-button"));
   return row;
 }
 
@@ -361,8 +389,10 @@ function feedbackActionPanel(detail) {
 }
 
 async function openFeedback(signalId) {
+  if (state.view === "quality" && state.selectedCase) state.qualityReturnCase = state.selectedCase;
   state.selectedFeedback = signalId;
   state.selectedCase = null;
+  if (state.view === "quality") qualityRoute();
   const content = $("outcomeContent");
   content.replaceChildren(element("div", "loading-state", "正在读取反馈详情"));
   const detail = await api(`/api/feedback-signals/${encodeURIComponent(signalId)}`);
@@ -371,7 +401,17 @@ async function openFeedback(signalId) {
   const head = sectionHead(label(current.category), current.redacted_excerpt || "正文已清理");
   head.append(actionButton("返回", async () => {
     state.selectedFeedback = null;
-    await renderFeedback();
+    if (state.qualityReturnCase) {
+      const returnCase = state.qualityReturnCase;
+      state.qualityReturnCase = null;
+      state.selectedCase = returnCase;
+      qualityRoute({ caseId: returnCase, feedbackId: null, replace: true });
+      await openCase(returnCase);
+    } else if (state.qualitySubject) {
+      state.qualityTab = "feedback";
+      qualityRoute({ feedbackId: null, replace: true });
+      await renderQualityDetail();
+    } else await renderFeedback();
   }, "text-button"));
   const layout = element("div", "feedback-detail-layout");
   const evidence = element("section", "feedback-evidence-pane");
@@ -521,11 +561,30 @@ function reviewActions(detail) {
 async function openCase(caseId) {
   state.selectedCase = caseId;
   state.selectedFeedback = null;
+  if (state.view === "quality") qualityRoute();
   const content = $("outcomeContent");
   content.replaceChildren(element("div", "loading-state", "正在读取案例证据"));
-  const detail = await api(`/api/task-cases/${encodeURIComponent(caseId)}`);
+  let detail;
+  try {
+    detail = await api(`/api/task-cases/${encodeURIComponent(caseId)}`);
+  } catch (error) {
+    const panel = element("section", "quality-error-state");
+    panel.append(element("h2", "", "无法读取案例"), element("p", "", error.message),
+      actionButton("重试", () => openCase(caseId), "primary-button"));
+    if (state.view === "quality") panel.append(actionButton("返回质量页", () => {
+      state.selectedCase = null;
+      qualityRoute({ caseId: null, replace: true });
+      return renderQualityDetail();
+    }, "secondary-button"));
+    content.replaceChildren(panel);
+    return;
+  }
   const head = sectionHead(detail.case.task_type || "任务案例", `Case ${detail.case.id.slice(0, 12)} · revision ${detail.case.current_revision}`);
-  head.append(actionButton("返回", async () => { state.selectedCase = null; await renderView(); }, "text-button"));
+  head.append(actionButton("返回", async () => {
+    state.selectedCase = null;
+    if (state.view === "quality") qualityRoute({ caseId: null, replace: true });
+    await renderView();
+  }, "text-button"));
   const layout = element("div", "case-detail-layout");
   const timeline = element("section", "case-timeline");
   timeline.append(element("h2", "", "证据时间线"));
@@ -657,10 +716,466 @@ async function renderMetrics() {
   content.replaceChildren(head, preview, report, list);
 }
 
+function qualityRoute({ skillId = state.qualitySubject?.skillId, sha = state.qualitySubject?.sha,
+  tab = state.qualityTab, observation = state.qualityObservation, caseId = state.selectedCase,
+  feedbackId = state.selectedFeedback, replace = false } = {}) {
+  const params = new URLSearchParams(window.location.search);
+  params.set("view", "quality");
+  if (skillId) params.set("skill", skillId); else params.delete("skill");
+  if (sha) params.set("sha", sha); else params.delete("sha");
+  if (tab && skillId) params.set("tab", tab); else params.delete("tab");
+  if (observation) params.set("observation", observation); else params.delete("observation");
+  if (state.qualityAttribution) params.set("attribution", state.qualityAttribution); else params.delete("attribution");
+  if (state.qualityTaskType) params.set("taskType", state.qualityTaskType); else params.delete("taskType");
+  if (state.qualitySource) params.set("source", state.qualitySource); else params.delete("source");
+  if (state.qualityFrom) params.set("from", state.qualityFrom); else params.delete("from");
+  if (state.qualityTo) params.set("to", state.qualityTo); else params.delete("to");
+  if (caseId) params.set("case", caseId); else params.delete("case");
+  if (feedbackId) params.set("feedback", feedbackId); else params.delete("feedback");
+  const url = `${window.location.pathname}?${params.toString()}`;
+  window.history[replace ? "replaceState" : "pushState"]({}, "", url);
+}
+
+function openQuality(skillId, sha) {
+  state.view = "quality";
+  state.selectedCase = null;
+  state.selectedFeedback = null;
+  state.qualitySubject = { skillId, sha: sha || null };
+  state.qualityTab = "overview";
+  qualityRoute();
+  return renderQuality();
+}
+
+function qualityStatusBadge(status) {
+  const tone = status === "judgment-supported" ? "green"
+    : status === "threshold-not-met" ? "red"
+      : status === "not-publishable" ? "orange" : "";
+  return badge(label(status), tone);
+}
+
+function qualityFailure(content, message, retry) {
+  const panel = element("section", "quality-error-state");
+  panel.append(element("h2", "", "无法读取技能质量"), element("p", "", message),
+    actionButton("重试", retry, "primary-button"));
+  if (state.qualitySubject) panel.append(actionButton("返回目录", () => {
+    state.qualitySubject = null;
+    qualityRoute({ skillId: null, sha: null, tab: null, replace: true });
+    return renderQuality();
+  }, "secondary-button"));
+  content.replaceChildren(panel);
+}
+
+function qualityFilters() {
+  const bar = element("div", "outcome-filterbar quality-filterbar");
+  const input = element("input");
+  input.type = "search";
+  input.placeholder = "搜索技能名称";
+  input.value = state.skillFilter;
+  let timer = null;
+  const apply = () => {
+    state.skillFilter = input.value.trim();
+    qualityRoute({ skillId: state.skillFilter || null, sha: null, tab: null, replace: true });
+    renderQuality().catch((error) => setStatus(error.message));
+  };
+  input.addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(apply, 250); });
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { clearTimeout(timer); apply(); }
+    if (event.key === "Escape") { clearTimeout(timer); input.value = ""; apply(); }
+  });
+  const observation = element("select");
+  [["", "全部观察状态"], ["observed", "已观察"], ["evaluable", "可判断"], ["insufficient", "证据不足"]]
+    .forEach(([value, text]) => observation.append(new Option(text, value)));
+  observation.value = state.qualityObservation;
+  observation.addEventListener("change", () => {
+    state.qualityObservation = observation.value;
+    qualityRoute({ skillId: state.skillFilter || null, sha: null, tab: null, replace: true });
+    renderQuality().catch((error) => setStatus(error.message));
+  });
+  const attribution = element("select");
+  [["", "全部参与关系"], ["direct", "直接参与"], ["shared", "共享参与"]]
+    .forEach(([value, text]) => attribution.append(new Option(text, value)));
+  attribution.value = state.qualityAttribution;
+  const taskType = element("input"); taskType.type = "search"; taskType.placeholder = "任务类型"; taskType.value = state.qualityTaskType;
+  const source = element("select");
+  [["", "全部来源"], ["codex", "Codex"], ["pi", "Pi"]]
+    .forEach(([value, text]) => source.append(new Option(text, value)));
+  source.value = state.qualitySource;
+  const from = element("input"); from.type = "date"; from.value = state.qualityFrom.slice(0, 10);
+  const to = element("input"); to.type = "date"; to.value = state.qualityTo.slice(0, 10);
+  const applyScope = () => {
+    state.qualityAttribution = attribution.value;
+    state.qualityTaskType = taskType.value.trim();
+    state.qualitySource = source.value;
+    state.qualityFrom = from.value ? `${from.value}T00:00:00Z` : "";
+    state.qualityTo = to.value ? `${to.value}T23:59:59Z` : "";
+    qualityRoute({ skillId: state.skillFilter || null, sha: null, tab: null, replace: true });
+    renderQuality().catch((error) => setStatus(error.message));
+  };
+  attribution.addEventListener("change", applyScope);
+  source.addEventListener("change", applyScope);
+  taskType.addEventListener("change", applyScope);
+  from.addEventListener("change", applyScope);
+  to.addEventListener("change", applyScope);
+  bar.append(input, observation, attribution, taskType, source, from, to);
+  if (state.qualityCompare.length) {
+    bar.append(element("span", "outcome-muted", `已选择 ${state.qualityCompare.length}/2 个版本`));
+    bar.append(actionButton("清除比较", () => { state.qualityCompare = []; return renderQuality(); }, "text-button"));
+  }
+  if (state.qualityCompare.length === 2) {
+    bar.append(actionButton("比较版本", () => renderQualityComparison(), "primary-button"));
+  }
+  return bar;
+}
+
+async function renderQuality(reset = true) {
+  await window.skillAuth.fetch("/api/auth/status");
+  const roles = window.skillAuth.state.actor?.roles || [];
+  if (!roles.includes("reviewer") && !roles.includes("admin")) return renderTrialAssignments();
+  if (state.qualitySubject) return renderQualityDetail();
+  const content = $("outcomeContent");
+  const head = sectionHead("技能质量", "先确认版本、覆盖和证据是否足以判断，再查看任务结果、体验与反馈。");
+  head.append(qualityFilters());
+  content.replaceChildren(head, element("div", "loading-state", "正在读取技能质量目录"));
+  if (reset) {
+    state.qualityItems = [];
+    state.qualityNextCursor = null;
+  }
+  const query = new URLSearchParams({ limit: "100" });
+  if (state.skillFilter) query.set("skillId", state.skillFilter);
+  if (state.qualityObservation) query.set("observation", state.qualityObservation);
+  if (state.qualityAttribution) query.set("attribution", state.qualityAttribution);
+  if (state.qualityTaskType) query.set("taskType", state.qualityTaskType);
+  if (state.qualitySource) query.set("source", state.qualitySource);
+  if (state.qualityFrom) query.set("from", state.qualityFrom);
+  if (state.qualityTo) query.set("to", state.qualityTo);
+  if (!reset && state.qualityNextCursor) query.set("cursor", state.qualityNextCursor);
+  let payload;
+  try {
+    payload = await api(`/api/skill-quality?${query}`);
+  } catch (error) {
+    qualityFailure(content, error.message, () => renderQuality());
+    return;
+  }
+  state.qualityItems.push(...(payload.items || []));
+  state.qualityNextCursor = payload.next_cursor || null;
+  const coverage = element("section", "quality-coverage-band");
+  coverage.append(
+    qualityStatusBadge(payload.coverage?.coverage_status === "complete" ? "complete" : "not-publishable"),
+    element("span", "", `发现 ${payload.coverage?.discovered_files || 0} 个日志，已索引 ${payload.coverage?.indexed_files || 0} 个`),
+    element("span", "outcome-muted", `待处理 ${payload.coverage?.pending_files || 0} · 失败 ${payload.coverage?.failed_files || 0}`),
+  );
+  const table = element("div", "outcome-table quality-directory-table");
+  table.append(element("div", "outcome-table-head", "比较 / 技能版本 / 判断状态 / 直接 Case / 最近观察 / 操作"));
+  for (const item of state.qualityItems) {
+    const row = element("div", "outcome-table-row quality-directory-row");
+    const choose = element("input"); choose.type = "checkbox";
+    const key = `${item.skill_id}@${item.skill_sha256 || ""}`;
+    choose.checked = state.qualityCompare.some((subject) => `${subject.skillId}@${subject.sha || ""}` === key);
+    choose.disabled = !choose.checked && state.qualityCompare.length >= 2;
+    choose.addEventListener("change", () => {
+      if (choose.checked) state.qualityCompare.push({ skillId: item.skill_id, sha: item.skill_sha256 || null });
+      else state.qualityCompare = state.qualityCompare.filter((subject) => `${subject.skillId}@${subject.sha || ""}` !== key);
+      renderQuality().catch((error) => setStatus(error.message));
+    });
+    const primary = element("div", "outcome-row-primary");
+    primary.append(element("strong", "", item.skill_id), element("span", "outcome-mono", shortSha(item.skill_sha256)));
+    row.append(choose, primary, qualityStatusBadge(item.quality_status), element("span", "", item.direct_case_count || 0),
+      element("time", "", dateText(item.last_observed_at)),
+      actionButton("查看质量", () => openQuality(item.skill_id, item.skill_sha256 || null), "text-button"));
+    table.append(row);
+  }
+  if (!state.qualityItems.length) table.append(element("div", "empty-state", "当前条件下没有可观察的技能版本。"));
+  if (state.qualityNextCursor) table.append(actionButton("加载更多", () => renderQuality(false), "secondary-button feedback-load-more"));
+  content.replaceChildren(head, coverage, table);
+}
+
+async function renderTrialAssignments() {
+  const content = $("outcomeContent");
+  const head = sectionHead("已分配试用", "仅显示分配给你的技能调用与脱敏证据摘要。提交判断不会改变合同结果或任务结论。");
+  content.replaceChildren(head, element("div", "loading-state", "正在读取试用任务"));
+  let payload;
+  try {
+    payload = await api("/api/skill-use-judgment-assignments/current");
+  } catch (error) {
+    qualityFailure(content, error.message, () => renderTrialAssignments());
+    return;
+  }
+  const list = element("div", "outcome-table quality-assignment-table");
+  list.append(element("div", "outcome-table-head", "技能版本 / 任务类型 / 证据状态 / 反馈状态 / 操作"));
+  for (const item of payload.items || []) {
+    const row = element("div", "outcome-table-row");
+    const primary = element("div", "outcome-row-primary");
+    primary.append(element("strong", "", item.skill_id), element("span", "outcome-mono", shortSha(item.skill_sha256)));
+    const preview = item.evidence_preview || {};
+    row.append(primary, element("span", "", preview.case?.taskType || "任务类型未知"),
+      badge(preview.checks?.length ? "存在检查摘要" : "缺少检查摘要", preview.checks?.length ? "green" : "orange"),
+      element("span", "", `关联反馈 ${preview.relatedFeedback?.count || 0}`));
+    if (item.evidence_stale) row.append(badge(item.evidence_expired ? "分配已过期" : "证据已失效", "orange"));
+    else row.append(actionButton("判断本次使用", async () => {
+      state.qualityJudgmentInvocation = item.skill_invocation_id;
+      await renderTrialAssignments();
+    }, "primary-button"));
+    list.append(row);
+  }
+  if (!payload.items?.length) list.append(element("div", "empty-state", "当前没有分配给你的试用调用。"));
+  if (state.qualityJudgmentInvocation) list.append(await qualityJudgmentPanel(state.qualityJudgmentInvocation));
+  content.replaceChildren(head, list);
+}
+
+function qualityTabs(detail) {
+  const tabs = element("div", "quality-tabs");
+  [["overview", "总览"], ["cases", "案例"], ["feedback", "反馈"], ["metrics", "指标"], ["contracts", "合同与口径"]]
+    .forEach(([value, text]) => {
+      const button = actionButton(text, () => {
+        state.qualityTab = value;
+        qualityRoute({ replace: true });
+        return renderQualityDetail();
+      }, value === state.qualityTab ? "primary-button" : "secondary-button");
+      button.dataset.tab = value;
+      tabs.append(button);
+    });
+  return tabs;
+}
+
+function funnelTable(funnel) {
+  const table = element("div", "quality-funnel");
+  [["有效调用", funnel.valid_invocations], ["加载成功", funnel.loaded_invocations], ["关联 Case", funnel.cases],
+    ["版本已知 Case", funnel.known_version_cases], ["直接归因 Case", funnel.direct_cases],
+    ["存在合同", funnel.contract_cases], ["可评审", funnel.assessable_cases]]
+    .forEach(([name, value]) => {
+      const item = element("div", "quality-funnel-item");
+      item.append(element("span", "", name), element("strong", "", value || 0));
+      table.append(item);
+    });
+  return table;
+}
+
+async function renderQualityDetail() {
+  const content = $("outcomeContent");
+  const subject = state.qualitySubject;
+  content.replaceChildren(element("div", "loading-state", "正在读取技能版本质量"));
+  const query = new URLSearchParams({ skillId: subject.skillId });
+  if (subject.sha) query.set("sha", subject.sha);
+  if (state.qualityTaskType) query.set("taskType", state.qualityTaskType);
+  if (state.qualityAttribution) query.set("attribution", state.qualityAttribution);
+  if (state.qualitySource) query.set("source", state.qualitySource);
+  if (state.qualityFrom) query.set("from", state.qualityFrom);
+  if (state.qualityTo) query.set("to", state.qualityTo);
+  let detail;
+  try {
+    detail = await api(`/api/skill-quality/detail?${query}`);
+  } catch (error) {
+    qualityFailure(content, error.message, () => renderQualityDetail());
+    return;
+  }
+  let trialUsers = [];
+  if ((window.skillAuth.state.actor?.roles || []).includes("admin")) {
+    try { trialUsers = (await api("/api/trial-users")).items || []; }
+    catch (error) { qualityFailure(content, error.message, () => renderQualityDetail()); return; }
+  }
+  const head = sectionHead(detail.subject.skill_id, `版本 ${shortSha(detail.subject.skill_sha256)} · 精确版本质量口径`);
+  head.append(actionButton("返回目录", () => {
+    state.qualitySubject = null; state.qualityTab = "overview"; state.qualityJudgmentInvocation = null;
+    qualityRoute({ skillId: state.skillFilter || null, sha: null, tab: null });
+    return renderQuality();
+  }, "text-button"));
+  const context = element("section", "quality-context-band");
+  const scopeText = [
+    state.qualityTaskType && `任务类型 ${state.qualityTaskType}`,
+    state.qualityAttribution && `参与关系 ${label(state.qualityAttribution)}`,
+    state.qualitySource && `来源 ${state.qualitySource}`,
+    (state.qualityFrom || state.qualityTo) && `观察时间 ${state.qualityFrom || "起始"} 至 ${state.qualityTo || "当前"}`,
+  ].filter(Boolean).join(" · ");
+  const contextItems = [qualityStatusBadge(detail.quality_status),
+    element("span", "outcome-mono", detail.subject.skill_sha256 || "版本未知"),
+    element("span", "", `覆盖 ${coverageLabel(detail.coverage.coverage_status)}`),
+    element("span", "", `索引 ${detail.coverage.indexed_files || 0}/${detail.coverage.discovered_files || 0}`)];
+  if (scopeText) contextItems.push(element("span", "outcome-muted", scopeText));
+  context.append(...contextItems);
+  const reasons = element("section", "quality-reasons");
+  reasons.append(element("h2", "", "判断依据与限制"));
+  if (detail.blocking_reasons?.length) detail.blocking_reasons.forEach((reason) => reasons.append(badge(reason, "orange")));
+  else reasons.append(element("p", "outcome-muted", "当前统计键满足发布前置条件。"));
+  const panel = element("section", "quality-detail-panel");
+  if (state.qualityTab === "overview") {
+    panel.append(element("h2", "", "样本漏斗"), funnelTable(detail.funnel));
+    const results = element("div", "quality-result-strip");
+    results.append(element("strong", "", "合同结果"), element("span", "", `合格 Case ${detail.formal_results.eligible_cases || 0}`),
+      element("span", "", `通过 ${detail.formal_results.pass || 0}`), element("span", "", `部分 ${detail.formal_results.partial || 0}`),
+      element("span", "", `失败 ${detail.formal_results.fail || 0}`));
+    panel.append(results);
+    if (detail.formal_results.groups?.length) {
+      const groups = element("div", "quality-formal-groups");
+      detail.formal_results.groups.forEach((group) => {
+        const text = [
+          `合同 ${group.contract_version_id?.slice(0, 10) || "缺失"}`,
+          group.task_type || "任务类型未知", `样本 ${group.eligible_cases}`,
+          `通过 ${group.pass} / 部分 ${group.partial} / 失败 ${group.fail}`,
+          group.pass_lower_bound === undefined ? "阈值未配置" : `通过下界 ${(group.pass_lower_bound * 100).toFixed(1)}% · 失败上界 ${(group.fail_upper_bound * 100).toFixed(1)}%`,
+        ].join(" · ");
+        groups.append(element("p", "outcome-muted", text));
+      });
+      panel.append(groups);
+    }
+    const experience = element("div", "quality-result-strip");
+    experience.append(element("strong", "", "试用体验"));
+    if (detail.experience.official) {
+      experience.append(element("span", "", `有帮助 ${detail.experience.helpful || 0}`),
+        element("span", "", `没帮助 ${detail.experience.not_helpful || 0}`),
+        element("span", "outcome-muted", `质量快照 ${detail.experience.snapshot_id.slice(0, 10)}`));
+    } else experience.append(element("span", "outcome-muted", `未封存体验判断 ${detail.experience.pending_judgments || 0} 条，不参与质量比例。`));
+    panel.append(experience);
+    panel.append(element("h2", "", "最近可追溯案例"), qualityCaseTable(detail.latest_cases || [], trialUsers));
+  } else if (state.qualityTab === "cases") {
+    let cases;
+    try { cases = await api(`/api/skill-quality/cases?${query}`); }
+    catch (error) { qualityFailure(content, error.message, () => renderQualityDetail()); return; }
+    panel.append(element("h2", "", "关联案例"), qualityCaseTable(cases.items || [], trialUsers));
+    if (state.qualityJudgmentInvocation) panel.append(await qualityJudgmentPanel(state.qualityJudgmentInvocation));
+  } else if (state.qualityTab === "feedback") {
+    let feedback;
+    try { feedback = await api(`/api/skill-quality/feedback?${query}`); }
+    catch (error) { qualityFailure(content, error.message, () => renderQualityDetail()); return; }
+    const table = element("div", "outcome-table");
+    table.append(element("div", "outcome-table-head", "反馈 / 关系 / 状态 / 时间 / 操作"));
+    for (const item of feedback.items || []) {
+      const row = element("div", "outcome-table-row");
+      row.append(element("strong", "", item.redacted_excerpt || "反馈正文已治理清理"), badge(item.relation_kind),
+        badge(label(item.current_resolution_state), toneFor(item.current_resolution_state)), element("time", "", dateText(item.observed_at)),
+        actionButton("查看反馈", () => openFeedback(item.id), "text-button"));
+      table.append(row);
+    }
+    if (!feedback.items?.length) table.append(element("div", "empty-state", "该版本没有直接或 Case 上下文反馈。"));
+    panel.append(table);
+  } else if (state.qualityTab === "metrics") {
+    panel.append(element("h2", "", "正式口径"));
+    panel.append(element("p", "outcome-muted", detail.formal_results.snapshot_id
+      ? `使用正式快照 ${detail.formal_results.snapshot_id.slice(0, 10)}，合格 Case ${detail.formal_results.eligible_cases || 0}。`
+      : "当前没有可用于该版本的完整覆盖正式快照。"));
+    panel.append(element("p", "outcome-muted", "体验比例仅在完整 scope 的专用质量快照中发布；当前预览不生成质量标签。"));
+  } else {
+    panel.append(element("h2", "", "合同与统计键"));
+    panel.append(element("p", "outcome-muted", `合同版本：${detail.contracts.contract_version_ids?.join("、") || "未绑定"}`));
+    panel.append(element("p", "outcome-muted", "统计键固定为技能 ID、SHA、合同、任务类型、归因、scope 和时间范围。"));
+  }
+  content.replaceChildren(head, context, qualityTabs(detail), reasons, panel);
+}
+
+function qualityCaseTable(items, trialUsers = []) {
+  const table = element("div", "outcome-table quality-case-table");
+  table.append(element("div", "outcome-table-head", "Case / 参与关系 / 结论 / 证据状态 / 时间 / 操作"));
+  for (const item of items) {
+    const row = element("div", "outcome-table-row");
+    const verdict = item.effective_verdict || item.automated_verdict || item.assessability || "needs-evidence";
+    row.append(element("span", "outcome-mono", String(item.task_case_id).slice(0, 12)), badge(label(item.attribution_kind)),
+      badge(label(verdict), toneFor(verdict)), badge(label(item.freshness || "unknown"), toneFor(item.freshness)),
+      element("time", "", dateText(item.created_at)),
+      actionButton("查看案例", () => openCase(item.task_case_id), "text-button"));
+    const roles = window.skillAuth.state.actor?.roles || [];
+    if (roles.includes("admin")) {
+      const assignee = element("select");
+      (trialUsers.length ? trialUsers : [{ id: window.skillAuth.state.actor?.uuid, displayName: "当前用户" }])
+        .forEach((user) => assignee.append(new Option(user.displayName, user.id)));
+      if (window.skillAuth.state.actor?.uuid) assignee.value = window.skillAuth.state.actor.uuid;
+      row.append(assignee);
+      row.append(actionButton("判断本次使用", async () => {
+        await api("/api/skill-use-judgment-assignments", { method: "POST", body: JSON.stringify({
+          skillInvocationId: item.skill_invocation_id, actorId: assignee.value,
+        }) });
+        state.qualityTab = "cases";
+        state.qualityJudgmentInvocation = assignee.value === window.skillAuth.state.actor?.uuid ? item.skill_invocation_id : null;
+        await renderQualityDetail();
+      }, "secondary-button compact-button"));
+    }
+    table.append(row);
+  }
+  if (!items.length) table.append(element("div", "empty-state", "当前筛选下没有可追溯 Case。"));
+  return table;
+}
+
+async function qualityJudgmentPanel(invocationId) {
+  const panel = element("section", "quality-judgment-panel");
+  panel.append(element("h2", "", "判断本次使用"));
+  const history = await api(`/api/skill-use-judgments?skillInvocationId=${encodeURIComponent(invocationId)}`);
+  const current = history.items?.[0];
+  const verdict = element("select");
+  [["helpful", "有帮助"], ["not-helpful", "没帮助"], ["cannot-judge", "无法判断"], ["not-applicable", "不适用"]]
+    .forEach(([value, text]) => verdict.append(new Option(text, value)));
+  const relation = element("select");
+  [["direct-skill-use", "该技能调用直接相关"], ["task-result-only", "仅与任务结果相关"], ["cannot-attribute", "无法归因"]]
+    .forEach(([value, text]) => relation.append(new Option(text, value)));
+  const reason = element("select");
+  [["", "原因代码"], ["goal-mismatch", "目标不匹配"], ["unexecutable-guidance", "指引不可执行"],
+    ["incomplete-result", "结果不完整"], ["insufficient-verification", "验证不足"],
+    ["increased-rework", "增加返工"], ["environment-limitation", "环境限制"], ["cannot-attribute", "无法归因"]]
+    .forEach(([value, text]) => reason.append(new Option(text, value)));
+  const note = element("textarea"); note.placeholder = "补充说明（可选，将脱敏保存）";
+  const controls = element("div", "outcome-action-row");
+  controls.append(verdict, relation, reason, note, actionButton("提交判断", async () => {
+    const requiresReason = ["not-helpful", "not-applicable"].includes(verdict.value);
+    await api("/api/skill-use-judgments", { method: "POST", body: JSON.stringify({
+      skillInvocationId: invocationId, expectedRevision: current?.revision || 0,
+      verdict: verdict.value, attributionRelation: relation.value,
+      reasonCode: requiresReason ? reason.value : null, note: note.value.trim() || null,
+    }) });
+    state.qualityJudgmentInvocation = null;
+    await renderAfterTrialJudgment();
+  }, "primary-button"));
+  if (current) {
+    controls.append(element("span", "outcome-muted", `当前 r${current.revision}：${label(current.verdict)}`));
+    controls.append(actionButton("撤销当前判断", async () => {
+      await api("/api/skill-use-judgments/withdraw", { method: "POST", body: JSON.stringify({
+        skillInvocationId: invocationId, expectedRevision: current.revision,
+      }) });
+      state.qualityJudgmentInvocation = null;
+      await renderAfterTrialJudgment();
+    }, "secondary-button"));
+  }
+  panel.append(controls);
+  return panel;
+}
+
+async function renderAfterTrialJudgment() {
+  const roles = window.skillAuth.state.actor?.roles || [];
+  if (roles.includes("reviewer") || roles.includes("admin")) await renderQualityDetail();
+  else await renderTrialAssignments();
+}
+
+async function renderQualityComparison() {
+  const subjects = state.qualityCompare.map((subject) => `subject=${encodeURIComponent(`${subject.skillId}@${subject.sha || ""}`)}`).join("&");
+  const scope = new URLSearchParams({ attribution: "direct" });
+  if (state.qualityTaskType) scope.set("taskType", state.qualityTaskType);
+  if (state.qualitySource) scope.set("source", state.qualitySource);
+  if (state.qualityFrom) scope.set("from", state.qualityFrom);
+  if (state.qualityTo) scope.set("to", state.qualityTo);
+  const payload = await api(`/api/skill-quality/compare?${subjects}&${scope}`);
+  const content = $("outcomeContent");
+  const head = sectionHead("技能版本比较", "仅在完整、同 scope、direct 归因和同一正式快照下给出可比较结论。");
+  head.append(actionButton("返回目录", () => renderQuality(), "text-button"));
+  const result = element("section", "quality-compare-panel");
+  if (!payload.comparable) {
+    result.append(element("h2", "", "当前仅可并排查看"));
+    payload.reasons.forEach((reason) => result.append(badge(reason, "orange")));
+  } else result.append(element("h2", "", "口径一致，可比较"));
+  const table = element("div", "outcome-table");
+  table.append(element("div", "outcome-table-head", "技能版本 / 判断状态 / 合格 Case / 通过 / 部分 / 失败"));
+  for (const detail of payload.subjects || []) {
+    const row = element("div", "outcome-table-row");
+    row.append(element("strong", "", detail.subject.skill_id), element("span", "outcome-mono", shortSha(detail.subject.skill_sha256)),
+      qualityStatusBadge(detail.quality_status), element("span", "", detail.formal_results.eligible_cases || 0),
+      element("span", "", detail.formal_results.pass || 0), element("span", "", detail.formal_results.partial || 0),
+      element("span", "", detail.formal_results.fail || 0));
+    table.append(row);
+  }
+  result.append(table);
+  content.replaceChildren(head, result);
+}
+
 async function renderView() {
   document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
   if (state.selectedFeedback) return openFeedback(state.selectedFeedback);
   if (state.selectedCase) return openCase(state.selectedCase);
+  if (state.view === "quality") return renderQuality();
   if (state.view === "loads") return renderLoads();
   if (state.view === "outcomes") return renderOutcomes();
   if (state.view === "feedback") return renderFeedback();
@@ -689,8 +1204,33 @@ document.querySelectorAll("[data-view]").forEach((button) => button.addEventList
   state.view = button.dataset.view;
   state.selectedCase = null;
   state.selectedFeedback = null;
+  if (state.view !== "quality") state.qualityJudgmentInvocation = null;
+  if (state.view === "quality") qualityRoute({ replace: false });
+  else {
+    const route = new URLSearchParams();
+    route.set("view", state.view);
+    window.history.pushState({}, "", `${window.location.pathname}?${route}`);
+  }
   renderView().catch((error) => setStatus(error.message));
 }));
+
+window.addEventListener("popstate", () => {
+  const route = new URLSearchParams(window.location.search);
+  state.view = route.get("view") || "quality";
+  state.qualitySubject = route.get("skill") && route.get("sha")
+    ? { skillId: route.get("skill"), sha: route.get("sha") } : null;
+  state.skillFilter = route.get("skill") || "";
+  state.qualityTab = route.get("tab") || "overview";
+  state.qualityObservation = route.get("observation") || "";
+  state.qualityAttribution = route.get("attribution") || "";
+  state.qualityTaskType = route.get("taskType") || "";
+  state.qualitySource = route.get("source") || "";
+  state.qualityFrom = route.get("from") || "";
+  state.qualityTo = route.get("to") || "";
+  state.selectedCase = route.get("case");
+  state.selectedFeedback = route.get("feedback");
+  renderView().catch((error) => setStatus(error.message));
+});
 $("effectScanButton").addEventListener("click", () => runScan().catch((error) => setStatus(error.message)));
 
 Promise.all([loadOverview(), renderView()])

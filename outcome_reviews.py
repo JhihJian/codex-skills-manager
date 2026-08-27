@@ -26,6 +26,7 @@ from effect_adapters import (
 from effect_store import EffectStore, EffectStoreError, RevisionConflict
 from feedback_service import FeedbackService
 from outcome_contracts import OutcomeContractInterpreter, OutcomeContractStore
+from quality_service import SkillQualityService
 from semantic_reviewer import SCHEMA_VERSION as SEMANTIC_SCHEMA_VERSION
 
 PARSER_VERSION = "outcome-reviews-v1"
@@ -136,6 +137,7 @@ class OutcomeReviewService:
         self.parser_version = str(parser_version)
         self.interpreter = OutcomeContractInterpreter()
         self.feedback = FeedbackService(self.store)
+        self.quality = SkillQualityService(self.store, self.contracts, self.feedback)
     def close(self) -> None:
         if self._owns_store:
             self.store.close()
@@ -2207,6 +2209,7 @@ class OutcomeReviewService:
         rows = self.store.execute(
             f"""SELECT c.id AS task_case_id, c.current_revision, c.task_type, i.id AS invocation_id,
                        i.skill_id, i.skill_sha256, l.attribution_kind, s.source,
+                       event.protocol_time AS invocation_time,
                        a.id AS assessment_id, a.revision AS assessment_revision, a.contract_version_id,
                        a.process_state, a.assessability, a.automated_verdict, a.conflict_state, a.model_version,
                        a.prompt_version, a.rubric_version, a.classification_revision,
@@ -2214,16 +2217,23 @@ class OutcomeReviewService:
                        a.checker_version AS assessment_checker_version, a.rationale_json
                 FROM task_cases c JOIN attribution_links l ON l.task_case_id=c.id
                 JOIN skill_invocations i ON i.id=l.skill_invocation_id
+                JOIN canonical_events event ON event.id=i.event_id
                 JOIN task_episodes ep ON ep.id=i.task_episode_id JOIN sessions s ON s.id=ep.session_id
                 LEFT JOIN outcome_assessments a ON a.task_case_id=c.id
                   AND a.skill_invocation_id=i.id AND a.is_current=1
                 WHERE {' AND '.join(conditions)}
-                ORDER BY c.id, i.skill_id, l.attribution_kind, i.created_at DESC""",
+                ORDER BY c.id, i.skill_id, l.attribution_kind,
+                         CASE WHEN a.id IS NOT NULL THEN 0 ELSE 1 END,
+                         CASE WHEN i.skill_sha256 IS NULL THEN 1 ELSE 0 END,
+                         COALESCE(event.protocol_time, i.created_at), i.id""",
             params,
         ).fetchall()
-        candidates: dict[tuple[str, str, str], dict[str, Any]] = {}
+        candidates: dict[tuple[str, str, str | None, str | None, str], dict[str, Any]] = {}
         for row in rows:
-            key = (row["task_case_id"], row["skill_id"], row["attribution_kind"])
+            key = (
+                row["task_case_id"], row["skill_id"], row["skill_sha256"],
+                row["contract_version_id"], row["attribution_kind"],
+            )
             governance_exclusion: str | None = None
             contract_digest: str | None = None
             calibration_profile_id: str | None = None
@@ -2305,11 +2315,12 @@ class OutcomeReviewService:
             existing = candidates.get(key)
             if existing is None:
                 candidate["frozen"]["duplicateInvocationIds"] = [row["invocation_id"]]
+                candidate["frozen"]["caseInvocationAnchor"] = row["invocation_id"]
+                candidate["frozen"]["caseInvocationAnchorRule"] = "assessment-then-known-version-then-earliest"
                 candidates[key] = candidate
             else:
                 invocation_ids = existing["frozen"].setdefault("duplicateInvocationIds", [])
                 invocation_ids.append(row["invocation_id"])
-                existing["frozen"]["governanceExclusion"] = "duplicate-invocation-ambiguous"
         return list(candidates.values())
     list_metric_candidates = metric_snapshot_candidates
     def create_metric_snapshot(

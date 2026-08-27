@@ -363,7 +363,7 @@ class OutcomeReviewServiceTests(unittest.TestCase):
                WHERE s.source_session_id='multi' AND ep.goal_text IS NOT NULL LIMIT 1"""
         ).fetchone())
 
-    def test_duplicate_same_skill_invocations_are_metric_ambiguous(self):
+    def test_duplicate_same_skill_invocations_choose_a_stable_metric_anchor(self):
         _skill, invocation, case = self._scan_skill_case("duplicate-metric")
         with self.store.transaction():
             self.store.execute(
@@ -387,8 +387,31 @@ class OutcomeReviewServiceTests(unittest.TestCase):
             )
         candidates = self.service.metric_snapshot_candidates(skill_id="duplicate-metric")
         self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0]["frozen"]["governanceExclusion"], "duplicate-invocation-ambiguous")
+        self.assertEqual(candidates[0]["frozen"]["caseInvocationAnchor"], invocation["id"])
+        self.assertEqual(candidates[0]["frozen"]["caseInvocationAnchorRule"], "assessment-then-known-version-then-earliest")
         self.assertEqual(len(candidates[0]["frozen"]["duplicateInvocationIds"]), 2)
+
+    def test_same_case_different_skill_versions_keep_separate_metric_candidates(self):
+        _skill, invocation, case = self._scan_skill_case("versioned-metric")
+        with self.store.transaction():
+            self.store.execute(
+                """INSERT INTO skill_invocations(id, invocation_fingerprint, task_episode_id,
+                       event_id, skill_id, skill_sha256, invocation_kind, load_status,
+                       validity, created_at, metadata_json)
+                   VALUES ('versioned-invocation', 'versioned-invocation', ?, ?, ?, ?,
+                       'business-use', 'loaded', 'valid', ?, '{}')""",
+                (invocation["task_episode_id"], invocation["event_id"], invocation["skill_id"],
+                 "f" * 64, "2026-08-24T02:00:03Z"),
+            )
+            self.store.execute(
+                """INSERT INTO attribution_links(id, task_case_id, skill_invocation_id,
+                       attribution_kind, confidence, status, created_at)
+                   VALUES ('versioned-link', ?, 'versioned-invocation', 'direct', 1, 'active', ?)""",
+                (case, "2026-08-24T02:00:03Z"),
+            )
+        candidates = self.service.metric_snapshot_candidates(skill_id="versioned-metric")
+        self.assertEqual({candidate["skill_sha256"] for candidate in candidates},
+                         {invocation["skill_sha256"], "f" * 64})
 
     def _scan_skill_case(self, skill_name="reviewed"):
         skill = self.root / "skills" / skill_name / "SKILL.md"

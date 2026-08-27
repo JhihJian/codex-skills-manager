@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
 
@@ -547,14 +547,17 @@ CREATE TABLE IF NOT EXISTS metric_snapshot_cases (
     manual_decision_revision INTEGER,
     skill_id TEXT NOT NULL,
     skill_sha256 TEXT,
+    skill_sha256_key TEXT NOT NULL,
     contract_version_id TEXT,
+    contract_version_key TEXT NOT NULL,
     task_type TEXT,
     attribution_kind TEXT NOT NULL,
+    case_anchor_invocation_id TEXT REFERENCES skill_invocations(id) ON DELETE RESTRICT,
     effective_verdict TEXT NOT NULL,
     metric_eligible INTEGER NOT NULL CHECK (metric_eligible IN (0, 1)),
     exclusion_reason TEXT,
     frozen_json TEXT NOT NULL DEFAULT '{}',
-    PRIMARY KEY (snapshot_id, task_case_id, skill_id, attribution_kind)
+    PRIMARY KEY (snapshot_id, task_case_id, skill_id, skill_sha256_key, contract_version_key, attribution_kind)
 );
 
 CREATE TABLE IF NOT EXISTS effect_derivation_changes (
@@ -593,7 +596,7 @@ CREATE TABLE IF NOT EXISTS feedback_signal_revisions (
     feedback_signal_id TEXT NOT NULL REFERENCES feedback_signals(id) ON DELETE CASCADE,
     revision INTEGER NOT NULL CHECK (revision >= 1),
     revision_fingerprint TEXT NOT NULL UNIQUE,
-    channel TEXT NOT NULL CHECK (channel IN ('user-feedback', 'process-anomaly', 'assistant-claim')),
+    channel TEXT NOT NULL CHECK (channel IN ('user-feedback', 'process-anomaly', 'assistant-claim', 'trial-experience')),
     category TEXT NOT NULL,
     severity TEXT NOT NULL CHECK (severity IN ('critical', 'high', 'medium', 'low', 'unknown')),
     authority TEXT NOT NULL CHECK (authority IN ('user', 'external', 'tool', 'assistant', 'unknown')),
@@ -811,6 +814,127 @@ CREATE TABLE IF NOT EXISTS feedback_metric_snapshot_attributions (
         REFERENCES feedback_metric_snapshot_items(snapshot_id, feedback_signal_id) ON DELETE RESTRICT
 );
 
+CREATE TABLE IF NOT EXISTS skill_use_judgment_assignments (
+    id TEXT PRIMARY KEY,
+    skill_invocation_id TEXT NOT NULL REFERENCES skill_invocations(id) ON DELETE RESTRICT,
+    actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
+    assigned_by_actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
+    evidence_snapshot_id TEXT REFERENCES use_evidence_snapshots(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'expired')),
+    expires_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(skill_invocation_id, actor_id)
+);
+
+CREATE TABLE IF NOT EXISTS use_evidence_snapshots (
+    id TEXT PRIMARY KEY,
+    skill_invocation_id TEXT NOT NULL REFERENCES skill_invocations(id) ON DELETE RESTRICT,
+    task_case_id TEXT NOT NULL REFERENCES task_cases(id) ON DELETE RESTRICT,
+    case_revision INTEGER NOT NULL CHECK (case_revision >= 1),
+    skill_id TEXT NOT NULL,
+    skill_sha256 TEXT,
+    contract_version_id TEXT NOT NULL,
+    task_type TEXT,
+    attribution_kind TEXT NOT NULL,
+    scan_run_id TEXT REFERENCES scan_runs(id) ON DELETE RESTRICT,
+    scope_fingerprint TEXT,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    evidence_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS skill_use_judgments (
+    id TEXT PRIMARY KEY,
+    skill_invocation_id TEXT NOT NULL REFERENCES skill_invocations(id) ON DELETE RESTRICT,
+    task_case_id TEXT NOT NULL REFERENCES task_cases(id) ON DELETE RESTRICT,
+    case_revision INTEGER NOT NULL CHECK (case_revision >= 1),
+    contract_version_id TEXT NOT NULL,
+    evidence_snapshot_id TEXT NOT NULL REFERENCES use_evidence_snapshots(id) ON DELETE RESTRICT,
+    actor_id TEXT NOT NULL REFERENCES actors(id) ON DELETE RESTRICT,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    verdict TEXT NOT NULL CHECK (verdict IN ('helpful', 'not-helpful', 'cannot-judge', 'not-applicable', 'withdrawn')),
+    reason_code TEXT,
+    note TEXT,
+    attribution_relation TEXT NOT NULL CHECK (attribution_relation IN ('direct-skill-use', 'task-result-only', 'cannot-attribute')),
+    aggregation_eligibility TEXT NOT NULL CHECK (aggregation_eligibility IN ('aggregate-eligible', 'individual-only', 'shared-only', 'excluded')),
+    supersedes_id TEXT REFERENCES skill_use_judgments(id) ON DELETE RESTRICT,
+    is_current INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0, 1)),
+    created_at TEXT NOT NULL,
+    UNIQUE(skill_invocation_id, actor_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS judgment_feedback_referrals (
+    id TEXT PRIMARY KEY,
+    skill_use_judgment_id TEXT NOT NULL UNIQUE REFERENCES skill_use_judgments(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN ('pending-review', 'linked', 'converted', 'closed')),
+    reviewer_actor_id TEXT REFERENCES actors(id) ON DELETE RESTRICT,
+    feedback_signal_id TEXT REFERENCES feedback_signals(id) ON DELETE RESTRICT,
+    reason_code TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS skill_quality_snapshots (
+    id TEXT PRIMARY KEY,
+    scan_run_id TEXT NOT NULL REFERENCES scan_runs(id) ON DELETE RESTRICT,
+    cutoff_at TEXT NOT NULL,
+    coverage_status TEXT NOT NULL,
+    scope_fingerprint TEXT NOT NULL,
+    derivation_cursor INTEGER NOT NULL CHECK (derivation_cursor >= 0),
+    versions_json TEXT NOT NULL DEFAULT '{}',
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    sealed INTEGER NOT NULL DEFAULT 0 CHECK (sealed IN (0, 1)),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS skill_quality_snapshot_items (
+    snapshot_id TEXT NOT NULL REFERENCES skill_quality_snapshots(id) ON DELETE RESTRICT,
+    skill_use_judgment_id TEXT NOT NULL REFERENCES skill_use_judgments(id) ON DELETE RESTRICT,
+    skill_id TEXT NOT NULL,
+    skill_sha256 TEXT,
+    contract_version_id TEXT NOT NULL,
+    task_type TEXT,
+    attribution_kind TEXT NOT NULL,
+    metric_eligible INTEGER NOT NULL CHECK (metric_eligible IN (0, 1)),
+    exclusion_reason TEXT,
+    frozen_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(snapshot_id, skill_use_judgment_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS skill_quality_snapshot_no_update
+BEFORE UPDATE ON skill_quality_snapshots
+WHEN OLD.sealed <> 0
+BEGIN
+    SELECT RAISE(ABORT, 'skill quality snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS skill_quality_snapshot_no_delete
+BEFORE DELETE ON skill_quality_snapshots
+BEGIN
+    SELECT RAISE(ABORT, 'skill quality snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS skill_quality_snapshot_item_only_before_seal
+BEFORE INSERT ON skill_quality_snapshot_items
+WHEN (SELECT sealed FROM skill_quality_snapshots WHERE id=NEW.snapshot_id) <> 0
+BEGIN
+    SELECT RAISE(ABORT, 'skill quality snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS skill_quality_snapshot_item_no_update
+BEFORE UPDATE ON skill_quality_snapshot_items
+BEGIN
+    SELECT RAISE(ABORT, 'skill quality snapshot is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS skill_quality_snapshot_item_no_delete
+BEFORE DELETE ON skill_quality_snapshot_items
+BEGIN
+    SELECT RAISE(ABORT, 'skill quality snapshot is immutable');
+END;
+
 CREATE INDEX IF NOT EXISTS idx_generations_file ON log_file_generations(log_file_id, status);
 CREATE INDEX IF NOT EXISTS idx_locations_path ON log_file_locations(path, is_current);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_generation ON file_checkpoints(generation_id, byte_offset DESC);
@@ -846,6 +970,12 @@ CREATE INDEX IF NOT EXISTS idx_feedback_revision_category ON feedback_signal_rev
 CREATE INDEX IF NOT EXISTS idx_feedback_revision_severity ON feedback_signal_revisions(severity, observed_at DESC, id DESC) WHERE is_current = 1 AND orphaned = 0;
 CREATE INDEX IF NOT EXISTS idx_feedback_revision_authority_source ON feedback_signal_revisions(authority, source, observed_at DESC, id DESC) WHERE is_current = 1 AND orphaned = 0;
 CREATE INDEX IF NOT EXISTS idx_feedback_revision_source ON feedback_signal_revisions(source, observed_at DESC, id DESC) WHERE is_current = 1 AND orphaned = 0;
+CREATE INDEX IF NOT EXISTS idx_judgment_assignment_actor ON skill_use_judgment_assignments(actor_id, status, expires_at, id);
+CREATE INDEX IF NOT EXISTS idx_judgment_invocation_current ON skill_use_judgments(skill_invocation_id, actor_id, is_current, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_judgment_case_quality ON skill_use_judgments(task_case_id, contract_version_id, aggregation_eligibility, is_current);
+CREATE INDEX IF NOT EXISTS idx_referral_status ON judgment_feedback_referrals(status, updated_at, id);
+CREATE INDEX IF NOT EXISTS idx_quality_snapshot_cutoff ON skill_quality_snapshots(cutoff_at, id);
+CREATE INDEX IF NOT EXISTS idx_quality_snapshot_skill ON skill_quality_snapshot_items(snapshot_id, skill_id, skill_sha256, contract_version_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_revision_confidence ON feedback_signal_revisions(confidence DESC, observed_at DESC, id DESC) WHERE is_current = 1 AND orphaned = 0;
 CREATE INDEX IF NOT EXISTS idx_feedback_revision_excerpt ON feedback_signal_revisions(channel, excerpt_hash, feedback_signal_id);
 CREATE INDEX IF NOT EXISTS idx_feedback_target_signal ON feedback_targets(feedback_signal_id, machine_status, rank);
@@ -1255,6 +1385,109 @@ class EffectStore:
             DROP TABLE calibration_profiles;
             ALTER TABLE calibration_profiles_migrated RENAME TO calibration_profiles;
             """
+        feedback_revision_sql_row = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='feedback_signal_revisions'"
+        ).fetchone()
+        feedback_revision_columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(feedback_signal_revisions)").fetchall()
+        }
+        feedback_channel_rebuild = bool(
+            feedback_revision_sql_row and "trial-experience" not in str(feedback_revision_sql_row[0] or "")
+        )
+        feedback_channel_rebuild_sql = ""
+        if feedback_channel_rebuild:
+            repair_statements.append("DROP TRIGGER IF EXISTS feedback_current_revision_guard;")
+            span_parser_expression = "span_parser_version" if "span_parser_version" in feedback_revision_columns else "'unknown'"
+            resolver_expression = "resolver_version" if "resolver_version" in feedback_revision_columns else "'unknown'"
+            feedback_channel_rebuild_sql = """
+            CREATE TABLE feedback_signal_revisions_migrated (
+                id TEXT PRIMARY KEY,
+                feedback_signal_id TEXT NOT NULL REFERENCES feedback_signals(id) ON DELETE CASCADE,
+                revision INTEGER NOT NULL CHECK (revision >= 1),
+                revision_fingerprint TEXT NOT NULL UNIQUE,
+                channel TEXT NOT NULL CHECK (channel IN ('user-feedback', 'process-anomaly', 'assistant-claim', 'trial-experience')),
+                category TEXT NOT NULL,
+                severity TEXT NOT NULL CHECK (severity IN ('critical', 'high', 'medium', 'low', 'unknown')),
+                authority TEXT NOT NULL CHECK (authority IN ('user', 'external', 'tool', 'assistant', 'unknown')),
+                source TEXT NOT NULL,
+                confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+                excerpt_hash TEXT NOT NULL,
+                redacted_excerpt TEXT,
+                locator_json TEXT NOT NULL DEFAULT '{}',
+                detector_id TEXT NOT NULL,
+                detector_version TEXT NOT NULL,
+                span_parser_version TEXT NOT NULL DEFAULT 'unknown',
+                resolver_version TEXT NOT NULL DEFAULT 'unknown',
+                suppression_reason TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                orphaned INTEGER NOT NULL DEFAULT 0 CHECK (orphaned IN (0, 1)),
+                is_current INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0, 1)),
+                supersedes_id TEXT,
+                observed_at TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(feedback_signal_id, revision),
+                UNIQUE(id, feedback_signal_id),
+                FOREIGN KEY(supersedes_id, feedback_signal_id)
+                    REFERENCES feedback_signal_revisions_migrated(id, feedback_signal_id) ON DELETE RESTRICT
+            );
+            INSERT INTO feedback_signal_revisions_migrated(
+                id, feedback_signal_id, revision, revision_fingerprint, channel, category,
+                severity, authority, source, confidence, excerpt_hash, redacted_excerpt,
+                locator_json, detector_id, detector_version, span_parser_version, resolver_version,
+                suppression_reason, metadata_json, orphaned, is_current, supersedes_id,
+                observed_at, created_at
+            ) SELECT id, feedback_signal_id, revision, revision_fingerprint, channel, category,
+                severity, authority, source, confidence, excerpt_hash, redacted_excerpt,
+                locator_json, detector_id, detector_version,
+                COALESCE(__SPAN_PARSER_EXPRESSION__, 'unknown'), COALESCE(__RESOLVER_EXPRESSION__, 'unknown'),
+                suppression_reason, metadata_json, orphaned, is_current, supersedes_id,
+                observed_at, created_at FROM feedback_signal_revisions;
+            DROP TABLE feedback_signal_revisions;
+            ALTER TABLE feedback_signal_revisions_migrated RENAME TO feedback_signal_revisions;
+            """.replace("__SPAN_PARSER_EXPRESSION__", span_parser_expression).replace(
+                "__RESOLVER_EXPRESSION__", resolver_expression
+            )
+        metric_case_sql_row = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='metric_snapshot_cases'"
+        ).fetchone()
+        metric_case_rebuild = bool(
+            metric_case_sql_row and "skill_sha256_key" not in str(metric_case_sql_row[0] or "")
+        )
+        metric_case_rebuild_sql = ""
+        if metric_case_rebuild:
+            repair_statements.extend((
+                "DROP TRIGGER IF EXISTS metric_snapshot_case_only_before_seal;",
+                "DROP TRIGGER IF EXISTS metric_snapshot_case_no_update;",
+                "DROP TRIGGER IF EXISTS metric_snapshot_case_no_delete;",
+            ))
+            metric_case_rebuild_sql = """
+            CREATE TABLE metric_snapshot_cases_migrated (
+                snapshot_id TEXT NOT NULL REFERENCES metric_snapshots(id) ON DELETE RESTRICT,
+                task_case_id TEXT NOT NULL, task_case_revision INTEGER NOT NULL,
+                assessment_id TEXT, assessment_revision INTEGER, manual_decision_id TEXT,
+                manual_decision_revision INTEGER, skill_id TEXT NOT NULL, skill_sha256 TEXT,
+                skill_sha256_key TEXT NOT NULL, contract_version_id TEXT,
+                contract_version_key TEXT NOT NULL, task_type TEXT, attribution_kind TEXT NOT NULL,
+                case_anchor_invocation_id TEXT REFERENCES skill_invocations(id) ON DELETE RESTRICT,
+                effective_verdict TEXT NOT NULL, metric_eligible INTEGER NOT NULL CHECK (metric_eligible IN (0, 1)),
+                exclusion_reason TEXT, frozen_json TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (snapshot_id, task_case_id, skill_id, skill_sha256_key, contract_version_key, attribution_kind)
+            );
+            INSERT INTO metric_snapshot_cases_migrated(
+                snapshot_id, task_case_id, task_case_revision, assessment_id, assessment_revision,
+                manual_decision_id, manual_decision_revision, skill_id, skill_sha256,
+                skill_sha256_key, contract_version_id, contract_version_key, task_type,
+                attribution_kind, case_anchor_invocation_id, effective_verdict, metric_eligible,
+                exclusion_reason, frozen_json
+            ) SELECT snapshot_id, task_case_id, task_case_revision, assessment_id, assessment_revision,
+                manual_decision_id, manual_decision_revision, skill_id, skill_sha256,
+                COALESCE(skill_sha256, '<unknown>'), contract_version_id,
+                COALESCE(contract_version_id, '<no-contract>'), task_type, attribution_kind,
+                NULL, effective_verdict, metric_eligible, exclusion_reason, frozen_json
+              FROM metric_snapshot_cases;
+            DROP TABLE metric_snapshot_cases;
+            ALTER TABLE metric_snapshot_cases_migrated RENAME TO metric_snapshot_cases;
+            """
         additions = {
             "task_facts": {
                 "source_kind": "TEXT NOT NULL DEFAULT 'deterministic-parser'",
@@ -1301,12 +1534,22 @@ class EffectStore:
                 "span_parser_version": "TEXT NOT NULL DEFAULT 'unknown'",
                 "resolver_version": "TEXT NOT NULL DEFAULT 'unknown'",
             },
+            "metric_snapshot_cases": {
+                "case_anchor_invocation_id": "TEXT REFERENCES skill_invocations(id) ON DELETE RESTRICT",
+            },
+            "skill_use_judgment_assignments": {
+                "evidence_snapshot_id": "TEXT REFERENCES use_evidence_snapshots(id) ON DELETE RESTRICT",
+            },
             "artifact_manifests": {
                 "cleanup_project_id": "TEXT",
             },
         }
         alter_statements: list[str] = []
         for table, columns in additions.items():
+            if table == "feedback_signal_revisions" and feedback_channel_rebuild:
+                continue
+            if table == "metric_snapshot_cases" and metric_case_rebuild:
+                continue
             existing = {
                 row[1] for row in self.connection.execute(f"PRAGMA table_info({table})").fetchall()
             }
@@ -1325,6 +1568,8 @@ class EffectStore:
         BEGIN IMMEDIATE;
         {''.join(repair_statements)}
         {calibration_rebuild_sql}
+        {feedback_channel_rebuild_sql}
+        {metric_case_rebuild_sql}
 
         {''.join(alter_statements)}
         {SCHEMA}
@@ -1333,6 +1578,8 @@ class EffectStore:
         PRAGMA user_version = {SCHEMA_VERSION};
         COMMIT;
         """
+        if feedback_channel_rebuild or metric_case_rebuild:
+            self.connection.execute("PRAGMA foreign_keys = OFF")
         try:
             self.connection.executescript(script)
         except BaseException:
@@ -1340,10 +1587,12 @@ class EffectStore:
                 self.connection.rollback()
             raise
         finally:
+            if feedback_channel_rebuild or metric_case_rebuild:
+                self.connection.execute("PRAGMA foreign_keys = ON")
             self._secure_files()
         if SCHEMA == _EXPECTED_SCHEMA and not _schema_conforms(self.connection):
             raise EffectStoreError(
-                "database schema does not match v7; restore from backup or run a supported migration"
+                "database schema does not match v8; restore from backup or run a supported migration"
             )
         return SCHEMA_VERSION
 
@@ -2345,17 +2594,20 @@ class EffectStore:
                     INSERT INTO metric_snapshot_cases(
                         snapshot_id, task_case_id, task_case_revision, assessment_id,
                         assessment_revision, manual_decision_id, manual_decision_revision,
-                        skill_id, skill_sha256, contract_version_id, task_type, attribution_kind,
-                        effective_verdict, metric_eligible, exclusion_reason, frozen_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skill_id, skill_sha256, skill_sha256_key, contract_version_id, contract_version_key,
+                        task_type, attribution_kind, case_anchor_invocation_id, effective_verdict,
+                        metric_eligible, exclusion_reason, frozen_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         snapshot_id, case["task_case_id"], case["task_case_revision"],
                         case.get("assessment_id"), assessment["revision"] if assessment is not None else None,
                         decision["id"] if decision is not None else None,
                         decision["revision"] if decision is not None else None,
-                        case["skill_id"], case.get("skill_sha256"), case.get("contract_version_id"),
-                        case.get("task_type"), case["attribution_kind"], effective_verdict,
+                        case["skill_id"], case.get("skill_sha256"), case.get("skill_sha256") or "<unknown>",
+                        case.get("contract_version_id"), case.get("contract_version_id") or "<no-contract>",
+                        case.get("task_type"), case["attribution_kind"],
+                        case.get("frozen", {}).get("caseInvocationAnchor"), effective_verdict,
                         int(eligible), exclusion_reason, _json(frozen),
                     ),
                 )
@@ -2382,7 +2634,7 @@ class EffectStore:
         try:
             return self.connection.execute(sql, parameters)
         except sqlite3.IntegrityError as exc:
-            if "metric snapshot is immutable" in str(exc):
+            if "metric snapshot is immutable" in str(exc) or "skill quality snapshot is immutable" in str(exc):
                 raise ImmutableSnapshotError(str(exc)) from exc
             raise
 

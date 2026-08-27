@@ -2761,6 +2761,8 @@ input:disabled {
   min-height: 0;
   overflow: auto;
   background: var(--bg-elev);
+  padding-bottom: 32px;
+  box-sizing: border-box;
 }
 
 .outcome-overview {
@@ -2796,7 +2798,7 @@ input:disabled {
 }
 
 .outcome-content {
-  padding: 24px;
+  padding: 24px 24px 64px;
 }
 
 .outcome-section-head {
@@ -2976,6 +2978,135 @@ input:disabled {
   margin: 14px auto;
   min-width: 180px;
   min-height: 44px;
+}
+
+.quality-coverage-band,
+.quality-context-band,
+.quality-result-strip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--hair);
+  font-size: 13px;
+}
+
+.quality-directory-table .outcome-table-head,
+.quality-directory-row {
+  grid-template-columns: 28px minmax(170px, 1fr) 130px 90px 160px auto;
+}
+
+.quality-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--hair);
+}
+
+.quality-tabs button {
+  min-height: 34px;
+}
+
+.quality-detail-panel {
+  padding-top: 20px;
+}
+
+.quality-detail-panel h2,
+.quality-reasons h2,
+.quality-judgment-panel h2 {
+  margin: 0 0 12px;
+  font-size: 15px;
+}
+
+.quality-reasons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--hair);
+}
+
+.quality-reasons h2 {
+  margin: 0 8px 0 0;
+}
+
+.quality-funnel {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(96px, 1fr));
+  border: 1px solid var(--hair);
+  margin-bottom: 16px;
+}
+
+.quality-funnel-item {
+  min-height: 72px;
+  padding: 12px;
+  border-right: 1px solid var(--hair);
+}
+
+.quality-funnel-item:last-child {
+  border-right: 0;
+}
+
+.quality-funnel-item span,
+.quality-funnel-item strong {
+  display: block;
+}
+
+.quality-funnel-item span {
+  color: var(--ink-2);
+  font-size: 12px;
+}
+
+.quality-funnel-item strong {
+  margin-top: 7px;
+  font-size: 20px;
+}
+
+.quality-case-table .outcome-table-head,
+.quality-case-table .outcome-table-row {
+  grid-template-columns: minmax(90px, .7fr) 90px 110px 100px 150px auto auto auto;
+}
+
+.quality-judgment-panel {
+  margin-top: 20px;
+  padding: 16px;
+  border: 1px solid var(--hair);
+  background: var(--bg-sunken);
+}
+
+.quality-judgment-panel textarea {
+  min-height: 68px;
+  min-width: 220px;
+  resize: vertical;
+}
+
+.quality-compare-panel {
+  padding-top: 20px;
+}
+
+.quality-compare-panel > .badge {
+  display: inline-flex;
+  max-width: 100%;
+  margin: 0 8px 8px 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.quality-error-state {
+  max-width: 640px;
+  padding: 28px 0;
+}
+
+.quality-error-state h2 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+
+.quality-error-state p {
+  margin: 0 0 16px;
+  color: var(--ink-2);
 }
 
 .feedback-evidence-pane .outcome-timeline-item .text-button {

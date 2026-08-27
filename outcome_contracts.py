@@ -116,6 +116,17 @@ def _validate_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
                     raise OutcomeContractError(f"semanticReview.dimensions[{index}] must be an object")
                 _require_text(dimension.get("id"), f"semanticReview.dimensions[{index}].id")
                 _require_text(dimension.get("description"), f"semanticReview.dimensions[{index}].description")
+    thresholds = result.get("qualityThresholds")
+    if thresholds is not None:
+        if not isinstance(thresholds, Mapping):
+            raise OutcomeContractError("qualityThresholds must be an object")
+        minimum_sample = thresholds.get("minimumSample")
+        if isinstance(minimum_sample, bool) or not isinstance(minimum_sample, int) or minimum_sample < 50:
+            raise OutcomeContractError("qualityThresholds.minimumSample must be an integer of at least 50")
+        for field in ("passRateLowerBound", "failRateUpperBound"):
+            value = thresholds.get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= float(value) <= 1:
+                raise OutcomeContractError(f"qualityThresholds.{field} must be between 0 and 1")
     return result
 
 

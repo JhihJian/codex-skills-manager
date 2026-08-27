@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-- 状态：设计完成，待实施
+- 状态：已实现
 - 目标读者：试用用户、产品负责人、技能负责人、结果评审维护者和开发者
 - 关联设计：[技能结果评审总体设计](./skill-outcome-review-design.md)、[会话负面反馈发现与处理设计](./session-negative-feedback-design.md)
 - 范围：桌面端。移动端适配不属于本设计。
@@ -106,7 +106,7 @@
 保留现有结果评审和全局人工队列，但新增“技能质量”作为用户主入口：
 
 ```text
-技能管理的技能详情 -> 试用评审 -> 技能质量 / <技能 ID> / <SHA>
+技能管理的技能详情 -> 质量评审 -> 按技能 ID 预筛选的观察版本目录 -> 技能质量 / <技能 ID> / <SHA>
 结果评审 -> 技能质量目录 -> 选择技能版本
 ```
 
@@ -117,6 +117,8 @@ skill, sha, tab, from, to, taskType, source, attribution, case
 ```
 
 浏览器前进、后退、刷新、面包屑和“返回案例”都恢复这些参数及列表滚动位置。进入反馈、指标、合同或 Case 时只追加目标参数，不清空 `skill + sha`。
+
+技能管理页不将当前工作区文件 SHA 假定为历史会话中的调用版本。入口只预筛选技能 ID，用户从观察版本目录选择实际记录过的 SHA；当前工作区版本没有调用记录时，目录显示“尚未观察”。
 
 ### 5.2 技能质量目录
 
@@ -210,7 +212,10 @@ GET  /api/skill-quality/compare?subject=skill@sha&subject=skill@sha&...
 POST /api/skill-use-judgments
 GET  /api/skill-use-judgments?skillInvocationId|skillId&sha
 GET  /api/skill-use-judgment-assignments/current
+POST /api/skill-use-judgment-assignments
 POST /api/judgment-feedback-referrals/<id>/decision
+POST /api/skill-use-judgments/withdraw
+POST /api/skill-quality-snapshots
 ```
 
 所有质量响应必须回传 `scopeSnapshotId`、scan run、cutoff、coverage、parser/resolver 版本、统计键、分母、排除原因和下钻对象 ID。浏览器不得自行跨版本或跨 scope 聚合。

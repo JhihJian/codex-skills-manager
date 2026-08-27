@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 
-DEFAULT_ROLES = ("admin", "contract-owner", "reviewer")
+DEFAULT_ROLES = ("admin", "contract-owner", "reviewer", "trial_user")
+_REQUIRED_OPERATOR_ROLES = frozenset(("admin", "contract-owner", "reviewer"))
 DEFAULT_COOKIE_NAME = "codex_skills_session"
 REDACTED = "[REDACTED]"
 REDACTION_FAILED = "[REDACTION FAILED]"
@@ -447,7 +448,7 @@ class AuthService:
         if (
             not isinstance(roles, list)
             or any(not isinstance(role, str) or not role for role in roles)
-            or not set(DEFAULT_ROLES).issubset(roles)
+            or not _REQUIRED_OPERATOR_ROLES.issubset(roles)
         ):
             raise AuthConfigurationError("actor roles are invalid")
         return Actor(actor_uuid, operator_name.strip(), tuple(dict.fromkeys(roles)))
