@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
 
@@ -251,6 +251,7 @@ CREATE TABLE IF NOT EXISTS skill_invocations (
     invocation_kind TEXT NOT NULL DEFAULT 'business-use',
     load_status TEXT NOT NULL DEFAULT 'unknown',
     validity TEXT NOT NULL DEFAULT 'valid',
+    invoked_at TEXT,
     created_at TEXT NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
@@ -1496,6 +1497,7 @@ class EffectStore:
             },
             "skill_invocations": {
                 "result_event_id": "TEXT REFERENCES canonical_events(id) ON DELETE RESTRICT",
+                "invoked_at": "TEXT",
             },
             "outcome_assessments": {
                 "subject_key": "TEXT NOT NULL DEFAULT 'task-case'",
@@ -1558,6 +1560,13 @@ class EffectStore:
             for column, definition in columns.items():
                 if column not in existing:
                     alter_statements.append(f"ALTER TABLE {table} ADD COLUMN {column} {definition};")
+                    if table == "skill_invocations" and column == "invoked_at":
+                        alter_statements.append(
+                            """UPDATE skill_invocations SET invoked_at=(
+                                   SELECT protocol_time FROM canonical_events
+                                   WHERE canonical_events.id=skill_invocations.event_id
+                               ) WHERE invoked_at IS NULL;"""
+                        )
             if table == "outcome_assessments" and "is_current" not in existing:
                 alter_statements.append(
                     "UPDATE outcome_assessments SET is_current = "

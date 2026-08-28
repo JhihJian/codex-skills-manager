@@ -462,6 +462,10 @@ class OutcomeReviewServiceTests(unittest.TestCase):
         ).fetchone()[0]
         return skill, invocation, case
 
+    def test_skill_invocation_preserves_protocol_invoked_time(self):
+        _skill, invocation, _case = self._scan_skill_case("invoked-time")
+        self.assertEqual(invocation["invoked_at"], "2026-08-24T02:00:00Z")
+
     def test_exact_contract_environment_error_and_hard_failure(self):
         _skill, invocation, case = self._scan_skill_case()
         contract = self.contracts.create_draft("reviewed", invocation["skill_sha256"], {

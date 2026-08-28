@@ -4714,13 +4714,13 @@ class Handler(SimpleHTTPRequestHandler):
                 with outcome_service() as service:
                     rows = service.store.execute(
                         f"""SELECT i.id, i.skill_id, i.skill_sha256, i.load_status, i.validity,
-                                   i.created_at, l.id AS attribution_id, l.task_case_id,
+                                   COALESCE(i.invoked_at,i.created_at) AS created_at, l.id AS attribution_id, l.task_case_id,
                                    l.attribution_kind, l.status AS attribution_status,
                                    a.id AS assessment_id, a.assessability, a.automated_verdict,
                                    a.contract_version_id, a.conflict_state, a.freshness
                             FROM skill_invocations i JOIN attribution_links l ON l.skill_invocation_id=i.id
                             LEFT JOIN outcome_assessments a ON a.skill_invocation_id=i.id AND a.is_current=1
-                            WHERE {' AND '.join(conditions)} ORDER BY i.created_at DESC LIMIT ?""",
+                            WHERE {' AND '.join(conditions)} ORDER BY COALESCE(i.invoked_at,i.created_at) DESC LIMIT ?""",
                         (*parameters, limit),
                     ).fetchall()
                     items = []

@@ -1255,9 +1255,9 @@ class OutcomeReviewService:
             (invocation_fp,),
         ).fetchone()
         self.store.execute(
-            """INSERT INTO skill_invocations( id, invocation_fingerprint, task_episode_id, event_id, skill_id, skill_sha256, skill_path, invocation_kind, load_status, validity, created_at, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'valid', ?, ?) ON CONFLICT(invocation_fingerprint) DO UPDATE SET skill_sha256=COALESCE(skill_invocations.skill_sha256, excluded.skill_sha256), skill_path=excluded.skill_path, invocation_kind=excluded.invocation_kind, load_status=CASE WHEN skill_invocations.load_status='loaded' THEN 'loaded' ELSE excluded.load_status END, validity='valid', metadata_json=excluded.metadata_json""",
+            """INSERT INTO skill_invocations( id, invocation_fingerprint, task_episode_id, event_id, skill_id, skill_sha256, skill_path, invocation_kind, load_status, validity, invoked_at, created_at, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'valid', ?, ?, ?) ON CONFLICT(invocation_fingerprint) DO UPDATE SET skill_sha256=COALESCE(skill_invocations.skill_sha256, excluded.skill_sha256), skill_path=excluded.skill_path, invocation_kind=excluded.invocation_kind, load_status=CASE WHEN skill_invocations.load_status='loaded' THEN 'loaded' ELSE excluded.load_status END, validity='valid', invoked_at=COALESCE(skill_invocations.invoked_at, excluded.invoked_at), metadata_json=excluded.metadata_json""",
             (invocation_id, invocation_fp, episode["id"], stored["id"], spec["skill_id"],
-             invocation_sha, spec["path"], invocation_kind, load_status, _now(), _json(metadata)),
+             invocation_sha, spec["path"], invocation_kind, load_status, event.timestamp or None, _now(), _json(metadata)),
         )
         invocation = self.store.execute(
             "SELECT id FROM skill_invocations WHERE invocation_fingerprint = ?", (invocation_fp,)
@@ -1343,7 +1343,7 @@ class OutcomeReviewService:
             ).fetchone()
         else:
             invocation = self.store.execute(
-                """SELECT i.*, l.attribution_kind FROM skill_invocations i JOIN attribution_links l ON l.skill_invocation_id=i.id WHERE l.task_case_id=? AND l.status='active' AND i.validity='valid' AND i.load_status='loaded' ORDER BY i.created_at DESC LIMIT 1""",
+                """SELECT i.*, l.attribution_kind FROM skill_invocations i JOIN attribution_links l ON l.skill_invocation_id=i.id WHERE l.task_case_id=? AND l.status='active' AND i.validity='valid' AND i.load_status='loaded' ORDER BY COALESCE(i.invoked_at,i.created_at) DESC, i.id DESC LIMIT 1""",
                 (task_case_id,),
             ).fetchone()
         if invocation is None:
@@ -2140,7 +2140,7 @@ class OutcomeReviewService:
             """SELECT i.*, l.id AS attribution_id, l.attribution_kind,
                       l.status AS attribution_status FROM skill_invocations i
                JOIN attribution_links l ON l.skill_invocation_id=i.id
-               WHERE l.task_case_id=? ORDER BY i.created_at, i.id""", (task_case_id,)
+               WHERE l.task_case_id=? ORDER BY COALESCE(i.invoked_at,i.created_at), i.id""", (task_case_id,)
         ).fetchall()
         calls = self.store.execute(
             """SELECT c.*, r.id AS result_id, r.status AS result_status, r.output_hash, r.excerpt FROM tool_calls c JOIN task_case_episodes ce ON ce.task_episode_id=c.task_episode_id LEFT JOIN tool_results r ON r.tool_call_id=c.id WHERE ce.task_case_id=? ORDER BY c.called_at, c.id""", (task_case_id,)
@@ -2251,7 +2251,7 @@ class OutcomeReviewService:
         ]
         params: list[Any] = []
         if cutoff_at:
-            conditions.append("i.created_at <= ?")
+            conditions.append("COALESCE(i.invoked_at,i.created_at) <= ?")
             params.append(cutoff_at)
             conditions.append("(a.id IS NULL OR a.created_at <= ?)")
             params.append(cutoff_at)

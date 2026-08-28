@@ -438,6 +438,48 @@ class SkillQualityServiceTests(unittest.TestCase):
         snapshot = scoped.seal_snapshot(expected_scope_fingerprint="quality-scope")
         self.assertEqual(snapshot["items"][0]["skill_sha256"], "a" * 64)
 
+    def test_legacy_quality_snapshot_uses_original_time_field_for_filtering(self) -> None:
+        self._complete_scan()
+        self.service.assign(self.invocation, actor_id=self.trial["id"], assigned_by_actor_id=self.admin["id"])
+        judgment = self.service.submit_judgment(
+            self.invocation, actor_id=self.trial["id"], expected_revision=0,
+            verdict="helpful", attribution_relation="direct-skill-use",
+        )
+        snapshot_id = "legacy-quality-snapshot"
+        with self.store.transaction():
+            self.store.execute(
+                """INSERT INTO skill_quality_snapshots(id, scan_run_id, cutoff_at, coverage_status,
+                       scope_fingerprint, derivation_cursor, versions_json, summary_json, sealed, created_at)
+                   VALUES (?, (SELECT id FROM scan_runs ORDER BY started_at DESC LIMIT 1), ?, 'complete',
+                           'quality-scope', 0, '{}', '{}', 0, ?)""",
+                (snapshot_id, NOW, NOW),
+            )
+            self.store.execute(
+                """INSERT INTO skill_quality_snapshot_items(snapshot_id, skill_use_judgment_id,
+                       skill_id, skill_sha256, contract_version_id, task_type, attribution_kind,
+                       metric_eligible, frozen_json)
+                   VALUES (?, ?, 'quality-skill', ?, 'contract-legacy', 'coding', 'direct', 1, ?)""",
+                (snapshot_id, judgment["id"], "a" * 64,
+                 json.dumps({"verdict": "helpful", "invocationCreatedAt": "2026-08-24T10:00:00Z"})),
+            )
+            self.store.execute("UPDATE skill_quality_snapshots SET sealed=1 WHERE id=?", (snapshot_id,))
+        summary = self.service._judgment_summary(
+            "quality-skill", "a" * 64, task_type=None,
+            from_at="2026-08-24T00:00:00Z", to_at="2026-08-25T00:00:00Z",
+        )
+        self.assertEqual((summary["official"], summary["total"], summary["helpful"]), (True, 1, 1))
+
+    def test_quality_time_filter_uses_invoked_not_indexed_time(self) -> None:
+        self.store.execute(
+            "UPDATE skill_invocations SET invoked_at='2026-08-24T10:00:00Z', created_at='2026-08-26T10:00:00Z' WHERE id=?",
+            (self.invocation,),
+        )
+        detail = self.service.detail(
+            "quality-skill", "a" * 64,
+            from_at="2026-08-25T00:00:00Z", to_at="2026-08-27T00:00:00Z",
+        )
+        self.assertEqual(detail["funnel"]["valid_invocations"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

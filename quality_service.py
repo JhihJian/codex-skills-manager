@@ -98,10 +98,10 @@ class SkillQualityService:
                 WHERE source_episode.id=i.task_episode_id AND source_session.source=?)""")
             params.append(source)
         if from_at:
-            conditions.append("i.created_at>=?")
+            conditions.append("COALESCE(i.invoked_at,i.created_at)>=?")
             params.append(self._timestamp(from_at, "from"))
         if to_at:
-            conditions.append("i.created_at<=?")
+            conditions.append("COALESCE(i.invoked_at,i.created_at)<=?")
             params.append(self._timestamp(to_at, "to"))
         allowed = {
             "observed": {"only-loaded", "evidence-insufficient", "directional", "judgment-supported", "not-publishable", "threshold-not-met"},
@@ -116,7 +116,7 @@ class SkillQualityService:
                        COUNT(DISTINCT CASE WHEN i.skill_sha256 IS NOT NULL THEN directory_case.id END) AS known_version_cases,
                        COUNT(DISTINCT CASE WHEN assessment.contract_version_id IS NOT NULL THEN directory_case.id END) AS contract_cases,
                        COUNT(DISTINCT CASE WHEN assessment.assessability='assessable' THEN directory_case.id END) AS assessable_cases,
-                       MAX(i.created_at) AS last_observed_at
+                       MAX(COALESCE(i.invoked_at,i.created_at)) AS last_observed_at
                 FROM skill_invocations i
                 LEFT JOIN attribution_links l ON l.skill_invocation_id=i.id AND l.status='active'
                 LEFT JOIN task_cases directory_case ON directory_case.id=l.task_case_id AND directory_case.invalidated_at IS NULL
@@ -158,6 +158,11 @@ class SkillQualityService:
             "next_cursor": None if exhausted else raw_cursor,
             "coverage": self._coverage(),
             "scope": self._scope_summary(),
+            "requested_skill_not_enabled": bool(
+                skill_id and self.eligible_skill_versions is not None
+                and skill_id not in self.eligible_skill_versions
+                and self.store.execute("SELECT 1 FROM skill_invocations WHERE skill_id=? LIMIT 1", (skill_id,)).fetchone() is not None
+            ),
         }
 
     def _scope_summary(self) -> dict[str, int]:
@@ -248,18 +253,18 @@ class SkillQualityService:
             conditions.append("session.source=?")
             params.append(source)
         if from_at:
-            conditions.append("i.created_at>=?")
+            conditions.append("COALESCE(i.invoked_at,i.created_at)>=?")
             params.append(self._timestamp(from_at, "from"))
         if to_at:
-            conditions.append("i.created_at<=?")
+            conditions.append("COALESCE(i.invoked_at,i.created_at)<=?")
             params.append(self._timestamp(to_at, "to"))
         if cursor:
             created, case_id, invocation_id = cursor.split("|", 2)
-            conditions.append("(i.created_at, c.id, i.id) < (?, ?, ?)")
+            conditions.append("(COALESCE(i.invoked_at,i.created_at), c.id, i.id) < (?, ?, ?)")
             params.extend((created, case_id, invocation_id))
         rows = self.store.execute(
             f"""SELECT c.id AS task_case_id, c.task_type, c.current_revision,
-                       i.id AS skill_invocation_id, i.load_status, i.created_at,
+                       i.id AS skill_invocation_id, i.load_status, COALESCE(i.invoked_at,i.created_at) AS observed_at,
                        l.attribution_kind,
                        a.id AS assessment_id, a.assessability, a.automated_verdict,
                        a.contract_version_id, a.freshness
@@ -270,14 +275,14 @@ class SkillQualityService:
                 LEFT JOIN outcome_assessments a ON a.skill_invocation_id=i.id
                   AND a.task_case_id=c.id AND a.is_current=1
                 WHERE {' AND '.join(conditions)}
-                ORDER BY i.created_at DESC, c.id DESC, i.id DESC LIMIT ?""",
+                ORDER BY COALESCE(i.invoked_at,i.created_at) DESC, c.id DESC, i.id DESC LIMIT ?""",
             (*params, limit + 1),
         ).fetchall()
         has_more = len(rows) > limit
         items = [_decode(row) for row in rows[:limit]]
         return {
             "items": items,
-            "next_cursor": f"{items[-1]['created_at']}|{items[-1]['task_case_id']}|{items[-1]['skill_invocation_id']}" if has_more and items else None,
+            "next_cursor": f"{items[-1]['observed_at']}|{items[-1]['task_case_id']}|{items[-1]['skill_invocation_id']}" if has_more and items else None,
         }
 
     def feedback_items(
@@ -414,7 +419,7 @@ class SkillQualityService:
         now = _now()
         rows = self.store.execute(
             """SELECT assignment.*, invocation.skill_id, invocation.skill_sha256,
-                      invocation.load_status, invocation.created_at AS invocation_created_at
+                      invocation.load_status, COALESCE(invocation.invoked_at,invocation.created_at) AS invocation_observed_at
                FROM skill_use_judgment_assignments assignment
                JOIN skill_invocations invocation ON invocation.id=assignment.skill_invocation_id
                WHERE assignment.actor_id=? AND assignment.status IN ('active', 'expired')
@@ -614,7 +619,7 @@ class SkillQualityService:
                       evidence.scope_fingerprint AS evidence_scope_fingerprint,
                       evidence.case_revision AS evidence_case_revision,
                       current_case.current_revision AS current_case_revision,
-                      invocation.created_at AS invocation_created_at, session.source AS invocation_source,
+                      COALESCE(invocation.invoked_at,invocation.created_at) AS invocation_observed_at, session.source AS invocation_source,
                       invocation.validity, invocation.invocation_kind, invocation.load_status
                FROM skill_use_judgments judgment
                JOIN use_evidence_snapshots evidence ON evidence.id=judgment.evidence_snapshot_id
@@ -678,7 +683,7 @@ class SkillQualityService:
                     "judgmentId": row["id"], "revision": row["revision"],
                     "verdict": row["verdict"], "evidenceHash": row["evidence_hash"],
                     "attributionRelation": row["attribution_relation"],
-                    "source": row["invocation_source"], "invocationCreatedAt": row["invocation_created_at"],
+                    "source": row["invocation_source"], "invocationObservedAt": row["invocation_observed_at"],
                 }
                 self.store.execute(
                     """INSERT INTO skill_quality_snapshot_items(
@@ -753,7 +758,7 @@ class SkillQualityService:
         condition = "i.skill_sha256 IS NULL" if skill_sha256 is None else "i.skill_sha256=?"
         params: tuple[Any, ...] = (skill_id,) if skill_sha256 is None else (skill_id, skill_sha256)
         row = self.store.execute(
-            f"""SELECT i.skill_id, i.skill_sha256, MAX(i.created_at) AS last_observed_at,
+            f"""SELECT i.skill_id, i.skill_sha256, MAX(COALESCE(i.invoked_at,i.created_at)) AS last_observed_at,
                        COUNT(DISTINCT i.id) AS invocation_count
                 FROM skill_invocations i WHERE i.skill_id=? AND {condition}
                   AND i.validity='valid' AND i.invocation_kind='business-use' AND i.load_status='loaded' AND i.skill_sha256 IS NOT NULL
@@ -820,10 +825,10 @@ class SkillQualityService:
             conditions.append("session.source=?")
             params.append(source)
         if from_at:
-            conditions.append("i.created_at>=?")
+            conditions.append("COALESCE(i.invoked_at,i.created_at)>=?")
             params.append(self._timestamp(from_at, "from"))
         if to_at:
-            conditions.append("i.created_at<=?")
+            conditions.append("COALESCE(i.invoked_at,i.created_at)<=?")
             params.append(self._timestamp(to_at, "to"))
         row = self.store.execute(
             f"""SELECT COUNT(DISTINCT i.id) AS valid_invocations,
@@ -882,10 +887,10 @@ class SkillQualityService:
             conditions.append("anchor_session.source=?")
             params.append(source)
         if from_at:
-            conditions.append("anchor.created_at>=?")
+            conditions.append("COALESCE(anchor.invoked_at,anchor.created_at)>=?")
             params.append(self._timestamp(from_at, "from"))
         if to_at:
-            conditions.append("anchor.created_at<=?")
+            conditions.append("COALESCE(anchor.invoked_at,anchor.created_at)<=?")
             params.append(self._timestamp(to_at, "to"))
         rows = self.store.execute(
             f"""SELECT metric.contract_version_id, metric.task_type, COUNT(*) AS eligible_cases,
@@ -997,10 +1002,10 @@ class SkillQualityService:
             conditions.append("session.source=?")
             params.append(source)
         if from_at:
-            conditions.append("invocation.created_at>=?")
+            conditions.append("COALESCE(invocation.invoked_at,invocation.created_at)>=?")
             params.append(self._timestamp(from_at, "from"))
         if to_at:
-            conditions.append("invocation.created_at<=?")
+            conditions.append("COALESCE(invocation.invoked_at,invocation.created_at)<=?")
             params.append(self._timestamp(to_at, "to"))
         current = self.store.execute(
             f"""SELECT COUNT(*) AS total,
@@ -1038,10 +1043,10 @@ class SkillQualityService:
             snapshot_conditions.append("json_extract(item.frozen_json,'$.source')=?")
             snapshot_params.append(source)
         if from_at:
-            snapshot_conditions.append("json_extract(item.frozen_json,'$.invocationCreatedAt')>=?")
+            snapshot_conditions.append("COALESCE(json_extract(item.frozen_json,'$.invocationObservedAt'), json_extract(item.frozen_json,'$.invocationCreatedAt'))>=?")
             snapshot_params.append(self._timestamp(from_at, "from"))
         if to_at:
-            snapshot_conditions.append("json_extract(item.frozen_json,'$.invocationCreatedAt')<=?")
+            snapshot_conditions.append("COALESCE(json_extract(item.frozen_json,'$.invocationObservedAt'), json_extract(item.frozen_json,'$.invocationCreatedAt'))<=?")
             snapshot_params.append(self._timestamp(to_at, "to"))
         sealed = self.store.execute(
             f"""SELECT COUNT(*) AS total,

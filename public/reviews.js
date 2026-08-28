@@ -134,7 +134,9 @@ function renderOverview() {
     ["可评审", overview.assessable_count || 0],
     ["证据不足", overview.needs_evidence_count || 0],
     ["待人工", overview.open_review_count || 0],
-    ["覆盖", coverageLabel(scan.coverage_status || "unknown")],
+    ["覆盖", scan.metadata?.scopeKind === "ad-hoc"
+      ? `定向扫描${coverageLabel(scan.coverage_status || "unknown")}`
+      : coverageLabel(scan.coverage_status || "unknown")],
   ];
   $("effectOverview").replaceChildren(...metrics.map(([name, value]) => {
     const metric = element("div", "outcome-overview-item");
@@ -589,7 +591,7 @@ async function openCase(caseId) {
   const timeline = element("section", "case-timeline");
   timeline.append(element("h2", "", "证据时间线"));
   for (const episode of detail.episodes || []) timeline.append(timelineItem("目标", episode.goal_text || "未恢复用户目标", dateText(episode.created_at), episode.process_state));
-  for (const invocation of detail.invocations || []) timeline.append(timelineItem("技能", invocation.skill_id, dateText(invocation.created_at), `${label(invocation.load_status)} · ${shortSha(invocation.skill_sha256)} · ${label(invocation.attribution_kind)}`));
+  for (const invocation of detail.invocations || []) timeline.append(timelineItem("技能", invocation.skill_id, dateText(invocation.invoked_at || invocation.created_at), `${label(invocation.load_status)} · ${shortSha(invocation.skill_sha256)} · ${label(invocation.attribution_kind)}`));
   for (const call of detail.tool_calls || []) timeline.append(timelineItem("工具", call.tool_name, dateText(call.called_at), call.result_status ? `结果：${call.result_status}` : "结果缺失"));
   for (const check of detail.checks || []) timeline.append(timelineItem("检查", check.checker_id, dateText(check.finished_at), `${check.assertion_outcome || check.status} · freshness ${check.freshness}`));
   for (const review of detail.semantic_reviews || []) timeline.append(timelineItem(
@@ -887,7 +889,9 @@ async function renderQuality(reset = true) {
   }
   if (!state.qualityItems.length) {
     const scope = payload.scope || {};
-    const message = !scope.enabled_skill_count
+    const message = payload.requested_skill_not_enabled
+      ? "该技能存在历史记录，但当前未启用，不在质量分析范围。可在加载检测查看审计记录。"
+      : !scope.enabled_skill_count
       ? "当前没有可分析的已启用技能。"
       : !scope.eligible_loaded_version_count
         ? `当前已启用 ${scope.enabled_skill_count} 个技能，尚无成功加载记录。`
@@ -1006,6 +1010,8 @@ async function renderQualityDetail() {
   reasons.append(element("h2", "", "判断依据与限制"));
   if (detail.blocking_reasons?.length) detail.blocking_reasons.forEach((reason) => reasons.append(badge(reason, "orange")));
   else reasons.append(element("p", "outcome-muted", "当前统计键满足发布前置条件。"));
+  const guidance = qualityGuidance(detail);
+  if (guidance.length) reasons.append(element("p", "outcome-muted", guidance.join("。")));
   const panel = element("section", "quality-detail-panel");
   if (state.qualityTab === "overview") {
     panel.append(element("h2", "", "样本漏斗"), funnelTable(detail.funnel));
@@ -1071,6 +1077,17 @@ async function renderQualityDetail() {
   content.replaceChildren(head, context, qualityTabs(detail), reasons, panel);
 }
 
+function qualityGuidance(detail) {
+  const reasons = new Set(detail.blocking_reasons || []);
+  const steps = [];
+  if (reasons.has("coverage-partial")) steps.push("先完成 configured-catalog 全目录扫描");
+  if (reasons.has("contract-missing")) steps.push("为该历史版本发布结果评审合同");
+  if (reasons.has("assessment-evidence-missing")) steps.push("采集产物或检查证据并评审关联 Case");
+  if (reasons.has("formal-snapshot-missing")) steps.push("在完整覆盖后创建正式结果快照");
+  if (!detail.funnel.direct_cases && detail.funnel.cases) steps.push("共享参与仅作上下文，单技能结论需要直接归因 Case");
+  return steps;
+}
+
 function qualityCaseTable(items, trialUsers = []) {
   const table = element("div", "outcome-table quality-case-table");
   table.append(element("div", "outcome-table-head", "Case / 参与关系 / 结论 / 证据状态 / 时间 / 操作"));
@@ -1079,7 +1096,7 @@ function qualityCaseTable(items, trialUsers = []) {
     const verdict = item.effective_verdict || item.automated_verdict || item.assessability || "needs-evidence";
     row.append(element("span", "outcome-mono", String(item.task_case_id).slice(0, 12)), badge(label(item.attribution_kind)),
       badge(label(verdict), toneFor(verdict)), badge(label(item.freshness || "unknown"), toneFor(item.freshness)),
-      element("time", "", dateText(item.created_at)),
+      element("time", "", dateText(item.observed_at)),
       actionButton("查看案例", () => openCase(item.task_case_id), "text-button"));
     const roles = window.skillAuth.state.actor?.roles || [];
     if (roles.includes("admin")) {
@@ -1212,7 +1229,16 @@ async function runScan() {
 }
 
 document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => {
-  state.view = button.dataset.view;
+  const requestedView = button.dataset.view;
+  if (state.view === "quality" && state.qualitySubject && ["feedback", "metrics", "contracts"].includes(requestedView)) {
+    state.qualityTab = requestedView === "contracts" ? "contracts" : requestedView;
+    state.selectedCase = null;
+    state.selectedFeedback = null;
+    qualityRoute({ replace: false });
+    renderQualityDetail().catch((error) => setStatus(error.message));
+    return;
+  }
+  state.view = requestedView;
   state.selectedCase = null;
   state.selectedFeedback = null;
   if (state.view !== "quality") state.qualityJudgmentInvocation = null;
