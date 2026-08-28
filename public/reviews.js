@@ -1,6 +1,6 @@
 const initialRoute = new URLSearchParams(window.location.search);
 const state = {
-  view: initialRoute.get("view") || "discover", overview: null, selectedCase: initialRoute.get("case"), selectedFeedback: initialRoute.get("feedback"),
+  view: initialRoute.get("view") || "validate", overview: null, selectedCase: initialRoute.get("case"), selectedFeedback: initialRoute.get("feedback"),
   skillFilter: initialRoute.get("skill") || "", feedbackChannel: "", feedbackSeverity: "",
   feedbackResolution: "", feedbackItems: [], feedbackNextCursor: null, busy: false,
   qualitySubject: initialRoute.get("skill") && initialRoute.get("sha") ? {
@@ -12,6 +12,7 @@ const state = {
   qualityCompare: [], qualityJudgmentInvocation: null, qualityReturnCase: null,
   qualityItems: [], qualityNextCursor: null,
   discoveryInvocationId: "", discoveryReceipt: null, discoveryUses: null, discoveryItems: null,
+  validationCatalog: null, validationSkill: "", validationResult: null,
 };
 const $ = (id) => document.getElementById(id);
 
@@ -238,6 +239,91 @@ function feedbackTargetText(item) {
   const identifier = item.skill_invocation_id || item.tool_call_id || item.tool_result_id
     || item.target_task_case_id || item.context_task_case_id || "目标待确认";
   return `${label(item.target_kind)} · ${String(identifier).slice(0, 12)}`;
+}
+
+async function renderValidation() {
+  const content = $("outcomeContent");
+  const head = sectionHead("验证技能设计", "选择当前启用技能，运行可复现检查。检查会指出说明中可能让使用者做不下去的地方，不会形成质量结论或提交反馈。");
+  content.replaceChildren(head, element("div", "loading-state", "正在读取可验证技能"));
+  if (!state.validationCatalog) {
+    try {
+      state.validationCatalog = await api("/api/skill-validations");
+    } catch (error) {
+      qualityFailure(content, error.message, () => renderValidation());
+      return;
+    }
+  }
+  const items = state.validationCatalog.items || [];
+  if (!state.validationSkill) {
+    state.validationSkill = (items.find((item) => item.has_reproducible_probe) || items[0] || {}).key || "";
+  }
+  const controls = element("section", "validation-controls");
+  controls.append(element("h2", "", "1. 选择要验证的技能"));
+  const select = element("select", "validation-select");
+  for (const item of items) {
+    const option = element("option", "", item.name);
+    option.value = item.key;
+    option.selected = item.key === state.validationSkill;
+    select.append(option);
+  }
+  select.addEventListener("change", () => {
+    state.validationSkill = select.value;
+    state.validationResult = null;
+    renderValidation();
+  });
+  const selected = items.find((item) => item.key === state.validationSkill);
+  controls.append(select);
+  if (selected) controls.append(element("p", "outcome-muted", selected.purpose));
+  const run = actionButton("运行当前版本检查", async () => {
+    if (!state.validationSkill) throw new Error("没有可验证的当前启用技能");
+    state.validationResult = await api(`/api/skill-validations/${encodeURIComponent(state.validationSkill)}`);
+    setStatus("当前版本检查完成");
+    await renderValidation();
+  }, "primary-button");
+  controls.append(run);
+
+  const guidance = element("section", "validation-guidance");
+  guidance.append(element("h2", "", "2. 用结果发现问题"),
+    element("p", "", "先看检查观察到的现象，再对照预期行为和影响。标为“已复现”的卡片给出了可以在隔离任务中重复的步骤和已有证据。"),
+    element("p", "outcome-muted", "本页只帮助发现和复核设计问题。尚未收录的新线索可在“提交线索”中另行记录。"));
+
+  const result = state.validationResult;
+  const output = element("section", "validation-output");
+  output.append(element("h2", "", "3. 当前检查结果"));
+  if (!result) {
+    output.append(element("p", "outcome-muted", "选择技能后运行检查。结果会始终基于当前启用版本，不使用历史版本或正式质量数据。"));
+  } else {
+    output.append(element("p", "outcome-muted", result.scope_note));
+    const checks = element("div", "validation-check-list");
+    for (const check of result.checks || []) {
+      const row = element("article", "validation-check");
+      row.append(badge(check.status === "pass" ? "通过" : "需要关注", check.status === "pass" ? "green" : "orange"),
+        element("strong", "", check.title), element("p", "", check.detail));
+      checks.append(row);
+    }
+    output.append(checks);
+    if ((result.findings || []).length) {
+      const findings = element("div", "validation-findings");
+      findings.append(element("h3", "", "已发现并可复现的问题"));
+      for (const finding of result.findings) {
+        const card = element("article", "validation-finding");
+        const steps = element("ol", "validation-steps");
+        for (const step of finding.reproduction || []) steps.append(element("li", "", step));
+        card.append(badge("已复现", "red"), element("h3", "", finding.title),
+          element("h4", "", "当前版本命中条件"), element("p", "", finding.matched_condition),
+          element("h4", "", "检查观察"), element("p", "", finding.observation),
+          element("h4", "", "预期行为"), element("p", "", finding.expected),
+          element("h4", "", "可能影响"), element("p", "", finding.impact),
+          element("h4", "", "在隔离任务中复核"), steps,
+          element("p", "validation-evidence", `已有证据：${finding.evidence}`));
+        findings.append(card);
+      }
+      output.append(findings);
+    } else {
+      output.append(element("p", "outcome-muted", "没有命中已收录规则。继续按技能完成一次隔离任务，并重点观察前置条件、命令输出和成功标准是否足够明确。"));
+    }
+  }
+  content.replaceChildren(head, controls, guidance, output);
 }
 
 function discoveryStatus(item) {
@@ -575,7 +661,8 @@ async function openFeedback(signalId) {
       state.qualityTab = "feedback";
       qualityRoute({ feedbackId: null, replace: true });
       await renderQualityDetail();
-    } else if (state.view === "discover") await renderDiscovery();
+    } else if (state.view === "validate") await renderValidation();
+    else if (state.view === "discover") await renderDiscovery();
     else await renderFeedback();
   }, "text-button"));
   const layout = element("div", "feedback-detail-layout");
@@ -1357,9 +1444,10 @@ async function renderQualityComparison() {
 
 async function renderView() {
   document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
-  $("effectOverview").hidden = ["quality", "discover"].includes(state.view);
+  $("effectOverview").hidden = ["quality", "validate", "discover"].includes(state.view);
   if (state.selectedFeedback) return openFeedback(state.selectedFeedback);
   if (state.selectedCase) return openCase(state.selectedCase);
+  if (state.view === "validate") return renderValidation();
   if (state.view === "discover") return renderDiscovery();
   if (state.view === "quality") return renderQuality();
   if (state.view === "loads") return renderLoads();
@@ -1413,7 +1501,7 @@ document.querySelectorAll("[data-view]").forEach((button) => button.addEventList
 
 window.addEventListener("popstate", () => {
   const route = new URLSearchParams(window.location.search);
-  state.view = route.get("view") || "discover";
+  state.view = route.get("view") || "validate";
   state.qualitySubject = route.get("skill") && route.get("sha")
     ? { skillId: route.get("skill"), sha: route.get("sha") } : null;
   state.skillFilter = route.get("skill") || "";

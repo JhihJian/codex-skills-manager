@@ -118,6 +118,64 @@ class AppAuthOutcomeApiTests(unittest.TestCase):
         self.assertIn("event_count", payload)
         self.assertEqual(headers["X-Frame-Options"], "DENY")
 
+    def test_skill_validation_api_reads_enabled_skill_and_returns_reproducible_finding(self):
+        library_skill = self.skills / "local-gradle-wrapper"
+        library_skill.mkdir()
+        (library_skill / "SKILL.md").write_text(
+            "---\nname: local-gradle-wrapper\ndescription: 库副本\n---\n```bash\necho correct\n```\n",
+            encoding="utf-8",
+        )
+        skill_dir = self.codex_skills / "local-gradle-wrapper"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: local-gradle-wrapper\ndescription: Gradle 构建\n---\n"
+            "```bash\nsed -n 's/^distributionUrl=.*gradle-\\\\([0-9][^-]*\\\\)-.*/version=\\\\1/p' gradle/wrapper/gradle-wrapper.properties\n```\n",
+            encoding="utf-8",
+        )
+        cookie, _csrf = self.login()
+        headers = {"Cookie": cookie}
+        status, catalog, _headers = self.request("GET", "/api/skill-validations", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(catalog["items"][0]["name"], "本机 Gradle 构建")
+        status, detail, _headers = self.request("GET", "/api/skill-validations/local-gradle-wrapper", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["findings"][0]["status"], "reproduced")
+        self.assertIn("双反斜杠", detail["findings"][0]["matched_condition"])
+        self.assertTrue(detail["findings"][0]["reproduction"])
+        self.assertTrue(detail["findings"][0]["evidence"])
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: local-gradle-wrapper\ndescription: Gradle 构建\n---\n"
+            "```bash\nsed -n 's/^distributionUrl=.*gradle-\\([0-9][^-]*\\)-.*/version=\\1/p' gradle/wrapper/gradle-wrapper.properties\n```\n",
+            encoding="utf-8",
+        )
+        status, fixed, _headers = self.request("GET", "/api/skill-validations/local-gradle-wrapper", headers=headers)
+        self.assertEqual((status, fixed["findings"]), (200, []))
+        (skill_dir / "SKILL.md").unlink()
+        status, _payload, _headers = self.request("GET", "/api/skill-validations/local-gradle-wrapper", headers=headers)
+        self.assertEqual(status, 404)
+
+    def test_multi_agent_validation_stops_matching_after_inline_record_format_is_added(self):
+        skill_dir = self.codex_skills / "multi-agent-deliberation"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: multi-agent-deliberation\ndescription: 多角色审议\n---\n"
+            "# 审议\n必须记录参与者、独立发现和决策前后变化。\n",
+            encoding="utf-8",
+        )
+        cookie, _csrf = self.login()
+        headers = {"Cookie": cookie}
+        status, detail, _headers = self.request("GET", "/api/skill-validations/multi-agent-deliberation", headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["findings"][0]["status"], "reproduced")
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: multi-agent-deliberation\ndescription: 多角色审议\n---\n"
+            "# 审议\n必须记录参与者、独立发现和决策前后变化。\n## 审议记录格式\n"
+            "参与者、发现、采纳理由、降级状态均为必填。\n",
+            encoding="utf-8",
+        )
+        status, fixed, _headers = self.request("GET", "/api/skill-validations/multi-agent-deliberation", headers=headers)
+        self.assertEqual((status, fixed["findings"]), (200, []))
+
     def test_cookie_writes_require_csrf_and_scan_is_reachable(self):
         cookie, csrf = self.login()
         body = {

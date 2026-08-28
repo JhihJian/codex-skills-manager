@@ -2752,6 +2752,33 @@ input:disabled {
   width: 100%;
 }
 
+.outcome-audit-nav {
+  margin-top: 10px;
+  border-top: 1px solid var(--hair);
+  padding-top: 8px;
+}
+
+.outcome-audit-nav summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 32px;
+  padding: 0 8px;
+  cursor: pointer;
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.outcome-audit-nav summary strong {
+  color: var(--ink);
+  font-family: var(--mono);
+}
+
+.outcome-audit-nav[open] summary {
+  margin-bottom: 4px;
+}
+
 .outcome-nav-hint {
   display: none;
 }
@@ -2885,6 +2912,109 @@ input:disabled {
 
 .queue-row {
   grid-template-columns: minmax(180px, 1.4fr) minmax(110px, .7fr) minmax(110px, .7fr) minmax(160px, 1fr) 110px;
+}
+
+.validation-controls,
+.validation-guidance,
+.validation-output {
+  padding: 18px;
+  border-bottom: 1px solid var(--hair);
+  background: var(--bg-elev);
+}
+
+.validation-controls h2,
+.validation-guidance h2,
+.validation-output h2 {
+  margin: 0 0 10px;
+  font-size: 16px;
+}
+
+.validation-select {
+  display: block;
+  width: min(100%, 520px);
+  margin: 10px 0 8px;
+}
+
+.validation-guidance {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, .8fr);
+  gap: 12px 28px;
+  background: var(--bg);
+}
+
+.validation-guidance h2 {
+  grid-row: span 2;
+  margin: 0;
+}
+
+.validation-guidance p {
+  margin: 0;
+}
+
+.validation-check-list,
+.validation-findings {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.validation-check {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 10px;
+  align-items: baseline;
+  padding: 12px;
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+}
+
+.validation-check p {
+  grid-column: 2;
+  margin: 0;
+  color: var(--ink-muted);
+}
+
+.validation-findings > h3 {
+  margin: 12px 0 0;
+  font-size: 15px;
+}
+
+.validation-finding {
+  padding: 16px;
+  border: 1px solid var(--hair-strong);
+  border-left: 4px solid var(--danger);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.validation-finding h3 {
+  display: inline;
+  margin: 0 0 0 8px;
+  font-size: 16px;
+}
+
+.validation-finding h4 {
+  margin: 14px 0 4px;
+  font-size: 13px;
+  color: var(--ink-muted);
+}
+
+.validation-finding p {
+  margin: 0;
+}
+
+.validation-steps {
+  margin: 0;
+  padding-left: 20px;
+}
+
+.validation-steps li + li {
+  margin-top: 6px;
+}
+
+.validation-evidence {
+  margin-top: 14px !important;
+  color: var(--ink-muted);
 }
 
 .discovery-layout {
@@ -3496,6 +3626,14 @@ input:disabled {
   .discovery-layout {
     grid-template-columns: 1fr;
     gap: 24px;
+  }
+
+  .validation-guidance {
+    grid-template-columns: 1fr;
+  }
+
+  .validation-guidance h2 {
+    grid-row: auto;
   }
 }
 

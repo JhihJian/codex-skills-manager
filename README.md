@@ -335,7 +335,7 @@ Pi 会话目录按以下顺序确定：`CODEX_SKILL_PI_SESSIONS_DIR`、`PI_CODIN
 
 ## 技能结果评审
 
-结果评审工作台位于 `http://127.0.0.1:8876/reviews.html`，包含加载检测、任务结果、人工队列、合同、指标和负面反馈六个视图。单案例详情按时间展示用户目标、技能加载、工具调用与结果、产物、确定性检查、assessment revision、反馈信号和人工操作。
+结果评审工作台位于 `http://127.0.0.1:8876/reviews.html`，默认进入“验证技能”：它只读当前启用版本并展示可复现设计检查、当前命中条件、预期、影响、隔离复现步骤和已有证据。提交线索是次级入口，加载检测、任务结果、人工队列、合同、指标和负面反馈仍保留用于审计。单案例详情按时间展示用户目标、技能加载、工具调用与结果、产物、确定性检查、assessment revision、反馈信号和人工操作。
 
 相关设计文档：
 
@@ -344,6 +344,7 @@ Pi 会话目录按以下顺序确定：`CODEX_SKILL_PI_SESSIONS_DIR`、`PI_CODIN
 - [`docs/skill-quality-judgment-design.md`](docs/skill-quality-judgment-design.md)：桌面端按精确技能版本判断质量、试用体验和可比较性的改进设计。
 - [`docs/skill-real-use-validation.md`](docs/skill-real-use-validation.md)：subagent 在隔离真实任务中验证技能说明并发现设计缺陷的首轮记录。
 - [`docs/problem-discovery-workbench-design.md`](docs/problem-discovery-workbench-design.md)：面向普通使用者的技能问题发现、提交和跟踪工作台。
+- [`docs/skill-validation-workbench-design.md`](docs/skill-validation-workbench-design.md)：用当前技能说明和隔离证据发现设计缺陷的验证工作台。
 - [`docs/skill-real-use-evidence-2026-08-28.md`](docs/skill-real-use-evidence-2026-08-28.md)：首轮验证的命令、退出状态、技能版本哈希与审议证据。
 
 ### 增量索引与结果模型
@@ -366,7 +367,7 @@ detector 升级时，截断的历史消息按 provenance 字节范围从配置�
 
 ### 技能质量判断
 
-工作台默认进入“技能质量”目录，只展示当前正确启用、非系统、非缺失技能的历史 `valid + business-use + loaded` 调用。目录按历史调用 SHA 分版本展示，并将当前启用副本与历史加载版本明确区分。未启用、缺失、未加载、等待结果、失败加载、维护调用和版本未知调用保留在加载检测与审计中，不进入质量分析。目录与详情支持观察状态、参与关系、任务类型、来源和时间范围筛选，并在 URL 中保留当前范围。来自技能管理详情的入口先按技能名筛选当前启用技能的观察记录。
+“技能质量”目录作为次级视图，只展示当前正确启用、非系统、非缺失技能的历史 `valid + business-use + loaded` 调用。目录按历史调用 SHA 分版本展示，并将当前启用副本与历史加载版本明确区分。未启用、缺失、未加载、等待结果、失败加载、维护调用和版本未知调用保留在加载检测与审计中，不进入质量分析。目录与详情支持观察状态、参与关系、任务类型、来源和时间范围筛选，并在 URL 中保留当前范围。来自技能管理详情的入口先按技能名筛选当前启用技能的观察记录。
 
 质量结论与加载、合同结果、试用体验和负面反馈分别保存：加载只证明内容被读取；合同结果仅使用完整 scope 的已封存 `metric_eligible` Case；试用体验由显式 assignment 的 `trial_user` 追加，并通过独立不可变质量快照统计；未确认、shared、版本未知和 Evidence 失效项始终单列。partial 扫描、合同缺失、样本不足、多个统计键或未封存体验不会生成“好用/不好用”结论。
 
@@ -376,6 +377,7 @@ detector 升级时，截断的历史消息按 provenance 字节范围从配置�
 
 - `GET /api/skill-quality`、`/detail`、`/cases`、`/feedback`、`/compare`：读取版本质量目录、下钻和同口径比较。
 - `GET/POST /api/problem-discoveries`：读取或提交主动问题发现。提交形成独立审计线索，不自动计入技能质量结论。
+- `GET /api/skill-validations`、`/api/skill-validations/<skill>`：读取当前启用技能的可复现设计检查和验证发现，不写入质量数据。
 
 本地验收可设置 `CODEX_SKILLS_MANAGER_DATA_DIR` 指向隔离数据目录；未设置时仍使用项目的 `data/`。该变量只改变管理器自身的 SQLite、认证和设置文件位置，适合提交问题发现等写入型界面验收。
 - `POST /api/skill-use-judgment-assignments`、`GET /api/skill-use-judgment-assignments/current`：管理并读取试用 assignment。

@@ -6,6 +6,7 @@
     dialog.className = "auth-dialog";
     dialog.innerHTML = `
       <form method="dialog" class="auth-form">
+        <input name="username" type="text" autocomplete="username" tabindex="-1" aria-hidden="true" hidden />
         <div class="auth-mark" aria-hidden="true">CS</div>
         <div><h2>本机访问验证</h2><p>使用服务启动时生成的访问密钥。</p></div>
         <label><span>访问密钥</span><input name="token" type="password" autocomplete="current-password" required /></label>

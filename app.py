@@ -2052,6 +2052,149 @@ def chinese_skill_view_source(name: str, entry: dict[str, Any]) -> dict[str, Any
     return source
 
 
+SKILL_VALIDATION_NAMES = {
+    "clone-bare-repo-and-use-worktrees": "裸仓库与工作目录管理",
+    "local-gradle-wrapper": "本机 Gradle 构建",
+    "multi-agent-deliberation": "多角色协同审议",
+}
+
+
+def skill_validation_display_name(entry: dict[str, Any], fallback_name: str, markdown: str = "") -> str:
+    localized = entry.get("localized") if isinstance(entry.get("localized"), dict) else {}
+    localized_name = str(localized.get("zhName") or SKILL_VALIDATION_NAMES.get(fallback_name) or "").strip()
+    if localized_name:
+        return localized_name
+    heading = re.search(r"^#\s+(.+?)\s*$", markdown, re.MULTILINE)
+    if heading:
+        return heading.group(1).strip()[:80]
+    description = str(entry.get("description") or "").strip().split(".", 1)[0]
+    return description[:80] or "未命名技能验证项"
+
+
+def enabled_skill_validation_source(name: str, entry: dict[str, Any]) -> dict[str, Any]:
+    codex_path = entry.get("codexPath")
+    if not codex_path:
+        raise ApiError("当前启用副本不可读取，不能执行验证。", HTTPStatus.NOT_FOUND)
+    candidate = (Path(str(codex_path)) / "SKILL.md").resolve()
+    if not is_relative_to(candidate, CODEX_SKILLS_DIR) or not candidate.exists() or not candidate.is_file():
+        raise ApiError("当前启用副本不可读取，不能执行验证。", HTTPStatus.NOT_FOUND)
+    try:
+        markdown = candidate.read_text(encoding="utf-8-sig", errors="replace").lstrip("\ufeff")
+    except OSError as exc:
+        raise ApiError(f"读取当前启用 SKILL.md 失败：{exc}", HTTPStatus.INTERNAL_SERVER_ERROR) from exc
+    return {"skill": name, "path": str(candidate), "markdown": markdown}
+
+
+def skill_validation_catalog() -> dict[str, Any]:
+    registry = read_registry_state()
+    items = []
+    for name, entry in sorted(registry.get("skills", {}).items()):
+        if not entry.get("enabled") or entry.get("system") or entry.get("status") == "missing":
+            continue
+        try:
+            source = enabled_skill_validation_source(name, entry)
+        except ApiError:
+            continue
+        items.append({
+            "key": name,
+            "name": skill_validation_display_name(entry, name, str(source["markdown"])),
+            "purpose": str(entry.get("description") or "用于完成一类特定工作。"),
+            "has_reproducible_probe": name in {
+                "clone-bare-repo-and-use-worktrees", "local-gradle-wrapper", "multi-agent-deliberation",
+            },
+        })
+    return {"items": items, "scope": "仅当前启用的非系统技能"}
+
+
+def skill_validation_detail(name: str) -> dict[str, Any]:
+    name = safe_skill_name(name)
+    registry = read_registry_state()
+    entry = registry.get("skills", {}).get(name)
+    if not entry or not entry.get("enabled") or entry.get("system") or entry.get("status") == "missing":
+        raise ApiError("该技能不在当前可验证范围内。", HTTPStatus.NOT_FOUND)
+    source = enabled_skill_validation_source(name, entry)
+    markdown = str(source["markdown"])
+    skill_root = Path(str(source["path"])).parent
+    checks = [{
+        "status": "pass", "title": "当前说明可读取",
+        "detail": "检查仅读取当前启用版本，不会写入技能、会话或质量数据。",
+    }, {
+        "status": "pass" if "```" in markdown else "attention", "title": "执行示例检查",
+        "detail": "说明中包含可执行示例。" if "```" in markdown else "说明中没有代码示例，使用者需要自行补全执行方式。",
+    }]
+    findings: list[dict[str, Any]] = []
+    if name == "local-gradle-wrapper" and "gradle-\\\\(" in markdown:
+        findings.append({
+            "title": "Wrapper 版本提取示例不能匹配正常配置",
+            "status": "reproduced",
+            "matched_condition": "当前 SKILL.md 的 sed 示例在单引号中含有双反斜杠。",
+            "observation": "当前 sed 示例在单引号中使用双反斜杠，面对标准 distributionUrl 会以成功状态退出但不输出版本。",
+            "expected": "应提取出 Gradle 版本和 bin 或 all 类型；空结果必须显式失败。",
+            "impact": "后续本机 Gradle 兼容性判断失去输入，使用者可能误以为版本已经读取。",
+            "reproduction": [
+                "在隔离的最小 Gradle 项目中保留标准 gradle-wrapper.properties。",
+                "执行当前说明中的 sed 命令，观察命令退出成功但没有任何输出。",
+                "将表达式改为单反斜杠后重跑，预期得到 version=8.12.1 type=bin。",
+            ],
+            "evidence": "2026-08-28 隔离真实验证：本机 Gradle 流程可运行，但原提取命令输出为空。",
+        })
+    if name == "clone-bare-repo-and-use-worktrees":
+        reference = skill_root / "references" / "root-agents-template.md"
+        try:
+            template = reference.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            template = ""
+        rules = template.split("## Rules", 1)[-1].split("## Repository Instructions", 1)[0]
+        if template and "```powershell" in rules and "```bash" not in rules:
+            findings.append({
+                "title": "日常 worktree 模板缺少 Bash 操作",
+                "status": "reproduced",
+                "matched_condition": "当前启用技能要求读取的日常操作区含 PowerShell 代码块，Bash 代码块数量为零。",
+                "observation": "当前管理根模板的日常操作区提供 PowerShell 代码块，却没有 Bash 等价命令。",
+                "expected": "初始化和日常操作应在目标 shell 中可以直接执行，或明确按 shell 分列。",
+                "impact": "Bash 使用者需要自己翻译创建、继续、审查和清理 worktree 的命令，容易造成分支或路径操作错误。",
+                "reproduction": [
+                    "在隔离 bare remote 上按技能流程生成管理根 AGENTS.md。",
+                    "打开日常操作区，检查 Bash fenced code block 数量。",
+                    "预期至少有一组可直接执行的 Bash 日常操作；当前版本数量为零。",
+                ],
+                "evidence": "2026-08-28 隔离真实验证：bare clone、fetch/prune 和 worktree 隔离通过，模板缺口已复现。",
+            })
+    requires_record = "审议记录格式" not in markdown and "审议" in markdown and "记录" in markdown
+    if name == "multi-agent-deliberation" and requires_record and not (skill_root / "templates" / "deliberation-record.md").exists():
+        findings.append({
+            "title": "审议过程没有可持久化的最小证据载体",
+            "status": "reproduced",
+            "matched_condition": "当前 SKILL.md 要求记录审议结果，但未定义“审议记录格式”，且当前技能目录没有 deliberation-record.md 模板。",
+            "observation": "当前说明要求审议产生改进，却没有随技能提供记录参与者、独立发现、决策前后和降级状态的模板。",
+            "expected": "每次审议应留下可引用的记录，明确真实多代理完成、降级本地检查或未完成三种状态。",
+            "impact": "之后无法区分真实多代理审议与主代理模拟角色，也无法证明反馈是否改变了决策。",
+            "reproduction": [
+                "用两个以上独立角色审查同一项决策，并保留各自结论。",
+                "回看技能目录是否提供可填写的审议记录模板。",
+                "检查记录能否回答参与者、独立发现、采纳或拒绝、决策前后、验证链接和降级状态。",
+            ],
+            "evidence": "2026-08-28 三角色隔离审议：仅能形成角色级证据，不能宣称完整多代理运行成功。",
+        })
+    if findings:
+        checks.append({
+            "status": "attention", "title": "可复现设计检查",
+            "detail": f"发现 {len(findings)} 个需要在真实任务中复核的设计问题。",
+        })
+    else:
+        checks.append({
+            "status": "pass", "title": "可复现设计检查",
+            "detail": "当前版本没有命中本控制台已收录的可复现规则。这不等同于技能有效，只表示尚未发现本规则集覆盖的问题。",
+        })
+    return {
+        "name": skill_validation_display_name(entry, name, markdown),
+        "purpose": str(entry.get("description") or "用于完成一类特定工作。"),
+        "checks": checks,
+        "findings": findings,
+        "scope_note": "这是当前技能说明的设计验证，不会写入正式质量结论、失败率或反馈指标。",
+    }
+
+
 def chinese_skill_view_cache_entry(name: str) -> dict[str, Any] | None:
     if not CHINESE_SKILL_VIEW_DB_FILE.exists():
         return None
@@ -4232,6 +4375,8 @@ class Handler(SimpleHTTPRequestHandler):
             return ("reviewer",)
         if path == "/api/problem-discoveries":
             return ("reviewer",)
+        if path.startswith("/api/skill-validations"):
+            return ("reviewer",)
         if path.startswith("/api/skill-quality-snapshots"):
             return ("admin",) if method != "GET" else ("reviewer",)
         if path.startswith("/api/skill-quality"):
@@ -4504,6 +4649,14 @@ class Handler(SimpleHTTPRequestHandler):
                     self.send_json({
                         "items": [EffectStore._row(row) for row in rows]
                     })
+                return True
+
+            if method == "GET" and path == "/api/skill-validations":
+                self.send_json(skill_validation_catalog())
+                return True
+            skill_validation_match = re.match(r"^/api/skill-validations/([^/]+)$", path)
+            if method == "GET" and skill_validation_match:
+                self.send_json(skill_validation_detail(skill_validation_match.group(1)))
                 return True
 
             if method == "GET" and path == "/api/skill-quality":
