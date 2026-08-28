@@ -312,6 +312,24 @@ class SkillQualityServiceTests(unittest.TestCase):
         self.assertEqual(snapshot["summary"]["eligible"], 0)
         self.assertEqual(snapshot["items"][0]["exclusion_reason"], "evidence-case-revision-stale")
 
+    def test_quality_snapshot_read_rejects_later_invalid_invocation(self) -> None:
+        scoped = SkillQualityService(
+            self.store, None, self.feedback, eligible_skill_versions={"quality-skill": "a" * 64},
+        )
+        self._complete_scan()
+        scoped.assign(self.invocation, actor_id=self.trial["id"], assigned_by_actor_id=self.admin["id"])
+        judgment = scoped.submit_judgment(
+            self.invocation, actor_id=self.trial["id"], expected_revision=0,
+            verdict="helpful", attribution_relation="direct-skill-use",
+        )
+        self.store.execute("UPDATE skill_use_judgments SET contract_version_id='contract-quality' WHERE id=?", (judgment["id"],))
+        self.store.execute("UPDATE use_evidence_snapshots SET contract_version_id='contract-quality' WHERE id=?", (judgment["evidence_snapshot_id"],))
+        snapshot = scoped.seal_snapshot(expected_scope_fingerprint="quality-scope")
+        self.assertEqual(scoped.quality_snapshot(snapshot["id"])["id"], snapshot["id"])
+        self.store.execute("UPDATE skill_invocations SET load_status='pending' WHERE id=?", (self.invocation,))
+        with self.assertRaises(KeyError):
+            scoped.quality_snapshot(snapshot["id"])
+
     def test_directory_excludes_parser_placeholder_skill_ids(self) -> None:
         placeholder = self._invocation("*", "d" * 64, "direct")
         self.assertTrue(placeholder)

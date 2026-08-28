@@ -692,11 +692,20 @@ class SkillQualityService:
             raise KeyError(snapshot_id)
         result = _decode(row)
         items = [_decode(item) for item in self.store.execute(
-            "SELECT * FROM skill_quality_snapshot_items WHERE snapshot_id=? ORDER BY skill_id, skill_sha256",
+            """SELECT item.*, invocation.validity AS invocation_validity,
+                      invocation.invocation_kind AS invocation_kind, invocation.load_status AS invocation_load_status
+               FROM skill_quality_snapshot_items item
+               JOIN skill_use_judgments judgment ON judgment.id=item.skill_use_judgment_id
+               JOIN skill_invocations invocation ON invocation.id=judgment.skill_invocation_id
+               WHERE item.snapshot_id=? ORDER BY item.skill_id, item.skill_sha256""",
             (snapshot_id,),
         ).fetchall()]
         if self.eligible_skill_versions is not None and any(
-            self.eligible_skill_versions.get(item["skill_id"]) != item["skill_sha256"] for item in items
+            self.eligible_skill_versions.get(item["skill_id"]) != item["skill_sha256"]
+            or item["invocation_validity"] != "valid"
+            or item["invocation_kind"] != "business-use"
+            or item["invocation_load_status"] != "loaded"
+            for item in items
         ):
             raise KeyError("quality-snapshot-not-in-current-scope")
         result["items"] = items
