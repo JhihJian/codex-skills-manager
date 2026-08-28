@@ -884,7 +884,15 @@ async function renderQuality(reset = true) {
       actionButton("查看质量", () => openQuality(item.skill_id, item.skill_sha256 || null), "text-button"));
     table.append(row);
   }
-  if (!state.qualityItems.length) table.append(element("div", "empty-state", "当前条件下没有可观察的技能版本。"));
+  if (!state.qualityItems.length) {
+    const scope = payload.scope || {};
+    const message = !scope.enabled_skill_count
+      ? "当前没有可分析的已启用技能。"
+      : !scope.eligible_loaded_version_count
+        ? `当前已启用 ${scope.enabled_skill_count} 个技能，尚无与当前启用版本匹配的成功加载记录。`
+        : "没有符合当前筛选条件的已启用成功加载技能。";
+    table.append(element("div", "empty-state", message));
+  }
   if (state.qualityNextCursor) table.append(actionButton("加载更多", () => renderQuality(false), "secondary-button feedback-load-more"));
   content.replaceChildren(head, coverage, table);
 }
@@ -1173,6 +1181,7 @@ async function renderQualityComparison() {
 
 async function renderView() {
   document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
+  $("effectOverview").hidden = state.view === "quality";
   if (state.selectedFeedback) return openFeedback(state.selectedFeedback);
   if (state.selectedCase) return openCase(state.selectedCase);
   if (state.view === "quality") return renderQuality();

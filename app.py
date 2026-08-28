@@ -1155,8 +1155,14 @@ def sync_registry(*, adopt_extra: bool = True, save: bool = True) -> dict[str, A
                     entry["enabled"] = False
                     entry["status"] = "missing"
                 continue
-            library_path = safe_child(LIBRARY_DIR, name)
-            codex_path = safe_child(CODEX_SKILLS_DIR, name)
+            try:
+                library_path = safe_child(LIBRARY_DIR, name)
+                codex_path = safe_child(CODEX_SKILLS_DIR, name)
+            except ApiError:
+                entry["enabled"] = False
+                entry["status"] = "missing"
+                entry["lastSyncedAt"] = now_iso()
+                continue
             if not library_path.exists() and not codex_path.exists():
                 entry["enabled"] = False
                 entry["managed"] = bool(entry.get("managed"))
@@ -3967,6 +3973,35 @@ def configured_session_scope_fingerprint() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def current_quality_skill_versions() -> dict[str, str]:
+    """Return the current enabled business-skill version scope for one request."""
+    try:
+        registry = read_registry_state()
+    except ApiError:
+        # A malformed historical registry key must not make unrelated enabled
+        # skills unavailable; each candidate is still checked against disk below.
+        registry = load_registry()
+    enabled: dict[str, str] = {}
+    root = CODEX_SKILLS_DIR.resolve()
+    for name, entry in registry.get("skills", {}).items():
+        if not entry.get("enabled") or entry.get("system") or entry.get("status") == "missing":
+            continue
+        raw_path = str(entry.get("codexPath") or "")
+        if not raw_path:
+            continue
+        try:
+            skill_file = (Path(raw_path) / "SKILL.md").resolve(strict=True)
+        except OSError:
+            continue
+        if not skill_file.is_file() or not is_relative_to(skill_file, root):
+            continue
+        try:
+            enabled[str(name)] = hashlib.sha256(skill_file.read_bytes()).hexdigest()
+        except OSError:
+            continue
+    return enabled
+
+
 @contextmanager
 def outcome_service() -> Any:
     """Open request-scoped effect services for ThreadingHTTPServer."""
@@ -3992,6 +4027,7 @@ def outcome_service() -> Any:
             store,
             OutcomeContractStore(SKILLS_DB_FILE),
             skill_roots=(LIBRARY_DIR, CODEX_SKILLS_DIR, PI_AGENT_DIR / "skills", Path.home() / ".agents" / "skills"),
+            quality_eligible_skill_versions=current_quality_skill_versions(),
         )
 
 

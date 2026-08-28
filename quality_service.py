@@ -39,10 +39,29 @@ def _decode(row: Any) -> dict[str, Any]:
 class SkillQualityService:
     """Owns quality-specific projections without changing outcome semantics."""
 
-    def __init__(self, store: EffectStore, contracts: Any, feedback: Any) -> None:
+    def __init__(self, store: EffectStore, contracts: Any, feedback: Any,
+        *, eligible_skill_versions: Mapping[str, str] | None = None,
+    ) -> None:
         self.store = store
         self.contracts = contracts
         self.feedback = feedback
+        self.eligible_skill_versions = dict(eligible_skill_versions) if eligible_skill_versions is not None else None
+
+    def _scope_conditions(self, alias: str = "i") -> tuple[list[str], list[Any]]:
+        if self.eligible_skill_versions is None:
+            return [], []
+        if not self.eligible_skill_versions:
+            return ["1=0"], []
+        clauses = []
+        params: list[Any] = []
+        for skill_id, skill_sha in sorted(self.eligible_skill_versions.items()):
+            clauses.append(f"({alias}.skill_id=? AND {alias}.skill_sha256=?)")
+            params.extend((skill_id, skill_sha))
+        return ["(" + " OR ".join(clauses) + ")"], params
+
+    def _require_eligible_subject(self, skill_id: str, skill_sha256: str | None) -> None:
+        if self.eligible_skill_versions is not None and self.eligible_skill_versions.get(skill_id) != skill_sha256:
+            raise KeyError(f"quality-subject-not-in-current-scope:{skill_id}")
 
     # -------------------------------------------------------------- read model
     def directory(
@@ -53,10 +72,13 @@ class SkillQualityService:
     ) -> dict[str, Any]:
         limit = min(max(int(limit), 1), 200)
         conditions = [
-            "i.validity='valid'", "i.invocation_kind='business-use'",
+            "i.validity='valid'", "i.invocation_kind='business-use'", "i.load_status='loaded'",
             "i.skill_id NOT IN ('', '*', 'unknown')",
         ]
         params: list[Any] = []
+        scope_conditions, scope_params = self._scope_conditions("i")
+        conditions.extend(scope_conditions)
+        params.extend(scope_params)
         if skill_id:
             conditions.append("i.skill_id=?")
             params.append(skill_id)
@@ -133,6 +155,23 @@ class SkillQualityService:
             "items": items,
             "next_cursor": None if exhausted else raw_cursor,
             "coverage": self._coverage(),
+            "scope": self._scope_summary(),
+        }
+
+    def _scope_summary(self) -> dict[str, int]:
+        if self.eligible_skill_versions is None:
+            return {"enabled_skill_count": 0, "eligible_loaded_version_count": 0}
+        scope_conditions, scope_params = self._scope_conditions("i")
+        row = self.store.execute(
+            f"""SELECT COUNT(DISTINCT i.skill_id || ':' || i.skill_sha256) AS eligible_loaded_version_count
+                FROM skill_invocations i
+                WHERE i.validity='valid' AND i.invocation_kind='business-use'
+                  AND i.load_status='loaded' AND {' AND '.join(scope_conditions)}""",
+            scope_params,
+        ).fetchone()
+        return {
+            "enabled_skill_count": len(self.eligible_skill_versions),
+            "eligible_loaded_version_count": int(row["eligible_loaded_version_count"] or 0),
         }
 
     def detail(
@@ -184,7 +223,8 @@ class SkillQualityService:
         limit: int = 50, cursor: str | None = None,
     ) -> dict[str, Any]:
         limit = min(max(int(limit), 1), 100)
-        conditions = ["i.validity='valid'", "i.invocation_kind='business-use'", "l.status='active'", "c.invalidated_at IS NULL", "i.skill_id=?"]
+        self._require_eligible_subject(skill_id, skill_sha256)
+        conditions = ["i.validity='valid'", "i.invocation_kind='business-use'", "i.load_status='loaded'", "l.status='active'", "c.invalidated_at IS NULL", "i.skill_id=?"]
         params: list[Any] = [skill_id]
         if skill_sha256 is None:
             conditions.append("i.skill_sha256 IS NULL")
@@ -242,7 +282,8 @@ class SkillQualityService:
         limit: int = 50, cursor: str | None = None,
     ) -> dict[str, Any]:
         limit = min(max(int(limit), 1), 100)
-        conditions = ["i.skill_id=?", "i.validity='valid'", "l.status='active'"]
+        self._require_eligible_subject(skill_id, skill_sha256)
+        conditions = ["i.skill_id=?", "i.validity='valid'", "i.invocation_kind='business-use'", "i.load_status='loaded'", "l.status='active'"]
         params: list[Any] = [skill_id]
         if skill_sha256 is None:
             conditions.append("i.skill_sha256 IS NULL")
@@ -384,6 +425,8 @@ class SkillQualityService:
             if snapshot is None:
                 continue
             context = self._invocation_context(item["skill_invocation_id"])
+            if context is None:
+                continue
             item["evidence_preview"] = _decode(snapshot).get("evidence", {})
             item["evidence_expired"] = bool(item.get("expires_at") and item["expires_at"] <= now)
             item["evidence_stale"] = bool(item["evidence_expired"] or
@@ -484,6 +527,8 @@ class SkillQualityService:
 
     def judgments(self, invocation_id: str, *, actor_id: str) -> dict[str, Any]:
         self._require_role(actor_id, "trial_user")
+        if self._invocation_context(invocation_id) is None:
+            return {"items": []}
         rows = self.store.execute(
             """SELECT id FROM skill_use_judgments WHERE skill_invocation_id=? AND actor_id=?
                ORDER BY revision DESC""", (invocation_id, actor_id),
@@ -522,6 +567,8 @@ class SkillQualityService:
             raise EffectStoreError("judgment referral has no judgment")
         if not judgment["is_current"]:
             raise RevisionConflict("judgment referral belongs to a superseded judgment")
+        if self._invocation_context(judgment["skill_invocation_id"]) is None:
+            raise EffectStoreError("judgment referral is outside the current quality scope")
         target_signal = feedback_signal_id
         if action == "link":
             if not target_signal or self.store.execute("SELECT 1 FROM feedback_signals WHERE id=?", (target_signal,)).fetchone() is None:
@@ -562,7 +609,8 @@ class SkillQualityService:
                       evidence.scope_fingerprint AS evidence_scope_fingerprint,
                       evidence.case_revision AS evidence_case_revision,
                       current_case.current_revision AS current_case_revision,
-                      invocation.created_at AS invocation_created_at, session.source AS invocation_source
+                      invocation.created_at AS invocation_created_at, session.source AS invocation_source,
+                      invocation.validity, invocation.invocation_kind, invocation.load_status
                FROM skill_use_judgments judgment
                JOIN use_evidence_snapshots evidence ON evidence.id=judgment.evidence_snapshot_id
                JOIN task_cases current_case ON current_case.id=evidence.task_case_id
@@ -574,6 +622,10 @@ class SkillQualityService:
         items: list[dict[str, Any]] = []
         selected_samples: set[tuple[Any, ...]] = set()
         for row in rows:
+            if self.eligible_skill_versions is not None and self.eligible_skill_versions.get(row["skill_id"]) != row["skill_sha256"]:
+                continue
+            if row["validity"] != "valid" or row["invocation_kind"] != "business-use" or row["load_status"] != "loaded":
+                continue
             eligible = bool(
                 row["aggregation_eligibility"] == "aggregate-eligible"
                 and row["verdict"] in {"helpful", "not-helpful"}
@@ -639,10 +691,15 @@ class SkillQualityService:
         if row is None:
             raise KeyError(snapshot_id)
         result = _decode(row)
-        result["items"] = [_decode(item) for item in self.store.execute(
+        items = [_decode(item) for item in self.store.execute(
             "SELECT * FROM skill_quality_snapshot_items WHERE snapshot_id=? ORDER BY skill_id, skill_sha256",
             (snapshot_id,),
         ).fetchall()]
+        if self.eligible_skill_versions is not None and any(
+            self.eligible_skill_versions.get(item["skill_id"]) != item["skill_sha256"] for item in items
+        ):
+            raise KeyError("quality-snapshot-not-in-current-scope")
+        result["items"] = items
         return result
 
     # -------------------------------------------------------------- internals
@@ -669,13 +726,15 @@ class SkillQualityService:
     def _subject(self, skill_id: str, skill_sha256: str | None) -> dict[str, Any] | None:
         if skill_id in {"", "*", "unknown"}:
             return None
+        if self.eligible_skill_versions is not None and self.eligible_skill_versions.get(skill_id) != skill_sha256:
+            return None
         condition = "i.skill_sha256 IS NULL" if skill_sha256 is None else "i.skill_sha256=?"
         params: tuple[Any, ...] = (skill_id,) if skill_sha256 is None else (skill_id, skill_sha256)
         row = self.store.execute(
             f"""SELECT i.skill_id, i.skill_sha256, MAX(i.created_at) AS last_observed_at,
                        COUNT(DISTINCT i.id) AS invocation_count
                 FROM skill_invocations i WHERE i.skill_id=? AND {condition}
-                  AND i.validity='valid' AND i.invocation_kind='business-use'
+                  AND i.validity='valid' AND i.invocation_kind='business-use' AND i.load_status='loaded'
                 GROUP BY i.skill_id, i.skill_sha256""", params,
         ).fetchone()
         return _decode(row) if row else None
@@ -712,7 +771,8 @@ class SkillQualityService:
         attribution: str | None, source: str | None = None, from_at: str | None = None,
         to_at: str | None = None,
     ) -> dict[str, int]:
-        conditions = ["i.skill_id=?", "i.validity='valid'", "i.invocation_kind='business-use'"]
+        self._require_eligible_subject(skill_id, skill_sha256)
+        conditions = ["i.skill_id=?", "i.validity='valid'", "i.invocation_kind='business-use'", "i.load_status='loaded'"]
         params: list[Any] = [skill_id]
         if skill_sha256 is None:
             conditions.append("i.skill_sha256 IS NULL")
@@ -884,6 +944,11 @@ class SkillQualityService:
                AND scan_run_id=? AND scope_fingerprint=? ORDER BY cutoff_at DESC, id DESC LIMIT 1""",
             (coverage.get("scan_run_id"), coverage.get("scope_fingerprint")),
         ).fetchone() if coverage.get("coverage_status") == "complete" else None
+        if quality_snapshot is not None:
+            try:
+                self.quality_snapshot(quality_snapshot["id"])
+            except KeyError:
+                quality_snapshot = None
         conditions = ["snapshot.skill_id=?", "judgment.is_current=1"]
         params: list[Any] = [skill_id]
         if skill_sha256 is None:
@@ -1009,12 +1074,15 @@ class SkillQualityService:
                        task_case.task_type
                 FROM skill_invocations i JOIN attribution_links link ON link.skill_invocation_id=i.id
                 JOIN task_cases task_case ON task_case.id=link.task_case_id
-                WHERE i.id=? AND i.validity='valid' AND i.invocation_kind='business-use'
+                WHERE i.id=? AND i.validity='valid' AND i.invocation_kind='business-use' AND i.load_status='loaded'
                   AND link.status='active' AND task_case.invalidated_at IS NULL
                 ORDER BY CASE link.attribution_kind WHEN 'direct' THEN 0 ELSE 1 END, link.task_case_id LIMIT 1""",
             (invocation_id,),
         ).fetchone()
-        return _decode(rows) if rows else None
+        result = _decode(rows) if rows else None
+        if result is not None and self.eligible_skill_versions is not None and self.eligible_skill_versions.get(result["skill_id"]) != result["skill_sha256"]:
+            return None
+        return result
 
     def _active_assignment(self, invocation_id: str, actor_id: str) -> Any:
         return self.store.execute(

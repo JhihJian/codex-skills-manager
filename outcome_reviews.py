@@ -123,6 +123,7 @@ class OutcomeReviewService:
         skills_db_path: str | os.PathLike[str] | None = None,
         skill_roots: Sequence[str | os.PathLike[str]] = (),
         parser_version: str = PARSER_VERSION,
+        quality_eligible_skill_versions: Mapping[str, str] | None = None,
     ) -> None:
         self._owns_store = not isinstance(store, EffectStore)
         self.store = store if isinstance(store, EffectStore) else EffectStore(store)
@@ -137,7 +138,10 @@ class OutcomeReviewService:
         self.parser_version = str(parser_version)
         self.interpreter = OutcomeContractInterpreter()
         self.feedback = FeedbackService(self.store)
-        self.quality = SkillQualityService(self.store, self.contracts, self.feedback)
+        self.quality = SkillQualityService(
+            self.store, self.contracts, self.feedback,
+            eligible_skill_versions=quality_eligible_skill_versions,
+        )
     def close(self) -> None:
         if self._owns_store:
             self.store.close()
@@ -2185,7 +2189,7 @@ class OutcomeReviewService:
         """Build snapshot candidates solely from authoritative current DB rows."""
         conditions = [
             "l.status='active'", "i.validity='valid'", "i.load_status='loaded'",
-            "c.invalidated_at IS NULL",
+            "i.invocation_kind='business-use'", "c.invalidated_at IS NULL",
         ]
         params: list[Any] = []
         if cutoff_at:

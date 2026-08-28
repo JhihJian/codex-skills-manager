@@ -27,7 +27,9 @@ class SkillQualityServiceTests(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
-    def _invocation(self, skill_id: str, sha: str | None, attribution: str, suffix: str = "") -> str:
+    def _invocation(self, skill_id: str, sha: str | None, attribution: str, suffix: str = "",
+        *, load_status: str = "loaded", validity: str = "valid", invocation_kind: str = "business-use",
+    ) -> str:
         event = self.store.upsert_event(
             f"event-{skill_id}-{sha}-{suffix}", source="pi", session_family="quality-family",
             event_type="user_message", payload_hash=f"hash-{skill_id}-{sha}-{suffix}",
@@ -50,8 +52,9 @@ class SkillQualityServiceTests(unittest.TestCase):
             self.store.execute(
                 """INSERT INTO skill_invocations(id, invocation_fingerprint, task_episode_id, event_id,
                        skill_id, skill_sha256, invocation_kind, load_status, validity, created_at, metadata_json)
-                   VALUES (?, ?, ?, ?, ?, ?, 'business-use', 'loaded', 'valid', ?, '{}')""",
-                (invocation_id, invocation_id, episode_id, event["id"], skill_id, sha, NOW),
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}')""",
+                (invocation_id, invocation_id, episode_id, event["id"], skill_id, sha,
+                 invocation_kind, load_status, validity, NOW),
             )
             self.store.execute(
                 """INSERT INTO attribution_links(id, task_case_id, skill_invocation_id,
@@ -342,6 +345,33 @@ class SkillQualityServiceTests(unittest.TestCase):
         self.assertEqual(first["items"][0]["skill_id"], "a")
         second = self.service.directory(limit=10, cursor=first["next_cursor"])
         self.assertIn("a:", [item["skill_id"] for item in second["items"]])
+
+    def test_current_enabled_scope_excludes_disabled_and_non_loaded_invocations(self) -> None:
+        disabled = self._invocation("disabled-skill", "b" * 64, "direct")
+        pending = self._invocation("pending-skill", "c" * 64, "direct", load_status="pending")
+        maintenance = self._invocation("maintenance-skill", "d" * 64, "direct", invocation_kind="skill-maintenance")
+        scoped = SkillQualityService(
+            self.store, None, self.feedback,
+            eligible_skill_versions={"quality-skill": "a" * 64, "pending-skill": "c" * 64},
+        )
+        self.assertEqual([item["skill_id"] for item in scoped.directory()["items"]], ["quality-skill"])
+        with self.assertRaises(KeyError):
+            scoped.detail("disabled-skill", "b" * 64)
+        for invocation in (disabled, pending, maintenance):
+            with self.assertRaises((KeyError, EffectStoreError)):
+                scoped.assign(invocation, actor_id=self.trial["id"], assigned_by_actor_id=self.admin["id"])
+        scoped.assign(self.invocation, actor_id=self.trial["id"], assigned_by_actor_id=self.admin["id"])
+        judgment = scoped.submit_judgment(
+            self.invocation, actor_id=self.trial["id"], expected_revision=0,
+            verdict="not-helpful", attribution_relation="direct-skill-use", reason_code="incomplete-result",
+        )
+        scoped.eligible_skill_versions.clear()
+        self.assertEqual(scoped.assignments(self.trial["id"])["items"], [])
+        self.assertEqual(scoped.judgments(self.invocation, actor_id=self.trial["id"])["items"], [])
+        with self.assertRaisesRegex(EffectStoreError, "outside the current quality scope"):
+            scoped.decide_referral(
+                judgment["referral"]["id"], actor_id=self.admin["id"], action="close", reason_code="reviewed",
+            )
 
 
 if __name__ == "__main__":

@@ -21,6 +21,8 @@ class AppAuthOutcomeApiTests(unittest.TestCase):
         self.codex_logs.mkdir()
         self.codex_archived_logs = self.root / "codex-archived"
         self.codex_archived_logs.mkdir()
+        self.codex_skills = self.root / "codex-skills"
+        self.codex_skills.mkdir()
         self.skills = self.root / "skills"
         self.skills.mkdir()
         self.auth = AuthService(self.root / "token", self.root / "actor.json")
@@ -30,6 +32,7 @@ class AppAuthOutcomeApiTests(unittest.TestCase):
             patch.object(app, "EFFECT_DB_FILE", self.root / "effects.sqlite3"),
             patch.object(app, "SKILLS_DB_FILE", self.root / "skills.sqlite3"),
             patch.object(app, "LIBRARY_DIR", self.skills),
+            patch.object(app, "CODEX_SKILLS_DIR", self.codex_skills),
             patch.object(app, "PI_SESSIONS_DIR", self.logs),
             patch.object(app, "CODEX_SESSIONS_DIR", self.codex_logs),
             patch.object(app, "CODEX_ARCHIVED_SESSIONS_DIR", self.codex_archived_logs),
@@ -187,6 +190,9 @@ class AppAuthOutcomeApiTests(unittest.TestCase):
         skill = self.skills / "trial-quality" / "SKILL.md"
         skill.parent.mkdir()
         skill.write_text("# trial quality\n", encoding="utf-8")
+        enabled_skill = self.codex_skills / "trial-quality"
+        enabled_skill.mkdir()
+        (enabled_skill / "SKILL.md").write_text(skill.read_text(encoding="utf-8"), encoding="utf-8")
         session = self.logs / "trial-quality.jsonl"
         session.write_text("".join(json.dumps(item, ensure_ascii=False) + "\n" for item in [
             {"type": "session", "id": "trial-quality-session", "timestamp": "2026-08-26T00:00:00Z"},
@@ -238,6 +244,34 @@ class AppAuthOutcomeApiTests(unittest.TestCase):
             "GET", "/api/skill-use-judgment-assignments/current", headers={"Cookie": cookie},
         )
         self.assertEqual((status, assignments["items"][0]["skill_invocation_id"]), (200, invocation_id))
+
+    def test_quality_api_excludes_skill_after_enabled_copy_is_removed(self):
+        skill = self.skills / "scope-quality" / "SKILL.md"
+        skill.parent.mkdir()
+        skill.write_text("# scope quality\n", encoding="utf-8")
+        enabled = self.codex_skills / "scope-quality"
+        enabled.mkdir()
+        (enabled / "SKILL.md").write_text(skill.read_text(encoding="utf-8"), encoding="utf-8")
+        session = self.logs / "scope-quality.jsonl"
+        session.write_text("".join(json.dumps(item) + "\n" for item in [
+            {"type": "session", "id": "scope-session"},
+            {"type": "message", "id": "scope-user", "message": {"role": "user", "content": [{"type": "text", "text": "完成任务"}]}},
+            {"type": "message", "id": "scope-skill", "message": {"role": "user", "content": [{"type": "text", "text": f'<skill name="scope-quality" location="{skill}">{skill.read_text()}</skill>'}]}},
+        ]), encoding="utf-8")
+        cookie, csrf = self.login()
+        headers = {"Cookie": cookie, "X-CSRF-Token": csrf}
+        self.request("POST", "/api/effect-scan", {"budgetBytes": 100000, "budgetSeconds": 2}, headers=headers)
+        status, before, _headers = self.request("GET", "/api/skill-quality?skillId=scope-quality", headers={"Cookie": cookie})
+        self.assertEqual((status, len(before["items"])), (200, 1))
+        sha = before["items"][0]["skill_sha256"]
+        (enabled / "SKILL.md").unlink()
+        enabled.rmdir()
+        status, after, _headers = self.request("GET", "/api/skill-quality?skillId=scope-quality", headers={"Cookie": cookie})
+        self.assertEqual((status, after["items"]), (200, []))
+        status, _detail, _headers = self.request(
+            "GET", f"/api/skill-quality/detail?skillId=scope-quality&sha={sha}", headers={"Cookie": cookie},
+        )
+        self.assertEqual(status, 404)
 
     def test_cleanup_rejects_invalid_criteria_before_creating_run(self):
         cookie, csrf = self.login()
