@@ -342,6 +342,8 @@ Pi 会话目录按以下顺序确定：`CODEX_SKILL_PI_SESSIONS_DIR`、`PI_CODIN
 - [`docs/skill-outcome-review-design.md`](docs/skill-outcome-review-design.md)：技能结果评审总体设计。
 - [`docs/session-negative-feedback-design.md`](docs/session-negative-feedback-design.md)：会话负面反馈、过程异常、目标归属和解决闭环设计。
 - [`docs/skill-quality-judgment-design.md`](docs/skill-quality-judgment-design.md)：桌面端按精确技能版本判断质量、试用体验和可比较性的改进设计。
+- [`docs/skill-real-use-validation.md`](docs/skill-real-use-validation.md)：subagent 在隔离真实任务中验证技能说明并发现设计缺陷的首轮记录。
+- [`docs/skill-real-use-evidence-2026-08-28.md`](docs/skill-real-use-evidence-2026-08-28.md)：首轮验证的命令、退出状态、技能版本哈希与审议证据。
 
 ### 增量索引与结果模型
 
