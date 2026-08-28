@@ -238,6 +238,28 @@ class SkillQualityServiceTests(unittest.TestCase):
         with self.assertRaises(ImmutableSnapshotError):
             self.store.execute("UPDATE skill_quality_snapshot_items SET metric_eligible=0 WHERE snapshot_id=?", (snapshot["id"],))
 
+    def test_ad_hoc_complete_scan_remains_not_publishable_for_quality(self) -> None:
+        scan = self.store.create_scan_run("pi", metadata={"scopeKind": "ad-hoc", "scopeFingerprint": "other-scope"})
+        self.store.finish_scan_run(scan["id"], coverage_status="complete")
+        detail = self.service.detail("quality-skill", "a" * 64)
+        self.assertEqual((detail["coverage"]["scope_kind"], detail["coverage"]["coverage_status"], detail["quality_status"]),
+                         ("ad-hoc", "partial", "not-publishable"))
+
+    def test_failed_or_stale_configured_scan_is_not_publishable(self) -> None:
+        failed = self.store.create_scan_run(
+            "pi", metadata={"scopeKind": "configured-catalog", "scopeFingerprint": "quality-scope"},
+        )
+        self.store.finish_scan_run(failed["id"], status="failed", coverage_status="complete")
+        with self.assertRaisesRegex(EffectStoreError, "complete latest scan"):
+            self.service.seal_snapshot(expected_scope_fingerprint="quality-scope")
+        scoped = SkillQualityService(
+            self.store, None, self.feedback,
+            expected_scope_fingerprint="current-scope",
+        )
+        detail = scoped.detail("quality-skill", "a" * 64)
+        self.assertEqual((detail["coverage"]["coverage_status"], detail["coverage"]["scope_stale"], detail["quality_status"]),
+                         ("partial", True, "not-publishable"))
+
     def test_compare_refuses_partial_or_missing_formal_scope(self) -> None:
         other = self._invocation("other-skill", "c" * 64, "direct")
         partial = self.store.create_scan_run("pi", metadata={"scopeKind": "configured-catalog", "scopeFingerprint": "quality-scope"})

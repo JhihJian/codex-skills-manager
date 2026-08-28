@@ -41,11 +41,13 @@ class SkillQualityService:
 
     def __init__(self, store: EffectStore, contracts: Any, feedback: Any,
         *, eligible_skill_versions: Mapping[str, str] | None = None,
+        expected_scope_fingerprint: str | None = None,
     ) -> None:
         self.store = store
         self.contracts = contracts
         self.feedback = feedback
         self.eligible_skill_versions = dict(eligible_skill_versions) if eligible_skill_versions is not None else None
+        self.expected_scope_fingerprint = expected_scope_fingerprint
 
     def _scope_conditions(self, alias: str = "i") -> tuple[list[str], list[Any]]:
         if self.eligible_skill_versions is None:
@@ -593,7 +595,7 @@ class SkillQualityService:
         latest = self.store.execute(
             """SELECT * FROM scan_runs WHERE status!='running' ORDER BY finished_at DESC, id DESC LIMIT 1"""
         ).fetchone()
-        if latest is None or latest["coverage_status"] != "complete":
+        if latest is None or latest["status"] != "completed" or latest["coverage_status"] != "complete":
             raise EffectStoreError("skill quality snapshots require a complete latest scan")
         metadata = json.loads(latest["metadata_json"])
         if metadata.get("scopeKind") != "configured-catalog" or metadata.get("scopeFingerprint") != expected_scope_fingerprint:
@@ -780,9 +782,16 @@ class SkillQualityService:
             return {"coverage_status": "unknown", "scan_run_id": None, "scope_fingerprint": None}
         decoded = _decode(row)
         metadata = decoded.get("metadata") or {}
+        configured_scope = (
+            decoded.get("status") == "completed"
+            and metadata.get("scopeKind") == "configured-catalog"
+            and (self.expected_scope_fingerprint is None or metadata.get("scopeFingerprint") == self.expected_scope_fingerprint)
+        )
         return {
-            "scan_run_id": decoded["id"], "coverage_status": decoded["coverage_status"],
+            "scan_run_id": decoded["id"],
+            "coverage_status": decoded["coverage_status"] if configured_scope else "partial",
             "scope_kind": metadata.get("scopeKind"), "scope_fingerprint": metadata.get("scopeFingerprint"),
+            "scope_stale": bool(self.expected_scope_fingerprint and metadata.get("scopeFingerprint") != self.expected_scope_fingerprint),
             "discovered_files": decoded.get("discovered_files", 0), "indexed_files": decoded.get("indexed_files", 0),
             "pending_files": decoded.get("pending_files", 0), "failed_files": decoded.get("failed_files", 0),
         }

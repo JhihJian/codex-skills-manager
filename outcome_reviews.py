@@ -124,6 +124,7 @@ class OutcomeReviewService:
         skill_roots: Sequence[str | os.PathLike[str]] = (),
         parser_version: str = PARSER_VERSION,
         quality_eligible_skill_versions: Mapping[str, str] | None = None,
+        quality_scope_fingerprint: str | None = None,
     ) -> None:
         self._owns_store = not isinstance(store, EffectStore)
         self.store = store if isinstance(store, EffectStore) else EffectStore(store)
@@ -141,6 +142,7 @@ class OutcomeReviewService:
         self.quality = SkillQualityService(
             self.store, self.contracts, self.feedback,
             eligible_skill_versions=quality_eligible_skill_versions,
+            expected_scope_fingerprint=quality_scope_fingerprint,
         )
     def close(self) -> None:
         if self._owns_store:
