@@ -2761,7 +2761,7 @@ input:disabled {
   min-height: 0;
   overflow: auto;
   background: var(--bg-elev);
-  padding-bottom: 32px;
+  padding-bottom: 64px;
   box-sizing: border-box;
 }
 
@@ -2798,7 +2798,7 @@ input:disabled {
 }
 
 .outcome-content {
-  padding: 24px 24px 64px;
+  padding: 24px 24px 96px;
 }
 
 .outcome-section-head {
