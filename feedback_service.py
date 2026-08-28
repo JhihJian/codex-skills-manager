@@ -568,6 +568,100 @@ class FeedbackService:
             deduplicated.append(item)
         return deduplicated
 
+    def submit_problem_discovery(
+        self,
+        *,
+        actor_id: str,
+        description: str,
+        category: str,
+        skill_invocation_id: str | None = None,
+        direct_association: bool = False,
+        association_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a user-reported problem without treating it as an automatic failure."""
+        allowed_categories = {
+            "result-rejection", "observed-defect", "requirement-gap",
+            "rework-correction", "process-critique", "mixed-or-unclear",
+        }
+        clean_description = redact_sensitive(str(description or "")).strip()
+        if len(clean_description) < 12 or len(clean_description) > 2000:
+            raise ValueError("问题说明应为 12 至 2000 个字符")
+        if category not in allowed_categories:
+            raise ValueError("问题类别无效")
+        clean_reason = redact_sensitive(str(association_reason or "")).strip()
+        if direct_association and len(clean_reason) < 8:
+            raise ValueError("请说明为什么认为问题与该技能直接有关")
+        actor = self.store.execute("SELECT id, active FROM actors WHERE id=?", (actor_id,)).fetchone()
+        if actor is None or not actor["active"]:
+            raise EffectStoreError("问题提交者不可用")
+
+        invocation = None
+        case_id = None
+        if skill_invocation_id:
+            invocation = self.store.execute(
+                """SELECT i.id, i.skill_id, i.skill_sha256, l.task_case_id
+                   FROM skill_invocations i
+                   LEFT JOIN attribution_links l ON l.skill_invocation_id=i.id AND l.status='active'
+                   WHERE i.id=? AND i.validity='valid' AND i.invocation_kind='business-use'
+                     AND i.load_status='loaded'
+                   ORDER BY l.attribution_kind='direct' DESC, l.task_case_id LIMIT 1""",
+                (skill_invocation_id,),
+            ).fetchone()
+            if invocation is None:
+                raise ValueError("这条使用记录已失效，不能提交问题")
+            case_id = invocation["task_case_id"]
+        now = _now()
+        fingerprint = _digest(
+            "skill-problem-discovery", actor_id, now, clean_description, category,
+            skill_invocation_id, direct_association, clean_reason,
+        )
+        event = self.store.upsert_event(
+            fingerprint,
+            source="manual-problem-discovery",
+            session_family=f"manual-discovery:{actor_id}",
+            event_type="problem_discovery",
+            payload_hash=_digest(clean_description),
+            payload={"text": clean_description, "metadata": {"submission": "skill-problem-discovery"}},
+            protocol_time=now,
+        )
+        with self.store.transaction():
+            self.store.execute("UPDATE canonical_events SET orphaned=0 WHERE id=?", (event["id"],))
+        span = {
+            "event_id": event["id"], "block_index": 0, "start": 0,
+            "end": len(clean_description), "origin": "user-authored",
+            "excerpt_hash": _digest(clean_description),
+            "redacted_excerpt": clean_description[:500],
+            "protocol_locator": "manual-problem-discovery.text",
+            "redaction_status": "redacted", "truncated": len(clean_description) > 500,
+        }
+        candidate = {
+            "channel": "skill-problem-discovery", "category": category,
+            "severity": "medium", "confidence": 1.0, "authority": "user",
+            "detector_id": "manual-problem-discovery", "detector_version": "manual-v1",
+            "span": span,
+            "metadata": {
+                "submittedByActorId": actor_id,
+                "directAssociationRequested": direct_association,
+                "associationReason": clean_reason or None,
+            },
+        }
+        targets: list[dict[str, Any]] = []
+        association = "pending-association"
+        if invocation and direct_association:
+            target = self._target_for_id("skill-invocation", invocation["id"], case_id, "user-direct-association", 1.0)
+            if target:
+                targets.append(target)
+                association = "direct-association-candidate"
+        elif case_id:
+            target = self._target_for_id("task-result", case_id, case_id, "user-task-result", 1.0)
+            if target:
+                targets.append(target)
+                association = "task-result-context"
+        signal = self._persist_candidate(
+            event, case_id, candidate, targets, source="manual-problem-discovery", queue=bool(targets),
+        )
+        return {"signal": signal, "association": association}
+
     def _normalize_target(
         self, raw: Mapping[str, Any], own_case_id: str | None, *, relation: str
     ) -> dict[str, Any] | None:
@@ -2849,7 +2943,7 @@ class FeedbackService:
                FROM feedback_signals s JOIN feedback_signal_revisions r ON r.id=s.current_machine_revision_id
                LEFT JOIN feedback_targets t ON t.id=s.current_confirmed_target_id
                WHERE COALESCE(r.observed_at,r.created_at)<=? AND r.created_at<=?
-                 AND r.channel<>'trial-experience'
+                 AND r.channel NOT IN ('trial-experience', 'skill-problem-discovery')
                  AND (? IS NULL OR EXISTS (
                    SELECT 1 FROM event_provenance provenance
                    JOIN log_file_generations generation ON generation.id=provenance.generation_id

@@ -2887,6 +2887,192 @@ input:disabled {
   grid-template-columns: minmax(180px, 1.4fr) minmax(110px, .7fr) minmax(110px, .7fr) minmax(160px, 1fr) 110px;
 }
 
+.discovery-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, .78fr) minmax(0, 1.22fr);
+  gap: 32px;
+  align-items: start;
+  margin-top: 8px;
+}
+
+.discovery-records,
+.discovery-form,
+.discovery-followup {
+  min-width: 0;
+}
+
+.discovery-records h2,
+.discovery-form h2,
+.discovery-followup h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+}
+
+.discovery-record-list {
+  display: grid;
+  gap: 6px;
+  max-height: 430px;
+  margin: 14px 0 8px;
+  overflow: auto;
+}
+
+.discovery-record {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 9px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid var(--hair);
+  border-radius: 5px;
+  background: var(--bg-elev);
+  cursor: pointer;
+}
+
+.discovery-record:has(input:checked) {
+  border-color: var(--blue);
+  box-shadow: inset 3px 0 var(--blue);
+}
+
+.discovery-record-copy strong,
+.discovery-record-copy span,
+.discovery-record-copy time {
+  display: block;
+}
+
+.discovery-record-copy strong {
+  font-size: 13px;
+}
+
+.discovery-record-copy span,
+.discovery-record-copy time {
+  margin-top: 3px;
+  color: var(--ink-2);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.discovery-field-label {
+  margin: 0 0 8px;
+  font-weight: 600;
+}
+
+.discovery-categories {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.discovery-category {
+  min-height: 42px;
+  padding: 8px 10px;
+  border: 1px solid var(--hair-strong);
+  border-radius: 5px;
+  background: var(--bg-elev);
+  color: var(--ink);
+  text-align: left;
+}
+
+.discovery-category:hover,
+.discovery-category.selected {
+  border-color: var(--blue);
+  background: color-mix(in srgb, var(--blue), var(--bg-elev) 94%);
+}
+
+.discovery-description,
+.discovery-association-reason {
+  width: 100%;
+  border: 1px solid var(--hair-strong);
+  border-radius: 5px;
+  background: var(--bg-elev);
+  color: var(--ink);
+}
+
+.discovery-description {
+  min-height: 132px;
+  padding: 10px;
+  resize: vertical;
+  line-height: 1.55;
+}
+
+.discovery-association-reason {
+  min-height: 38px;
+  margin-top: 8px;
+  padding: 0 10px;
+}
+
+.discovery-preview {
+  min-height: 40px;
+  margin: 8px 0 0;
+  color: var(--ink-2);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.discovery-direct {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 14px;
+  font-weight: 600;
+}
+
+.discovery-confirmation {
+  margin: 16px 0 12px;
+  padding: 12px 0;
+  border-block: 1px solid var(--hair);
+}
+
+.discovery-confirmation p {
+  margin: 4px 0 0;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+
+.discovery-followup {
+  margin-top: 34px;
+  padding-top: 20px;
+  border-top: 1px solid var(--hair);
+}
+
+.discovery-receipt {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 12px;
+  border-left: 3px solid var(--green);
+  background: color-mix(in srgb, var(--green), var(--bg-elev) 94%);
+}
+
+.discovery-receipt p {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.discovery-submission-list {
+  display: grid;
+  gap: 0;
+  border-top: 1px solid var(--hair);
+}
+
+.discovery-submission {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.4fr) auto minmax(180px, .8fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-height: 56px;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--hair);
+}
+
+.discovery-submission span,
+.discovery-submission time {
+  color: var(--ink-2);
+  font-size: 12px;
+}
+
 .feedback-summary-band {
   display: grid;
   grid-template-columns: repeat(6, minmax(90px, 1fr));
@@ -3306,6 +3492,11 @@ input:disabled {
   .feedback-detail-layout {
     grid-template-columns: 1fr;
   }
+
+  .discovery-layout {
+    grid-template-columns: 1fr;
+    gap: 24px;
+  }
 }
 
 @media (max-width: 720px) {
@@ -3417,6 +3608,20 @@ input:disabled {
   .feedback-row > :last-child {
     grid-column: 2;
     grid-row: 1 / span 3;
+  }
+
+  .discovery-categories {
+    grid-template-columns: 1fr;
+  }
+
+  .discovery-submission {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px 12px;
+  }
+
+  .discovery-submission span,
+  .discovery-submission time {
+    grid-column: 1;
   }
 
   .outcome-timeline-item {

@@ -57,7 +57,7 @@ from token_usage import calculate_skill_token_usage
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.environ.get("CODEX_SKILLS_MANAGER_DATA_DIR", BASE_DIR / "data")).expanduser().resolve()
 PUBLIC_DIR = BASE_DIR / "public"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_SKILLS_REPO_DIR = (BASE_DIR.parent / "codex-skills-library").resolve()
@@ -4230,6 +4230,8 @@ class Handler(SimpleHTTPRequestHandler):
             return ()
         if path.startswith("/api/judgment-feedback-referrals"):
             return ("reviewer",)
+        if path == "/api/problem-discoveries":
+            return ("reviewer",)
         if path.startswith("/api/skill-quality-snapshots"):
             return ("admin",) if method != "GET" else ("reviewer",)
         if path.startswith("/api/skill-quality"):
@@ -4399,6 +4401,27 @@ class Handler(SimpleHTTPRequestHandler):
                         claimed=normalize_bool(claimed_value) if claimed_value is not None else None,
                     ))
                 return True
+            if path == "/api/problem-discoveries":
+                if method == "GET":
+                    with outcome_service() as service:
+                        self.send_json(service.feedback.list_signals(
+                            limit=bounded_query_int(query, "limit", 100, 200),
+                            cursor=(query.get("cursor") or [None])[0],
+                            channel="skill-problem-discovery",
+                        ))
+                    return True
+                if method == "POST":
+                    body = self.read_body()
+                    with OUTCOME_WRITE_LOCK, outcome_service() as service:
+                        self.send_json(service.feedback.submit_problem_discovery(
+                            actor_id=actor.uuid,
+                            description=str(body.get("description") or ""),
+                            category=str(body.get("category") or ""),
+                            skill_invocation_id=(str(body["skillInvocationId"]) if body.get("skillInvocationId") else None),
+                            direct_association=normalize_bool(body.get("directAssociation"), default=False),
+                            association_reason=(str(body["associationReason"]) if body.get("associationReason") else None),
+                        ), HTTPStatus.CREATED)
+                    return True
             if method == "GET" and path == "/api/feedback-clusters":
                 with outcome_service() as service:
                     self.send_json(service.feedback.clusters(
@@ -4712,13 +4735,16 @@ class Handler(SimpleHTTPRequestHandler):
                     conditions.append("a.contract_version_id=?")
                     parameters.append(contract_filter)
                 with outcome_service() as service:
+                    registry = read_registry_state()
                     rows = service.store.execute(
                         f"""SELECT i.id, i.skill_id, i.skill_sha256, i.load_status, i.validity,
-                                   COALESCE(i.invoked_at,i.created_at) AS created_at, l.id AS attribution_id, l.task_case_id,
+                                   COALESCE(i.invoked_at,i.created_at) AS created_at, episode.goal_text, l.id AS attribution_id, l.task_case_id,
                                    l.attribution_kind, l.status AS attribution_status,
                                    a.id AS assessment_id, a.assessability, a.automated_verdict,
                                    a.contract_version_id, a.conflict_state, a.freshness
-                            FROM skill_invocations i JOIN attribution_links l ON l.skill_invocation_id=i.id
+                            FROM skill_invocations i
+                            JOIN task_episodes episode ON episode.id=i.task_episode_id
+                            LEFT JOIN attribution_links l ON l.skill_invocation_id=i.id AND l.status='active'
                             LEFT JOIN outcome_assessments a ON a.skill_invocation_id=i.id AND a.is_current=1
                             WHERE {' AND '.join(conditions)} ORDER BY COALESCE(i.invoked_at,i.created_at) DESC LIMIT ?""",
                         (*parameters, limit),
@@ -4726,6 +4752,10 @@ class Handler(SimpleHTTPRequestHandler):
                     items = []
                     for row in rows:
                         item = EffectStore._row(row)
+                        entry = registry.get("skills", {}).get(str(item.get("skill_id") or ""), {})
+                        localized = entry.get("localized") if isinstance(entry.get("localized"), dict) else {}
+                        item["skill_display_name"] = str(localized.get("zhName") or "技能使用")
+                        item["skill_purpose"] = str(localized.get("zhTrigger") or entry.get("description") or "未提供用途说明")
                         if item.get("assessment_id"):
                             item.update(service.effective_projection(item["assessment_id"]))
                         items.append(item)

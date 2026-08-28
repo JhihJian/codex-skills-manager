@@ -1,6 +1,6 @@
 const initialRoute = new URLSearchParams(window.location.search);
 const state = {
-  view: initialRoute.get("view") || "quality", overview: null, selectedCase: initialRoute.get("case"), selectedFeedback: initialRoute.get("feedback"),
+  view: initialRoute.get("view") || "discover", overview: null, selectedCase: initialRoute.get("case"), selectedFeedback: initialRoute.get("feedback"),
   skillFilter: initialRoute.get("skill") || "", feedbackChannel: "", feedbackSeverity: "",
   feedbackResolution: "", feedbackItems: [], feedbackNextCursor: null, busy: false,
   qualitySubject: initialRoute.get("skill") && initialRoute.get("sha") ? {
@@ -11,6 +11,7 @@ const state = {
   qualitySource: initialRoute.get("source") || "", qualityFrom: initialRoute.get("from") || "", qualityTo: initialRoute.get("to") || "",
   qualityCompare: [], qualityJudgmentInvocation: null, qualityReturnCase: null,
   qualityItems: [], qualityNextCursor: null,
+  discoveryInvocationId: "", discoveryReceipt: null, discoveryUses: null, discoveryItems: null,
 };
 const $ = (id) => document.getElementById(id);
 
@@ -61,7 +62,7 @@ function label(value) {
     rejected: "已排除", "exception-accepted": "例外接受", disputed: "结论冲突",
     "resolved-by-correction": "已由纠正解决", "manual-decision": "人工裁决",
     "manual-disposition": "人工处置", automatic: "自动评审", exception: "业务例外",
-    "user-feedback": "用户反馈", "process-anomaly": "过程异常", "assistant-claim": "助手线索",
+    "user-feedback": "用户反馈", "process-anomaly": "过程异常", "assistant-claim": "助手线索", "skill-problem-discovery": "主动问题发现",
     "result-rejection": "结果否定", "observed-defect": "故障反馈",
     "requirement-gap": "需求遗漏", "rework-correction": "返工纠正",
     "process-critique": "过程批评", "external-negative-acceptance": "外部拒绝",
@@ -239,6 +240,167 @@ function feedbackTargetText(item) {
   return `${label(item.target_kind)} · ${String(identifier).slice(0, 12)}`;
 }
 
+function discoveryStatus(item) {
+  const resolution = item.current_resolution_state;
+  if (resolution === "resolved-verified") return ["已解决", "已用证据验证结果"];
+  if (resolution === "resolved-unverified") return ["已关闭", "处理已结束，未保留验证证据"];
+  if (resolution === "false-positive") return ["未采纳", "评审未确认这是需要处理的问题"];
+  if (resolution === "awaiting-verification") return ["等待你确认", "处理方正在等待验证结果"];
+  if (resolution === "fix-in-progress") return ["正在处理", "处理方正在修复或补充证据"];
+  if (resolution === "action-required") return ["已确认", "问题已进入处理队列"];
+  if (item.current_process_state === "candidate") return ["待关联", "尚未关联到一次可验证的使用记录"];
+  return ["已收到", "系统正在核实问题与使用记录的关系"];
+}
+
+function problemPreview(value) {
+  return String(value || "")
+    .replace(/((?:token|password|secret|api[_-]?key)\s*[:=]\s*)[^\s,;]+/gi, "$1[已隐藏]")
+    .slice(0, 280) || "填写问题说明后会在这里显示提交摘要。";
+}
+
+async function renderDiscovery() {
+  const content = $("outcomeContent");
+  const head = sectionHead("发现一次使用中的问题", "选择刚才的使用记录，说明发生了什么。提交的是待核实的问题，不会自动认定技能失败。");
+  content.replaceChildren(head, element("div", "loading-state", "正在读取最近使用记录"));
+  if (!state.discoveryUses || !state.discoveryItems) {
+    try {
+      [state.discoveryUses, state.discoveryItems] = await Promise.all([
+        api("/api/skill-use-events?status=loaded&limit=12"),
+        api("/api/problem-discoveries?limit=12"),
+      ]);
+    } catch (error) {
+      qualityFailure(content, error.message, () => renderDiscovery());
+      return;
+    }
+  }
+  const uses = state.discoveryUses;
+  const discoveries = state.discoveryItems;
+  const draft = state.discoveryDraft || { category: "", description: "", direct: false, reason: "" };
+  state.discoveryDraft = draft;
+  const layout = element("div", "discovery-layout");
+  const record = element("section", "discovery-records");
+  record.append(element("h2", "", "1. 选择这次使用"));
+  record.append(element("p", "outcome-muted", "只用于帮助核实问题发生在什么任务中。没有记录也可以继续提交。"));
+  const records = element("div", "discovery-record-list");
+  for (const item of uses.items || []) {
+    const option = element("label", "discovery-record");
+    const radio = element("input");
+    radio.type = "radio"; radio.name = "discovery-use"; radio.value = item.id;
+    radio.checked = state.discoveryInvocationId === item.id;
+    radio.addEventListener("change", () => { state.discoveryInvocationId = item.id; renderDiscovery(); });
+    const copy = element("span", "discovery-record-copy");
+    copy.append(element("strong", "", item.skill_display_name || "技能使用"),
+      element("span", "", item.skill_purpose || "未提供用途说明"),
+      element("span", "", item.goal_text || "未恢复任务摘要"),
+      element("time", "", dateText(item.created_at)));
+    option.append(radio, copy);
+    records.append(option);
+  }
+  const missing = actionButton("没有看到这次使用记录", () => {
+    state.discoveryInvocationId = "";
+    return renderDiscovery();
+  }, "text-button");
+  record.append(records, missing);
+  if (!(uses.items || []).length) record.append(element("p", "outcome-muted", "暂时没有可选记录。可以直接描述问题，系统会将它标为待关联。"));
+
+  const form = element("form", "discovery-form");
+  form.noValidate = true;
+  form.append(element("h2", "", "2. 说明发生了什么"));
+  const categoryLabel = element("p", "discovery-field-label", "问题更接近哪一种情况？");
+  const categories = element("div", "discovery-categories");
+  [["result-rejection", "结果不完整或不对"], ["observed-defect", "操作做不下去"],
+    ["requirement-gap", "遗漏了需要的内容"], ["rework-correction", "增加了返工"], ["process-critique", "过程不合理"], ["mixed-or-unclear", "其他"]]
+    .forEach(([value, text]) => {
+      const option = element("button", "discovery-category", text);
+      option.type = "button";
+      option.setAttribute("aria-pressed", String(draft.category === value));
+      option.classList.toggle("selected", draft.category === value);
+      option.addEventListener("click", () => {
+        draft.category = value;
+        categories.querySelectorAll(".discovery-category").forEach((button) => {
+          const selected = button === option;
+          button.classList.toggle("selected", selected);
+          button.setAttribute("aria-pressed", String(selected));
+        });
+      });
+      categories.append(option);
+    });
+  const description = element("textarea", "discovery-description");
+  description.placeholder = "例如：技能给出的命令无法执行，导致我需要手动查找正确写法。";
+  description.value = draft.description;
+  description.maxLength = 2000;
+  const preview = element("p", "discovery-preview", `提交摘要：${problemPreview(draft.description)}`);
+  description.addEventListener("input", () => {
+    draft.description = description.value;
+    preview.textContent = `提交摘要：${problemPreview(draft.description)}`;
+  });
+  form.append(categoryLabel, categories, description, preview);
+  if (state.discoveryInvocationId) {
+    const direct = element("label", "discovery-direct");
+    const check = element("input"); check.type = "checkbox"; check.checked = draft.direct;
+    check.addEventListener("change", () => { draft.direct = check.checked; renderDiscovery(); });
+    direct.append(check, element("span", "", "我认为问题与这项技能直接有关"));
+    form.append(direct);
+    if (draft.direct) {
+      const reason = element("input", "discovery-association-reason");
+      reason.placeholder = "说明关联原因，例如：技能示例中的命令直接导致失败";
+      reason.value = draft.reason;
+      reason.maxLength = 500;
+      reason.addEventListener("input", () => { draft.reason = reason.value; });
+      form.append(reason);
+    }
+  }
+  const confirmation = element("section", "discovery-confirmation");
+  confirmation.append(element("strong", "", "提交前确认"),
+    element("p", "", "系统会保存脱敏后的问题摘要和使用记录。该反馈需要人工核实，不会自动写成技能失败。"));
+  const submit = actionButton("提交问题", async () => {
+    if (!draft.category) throw new Error("请选择问题类型");
+    if (draft.description.trim().length < 12) throw new Error("请至少说明 12 个字符，方便他人核实");
+    const response = await api("/api/problem-discoveries", {
+      method: "POST",
+      body: JSON.stringify({
+        skillInvocationId: state.discoveryInvocationId || null, category: draft.category,
+        description: draft.description, directAssociation: draft.direct,
+        associationReason: draft.reason,
+      }),
+    });
+    state.discoveryReceipt = response;
+    state.discoveryDraft = { category: "", description: "", direct: false, reason: "" };
+    state.discoveryInvocationId = "";
+    state.discoveryUses = null;
+    state.discoveryItems = null;
+    setStatus("问题已提交，等待核实");
+    await Promise.all([loadOverview(), renderDiscovery()]);
+  }, "primary-button");
+  form.append(confirmation, submit);
+  layout.append(record, form);
+
+  const followup = element("section", "discovery-followup");
+  followup.append(element("h2", "", "我提交的问题"));
+  if (state.discoveryReceipt?.signal) {
+    const receipt = state.discoveryReceipt.signal;
+    const status = discoveryStatus(receipt);
+    const revision = (receipt.machine_revisions || []).find((item) => item.is_current) || {};
+    const notice = element("div", "discovery-receipt");
+    notice.append(element("strong", "", "已收到你的问题"),
+      element("p", "", revision.redacted_excerpt || "问题摘要已保存"),
+      badge(status[0], "green"), element("span", "outcome-muted", status[1]));
+    followup.append(notice);
+  }
+  const list = element("div", "discovery-submission-list");
+  for (const item of discoveries.items || []) {
+    const status = discoveryStatus(item);
+    const row = element("article", "discovery-submission");
+    row.append(element("strong", "", item.redacted_excerpt || "问题摘要已清理"),
+      badge(status[0], toneFor(item.current_resolution_state)),
+      element("span", "", status[1]), element("time", "", dateText(item.observed_at)));
+    list.append(row);
+  }
+  if (!(discoveries.items || []).length) list.append(element("p", "outcome-muted", "提交后，你的问题和处理进度会显示在这里。"));
+  followup.append(list);
+  content.replaceChildren(head, layout, followup);
+}
+
 function feedbackFilterBar() {
   const bar = element("div", "outcome-filterbar feedback-filterbar");
   const channel = element("select");
@@ -413,7 +575,8 @@ async function openFeedback(signalId) {
       state.qualityTab = "feedback";
       qualityRoute({ feedbackId: null, replace: true });
       await renderQualityDetail();
-    } else await renderFeedback();
+    } else if (state.view === "discover") await renderDiscovery();
+    else await renderFeedback();
   }, "text-button"));
   const layout = element("div", "feedback-detail-layout");
   const evidence = element("section", "feedback-evidence-pane");
@@ -1194,9 +1357,10 @@ async function renderQualityComparison() {
 
 async function renderView() {
   document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
-  $("effectOverview").hidden = state.view === "quality";
+  $("effectOverview").hidden = ["quality", "discover"].includes(state.view);
   if (state.selectedFeedback) return openFeedback(state.selectedFeedback);
   if (state.selectedCase) return openCase(state.selectedCase);
+  if (state.view === "discover") return renderDiscovery();
   if (state.view === "quality") return renderQuality();
   if (state.view === "loads") return renderLoads();
   if (state.view === "outcomes") return renderOutcomes();
@@ -1214,6 +1378,8 @@ async function runScan() {
   try {
     const scan = await api("/api/effect-scan", { method: "POST", body: JSON.stringify({ budgetBytes: 268435456, budgetSeconds: 20 }) });
     setStatus(`扫描完成：索引 ${scan.indexed_files} 个文件，新增反馈 ${scan.feedback?.newSignals || 0} 条`);
+    state.discoveryUses = null;
+    state.discoveryItems = null;
     await loadOverview();
     await renderView();
   } finally {
@@ -1247,7 +1413,7 @@ document.querySelectorAll("[data-view]").forEach((button) => button.addEventList
 
 window.addEventListener("popstate", () => {
   const route = new URLSearchParams(window.location.search);
-  state.view = route.get("view") || "quality";
+  state.view = route.get("view") || "discover";
   state.qualitySubject = route.get("skill") && route.get("sha")
     ? { skillId: route.get("skill"), sha: route.get("sha") } : null;
   state.skillFilter = route.get("skill") || "";

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
 
@@ -597,7 +597,7 @@ CREATE TABLE IF NOT EXISTS feedback_signal_revisions (
     feedback_signal_id TEXT NOT NULL REFERENCES feedback_signals(id) ON DELETE CASCADE,
     revision INTEGER NOT NULL CHECK (revision >= 1),
     revision_fingerprint TEXT NOT NULL UNIQUE,
-    channel TEXT NOT NULL CHECK (channel IN ('user-feedback', 'process-anomaly', 'assistant-claim', 'trial-experience')),
+    channel TEXT NOT NULL CHECK (channel IN ('user-feedback', 'process-anomaly', 'assistant-claim', 'trial-experience', 'skill-problem-discovery')),
     category TEXT NOT NULL,
     severity TEXT NOT NULL CHECK (severity IN ('critical', 'high', 'medium', 'low', 'unknown')),
     authority TEXT NOT NULL CHECK (authority IN ('user', 'external', 'tool', 'assistant', 'unknown')),
@@ -1393,7 +1393,7 @@ class EffectStore:
             row[1] for row in self.connection.execute("PRAGMA table_info(feedback_signal_revisions)").fetchall()
         }
         feedback_channel_rebuild = bool(
-            feedback_revision_sql_row and "trial-experience" not in str(feedback_revision_sql_row[0] or "")
+            feedback_revision_sql_row and "skill-problem-discovery" not in str(feedback_revision_sql_row[0] or "")
         )
         feedback_channel_rebuild_sql = ""
         if feedback_channel_rebuild:
@@ -1406,7 +1406,7 @@ class EffectStore:
                 feedback_signal_id TEXT NOT NULL REFERENCES feedback_signals(id) ON DELETE CASCADE,
                 revision INTEGER NOT NULL CHECK (revision >= 1),
                 revision_fingerprint TEXT NOT NULL UNIQUE,
-                channel TEXT NOT NULL CHECK (channel IN ('user-feedback', 'process-anomaly', 'assistant-claim', 'trial-experience')),
+                channel TEXT NOT NULL CHECK (channel IN ('user-feedback', 'process-anomaly', 'assistant-claim', 'trial-experience', 'skill-problem-discovery')),
                 category TEXT NOT NULL,
                 severity TEXT NOT NULL CHECK (severity IN ('critical', 'high', 'medium', 'low', 'unknown')),
                 authority TEXT NOT NULL CHECK (authority IN ('user', 'external', 'tool', 'assistant', 'unknown')),
@@ -1601,7 +1601,7 @@ class EffectStore:
             self._secure_files()
         if SCHEMA == _EXPECTED_SCHEMA and not _schema_conforms(self.connection):
             raise EffectStoreError(
-                "database schema does not match v8; restore from backup or run a supported migration"
+                "database schema does not match v10; restore from backup or run a supported migration"
             )
         return SCHEMA_VERSION
 

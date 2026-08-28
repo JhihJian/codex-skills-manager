@@ -155,6 +155,57 @@ class FeedbackServiceTests(unittest.TestCase):
                     expected_revision=signal["current_action_revision"], reason_code=reason,
                 )
 
+    def test_manual_problem_discovery_requires_explicit_direct_association_and_stays_separate(self):
+        actor = self.actor("Reporter")
+        invocation = self.skill("discovery-skill", invocation_id="manual-discovery-invocation")
+        with self.assertRaisesRegex(ValueError, "直接有关"):
+            self.service.submit_problem_discovery(
+                actor_id=actor["id"], skill_invocation_id=invocation,
+                category="observed-defect", description="技能示例无法执行，任务无法继续完成。",
+                direct_association=True, association_reason="太短",
+            )
+        submitted = self.service.submit_problem_discovery(
+            actor_id=actor["id"], skill_invocation_id=invocation,
+            category="observed-defect", description="技能示例无法执行，任务无法继续完成。",
+            direct_association=True, association_reason="示例命令直接输出错误，无法继续执行。",
+        )
+        signal = submitted["signal"]
+        revision = next(item for item in signal["machine_revisions"] if item["is_current"])
+        self.assertEqual((submitted["association"], revision["channel"]), ("direct-association-candidate", "skill-problem-discovery"))
+        self.assertEqual(signal["targets"][0]["target_kind"], "skill-invocation")
+        self.assertEqual(signal["current_process_state"], "queued")
+        self.assertEqual(self.service.list_signals(channel="skill-problem-discovery")["items"][0]["id"], signal["id"])
+
+    def test_manual_problem_discovery_without_a_usage_record_stays_pending_association(self):
+        actor = self.actor("Reporter")
+        submitted = self.service.submit_problem_discovery(
+            actor_id=actor["id"], category="requirement-gap",
+            description="输出遗漏了关键步骤，无法确认后续操作是否安全。",
+        )
+        signal = submitted["signal"]
+        self.assertEqual((submitted["association"], signal["current_process_state"], signal["targets"]), ("pending-association", "candidate", []))
+        event = self.store.execute("SELECT orphaned FROM canonical_events WHERE id=?", (signal["feedback_event_id"],)).fetchone()
+        self.assertEqual(event["orphaned"], 0)
+
+    def test_manual_problem_discovery_redacts_sensitive_text_and_is_excluded_from_formal_candidates(self):
+        actor = self.actor("Reporter")
+        submitted = self.service.submit_problem_discovery(
+            actor_id=actor["id"], category="observed-defect",
+            description="token=super-secret-value 导致技能命令无法执行，请核实。",
+        )
+        serialized = json.dumps(submitted, ensure_ascii=False)
+        stored = self.store.execute(
+            """SELECT event.payload_json, revision.redacted_excerpt, revision.metadata_json
+               FROM feedback_signals signal
+               JOIN canonical_events event ON event.id=signal.feedback_event_id
+               JOIN feedback_signal_revisions revision ON revision.id=signal.current_machine_revision_id
+               WHERE signal.id=?""", (submitted["signal"]["id"],),
+        ).fetchone()
+        self.assertNotIn("super-secret-value", serialized)
+        self.assertNotIn("super-secret-value", "".join(str(value) for value in stored))
+        candidates = self.service.feedback_snapshot_candidates(coverage_status="complete")
+        self.assertNotIn(submitted["signal"]["id"], {item["feedback_signal_id"] for item in candidates})
+
     def test_explicit_user_acceptance_resolves_confirmed_feedback(self):
         signal = self.derive()
         actor, _action, confirmed = self.confirm(signal)

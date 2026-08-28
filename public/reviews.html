@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>技能结果评审</title>
+    <title>技能问题发现</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -20,16 +20,17 @@
     <div class="window review-window outcome-window">
       <header class="titlebar">
         <div class="traffic" aria-hidden="true"><span></span><span></span><span></span></div>
-        <div class="title"><strong>技能结果评审</strong><span id="reviewPageStatus">准备就绪</span></div>
+        <div class="title"><strong>技能问题发现</strong><span id="reviewPageStatus">准备就绪</span></div>
         <div class="toolbar">
           <button id="effectScanButton" class="icon-button icon-button-labeled" title="增量扫描会话" aria-label="增量扫描会话"><svg><use href="#icon-refresh"></use></svg><span>扫描</span></button>
           <a class="icon-button" href="/" title="返回技能管理" aria-label="返回技能管理"><svg><use href="#icon-arrow-left"></use></svg></a>
         </div>
       </header>
       <main class="outcome-shell">
-        <aside class="outcome-nav" aria-label="结果评审视图">
-          <div class="review-nav-head"><span>评审</span><strong id="openQueueCount">0</strong></div>
-          <button class="review-type active" data-view="quality"><svg><use href="#icon-chart"></use></svg><span><strong>技能质量</strong><small>版本、证据与试用判断</small></span></button>
+        <aside class="outcome-nav" aria-label="技能问题发现与评审">
+          <div class="review-nav-head"><span>问题</span><strong id="openQueueCount">0</strong></div>
+          <button class="review-type active" data-view="discover"><svg><use href="#icon-message-alert"></use></svg><span><strong>发现问题</strong><small>从一次使用开始记录问题</small></span></button>
+          <button class="review-type" data-view="quality"><svg><use href="#icon-chart"></use></svg><span><strong>技能质量</strong><small>版本、证据与试用判断</small></span></button>
           <button class="review-type" data-view="loads"><svg><use href="#icon-list"></use></svg><span><strong>加载检测</strong><small>Codex 与 Pi 加载记录</small></span></button>
           <button class="review-type" data-view="outcomes"><svg><use href="#icon-check"></use></svg><span><strong>任务结果</strong><small>合同证据与结论</small></span></button>
           <button class="review-type" data-view="feedback"><svg><use href="#icon-message-alert"></use></svg><span><strong>负面反馈</strong><small>用户评价与过程异常</small></span></button>

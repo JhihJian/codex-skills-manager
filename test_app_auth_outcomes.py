@@ -88,6 +88,22 @@ class AppAuthOutcomeApiTests(unittest.TestCase):
         self.assertEqual(app.Handler.required_roles("GET", "/api/review-tasks"), ("reviewer",))
         self.assertEqual(app.Handler.required_roles("GET", "/api/skill-use-events"), ("reviewer",))
         self.assertEqual(app.Handler.required_roles("GET", "/api/effect-metrics"), ("reviewer",))
+        self.assertEqual(app.Handler.required_roles("POST", "/api/problem-discoveries"), ("reviewer",))
+        self.assertFalse(app.normalize_bool("false"))
+
+    def test_problem_discovery_submission_is_created_as_a_separate_channel(self):
+        cookie, csrf = self.login()
+        headers = {"Cookie": cookie, "X-CSRF-Token": csrf}
+        status, created, _headers = self.request(
+            "POST", "/api/problem-discoveries",
+            {"category": "observed-defect", "description": "技能示例无法执行，导致任务无法继续完成。"},
+            headers=headers,
+        )
+        self.assertEqual(status, 201)
+        revision = next(item for item in created["signal"]["machine_revisions"] if item["is_current"])
+        self.assertEqual((created["association"], revision["channel"]), ("pending-association", "skill-problem-discovery"))
+        status, listed, _headers = self.request("GET", "/api/problem-discoveries", headers={"Cookie": cookie})
+        self.assertEqual((status, listed["items"][0]["id"]), (200, created["signal"]["id"]))
         status, payload, _headers = self.request("GET", "/api/auth/status")
         self.assertEqual((status, payload["authenticated"]), (200, False))
         status, payload, _headers = self.request("GET", "/api/effect-overview")

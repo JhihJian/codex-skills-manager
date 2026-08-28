@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from effect_store import EffectStore, EffectStoreError, ImmutableSnapshotError, RevisionConflict, SCHEMA_VERSION
+from effect_store import EffectStore, EffectStoreError, ImmutableSnapshotError, RevisionConflict, SCHEMA, SCHEMA_VERSION
 
 
 class EffectStoreTests(unittest.TestCase):
@@ -152,6 +152,47 @@ class EffectStoreTests(unittest.TestCase):
             ).fetchone()[0]
             self.assertIn("effect_derivation_changes", trigger)
             self.assertEqual(migrated.pragma("user_version"), SCHEMA_VERSION)
+        finally:
+            migrated.close()
+
+    def test_v9_feedback_revision_rows_survive_discovery_channel_migration(self) -> None:
+        path = Path(self.tmp.name) / "v9-feedback.sqlite3"
+        v9_schema = SCHEMA.replace(", 'skill-problem-discovery'", "")
+        now = "2026-08-28T00:00:00Z"
+        with sqlite3.connect(path) as connection:
+            connection.executescript(v9_schema)
+            connection.execute(
+                """INSERT INTO canonical_events(
+                       id,event_fingerprint,source,session_family,event_type,payload_hash,payload_json,
+                       orphaned,created_at,updated_at)
+                   VALUES ('v9-event','v9-event','pi','v9-family','user_message','hash','{}',0,?,?)""", (now, now),
+            )
+            connection.execute(
+                """INSERT INTO feedback_signals(
+                       id,logical_fingerprint,feedback_event_id,current_process_state,current_resolution_state,
+                       current_action_revision,created_at,updated_at)
+                   VALUES ('v9-signal','v9-signal','v9-event','candidate','unreviewed',0,?,?)""", (now, now),
+            )
+            connection.execute(
+                """INSERT INTO feedback_signal_revisions(
+                       id,feedback_signal_id,revision,revision_fingerprint,channel,category,severity,
+                       authority,source,confidence,excerpt_hash,redacted_excerpt,locator_json,detector_id,
+                       detector_version,span_parser_version,resolver_version,metadata_json,orphaned,is_current,
+                       observed_at,created_at)
+                   VALUES ('v9-revision','v9-signal',1,'v9-revision','user-feedback','observed-defect','medium',
+                       'user','pi',1.0,'hash','旧版反馈','{}','detector','v9','span','resolver','{}',0,1,?,?)""",
+                (now, now),
+            )
+            connection.execute("UPDATE feedback_signals SET current_machine_revision_id='v9-revision' WHERE id='v9-signal'")
+            connection.execute("PRAGMA user_version=9")
+        migrated = EffectStore(path)
+        try:
+            self.assertEqual(migrated.pragma("user_version"), SCHEMA_VERSION)
+            self.assertEqual(migrated.execute("SELECT redacted_excerpt FROM feedback_signal_revisions WHERE id='v9-revision'").fetchone()[0], "旧版反馈")
+            self.assertEqual(migrated.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(migrated.execute("PRAGMA foreign_key_check").fetchall(), [])
+            ddl = migrated.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='feedback_signal_revisions'").fetchone()[0]
+            self.assertIn("skill-problem-discovery", ddl)
         finally:
             migrated.close()
 

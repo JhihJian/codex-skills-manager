@@ -343,6 +343,7 @@ Pi 会话目录按以下顺序确定：`CODEX_SKILL_PI_SESSIONS_DIR`、`PI_CODIN
 - [`docs/session-negative-feedback-design.md`](docs/session-negative-feedback-design.md)：会话负面反馈、过程异常、目标归属和解决闭环设计。
 - [`docs/skill-quality-judgment-design.md`](docs/skill-quality-judgment-design.md)：桌面端按精确技能版本判断质量、试用体验和可比较性的改进设计。
 - [`docs/skill-real-use-validation.md`](docs/skill-real-use-validation.md)：subagent 在隔离真实任务中验证技能说明并发现设计缺陷的首轮记录。
+- [`docs/problem-discovery-workbench-design.md`](docs/problem-discovery-workbench-design.md)：面向普通使用者的技能问题发现、提交和跟踪工作台。
 - [`docs/skill-real-use-evidence-2026-08-28.md`](docs/skill-real-use-evidence-2026-08-28.md)：首轮验证的命令、退出状态、技能版本哈希与审议证据。
 
 ### 增量索引与结果模型
@@ -374,6 +375,9 @@ detector 升级时，截断的历史消息按 provenance 字节范围从配置�
 主要接口：
 
 - `GET /api/skill-quality`、`/detail`、`/cases`、`/feedback`、`/compare`：读取版本质量目录、下钻和同口径比较。
+- `GET/POST /api/problem-discoveries`：读取或提交主动问题发现。提交形成独立审计线索，不自动计入技能质量结论。
+
+本地验收可设置 `CODEX_SKILLS_MANAGER_DATA_DIR` 指向隔离数据目录；未设置时仍使用项目的 `data/`。该变量只改变管理器自身的 SQLite、认证和设置文件位置，适合提交问题发现等写入型界面验收。
 - `POST /api/skill-use-judgment-assignments`、`GET /api/skill-use-judgment-assignments/current`：管理并读取试用 assignment。
 - `POST /api/skill-use-judgments`、`POST /api/skill-use-judgments/withdraw`：追加或撤销本人的试用判断。
 - `POST /api/judgment-feedback-referrals/<id>/decision`：由 reviewer 将显式负面试用转介链接、转换或关闭。
