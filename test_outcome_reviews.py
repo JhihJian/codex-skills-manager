@@ -141,6 +141,31 @@ class OutcomeReviewServiceTests(unittest.TestCase):
             result = self.service.scan({"pi": path})
         self.assertEqual((result["status"], result["coverage_status"]), ("partial", "partial"))
 
+    def test_scan_prioritizes_unindexed_files_across_sources(self):
+        indexed = self.logs / "indexed.jsonl"
+        indexed.write_bytes(jsonl([self.pi_header("indexed"), self.pi_user(text="known")]))
+        self.service.scan({"pi": indexed})
+        unindexed = self.logs / "unindexed.jsonl"
+        unindexed.write_bytes(jsonl([self.pi_header("unindexed"), self.pi_user(text="new")]))
+        ordered = self.service._prioritize_unindexed_files([
+            ("pi", indexed), ("codex", unindexed),
+        ])
+        self.assertEqual(ordered[0], ("codex", unindexed))
+
+    def test_scan_prioritizes_appended_file_over_completed_checkpoint(self):
+        indexed = self.logs / "appended.jsonl"
+        indexed.write_bytes(jsonl([self.pi_header("appended"), self.pi_user(text="first")]))
+        self.service.scan({"pi": indexed})
+        completed = self.logs / "completed.jsonl"
+        completed.write_bytes(jsonl([self.pi_header("completed"), self.pi_user(text="done")]))
+        self.service.scan({"pi": completed})
+        with indexed.open("ab") as handle:
+            handle.write(jsonl([self.pi_user("next", "new tail")]))
+        ordered = self.service._prioritize_unindexed_files([
+            ("pi", completed), ("pi", indexed),
+        ])
+        self.assertEqual(ordered[0], ("pi", indexed))
+
     def test_rewrite_removes_orphaned_machine_derived_records(self):
         path = self.logs / "derived.jsonl"
         base = [self.pi_header("derived"), self.pi_user(text="run")]

@@ -201,6 +201,7 @@ class OutcomeReviewService:
         feedback_before = self.store.execute("SELECT COUNT(*) FROM feedback_signals").fetchone()[0]
         started = time.monotonic()
         files, scopes, discovery_errors = self._discover(entries)
+        files = self._prioritize_unindexed_files(files)
         indexed_files = indexed_bytes = failed_files = 0
         pending_files = 0
         errors: list[dict[str, Any]] = list(discovery_errors)
@@ -265,6 +266,61 @@ class OutcomeReviewService:
         }
         return _safe_public(finished)
     scan_incremental = scan
+
+    def _prioritize_unindexed_files(self, files: Sequence[tuple[str, Path]]) -> list[tuple[str, Path]]:
+        """Scan missing or incomplete checkpoints before already-complete history."""
+        complete_sizes = {
+            (row["source"], row["path"]): int(row["observed_size"])
+            for row in self.store.execute(
+                """SELECT f.source, location.path, generation.observed_size
+                   FROM log_file_locations location
+                   JOIN log_file_generations generation ON generation.id=location.generation_id
+                   JOIN log_files f ON f.id=generation.log_file_id
+                   WHERE location.is_current=1 AND generation.status='active'
+                     AND generation.parser_version=?
+                     AND EXISTS (SELECT 1 FROM file_checkpoints checkpoint
+                                 WHERE checkpoint.generation_id=generation.id
+                                   AND checkpoint.byte_offset>=generation.observed_size)""",
+                (self.parser_version,),
+            ).fetchall()
+        }
+        def is_complete(item: tuple[str, Path]) -> bool:
+            try:
+                observed_size = complete_sizes.get((item[0], str(item[1].resolve())))
+                return observed_size is not None and observed_size >= item[1].stat().st_size
+            except OSError:
+                return False
+
+        pending = [item for item in files if not is_complete(item)]
+        finished = [item for item in files if is_complete(item)]
+        source_recency = {
+            row["source"]: str(row["last_scanned"] or "")
+            for row in self.store.execute(
+                """SELECT file.source, MAX(COALESCE(run.started_at, generation.started_at)) AS last_scanned
+                   FROM log_files file JOIN log_file_generations generation ON generation.log_file_id=file.id
+                   LEFT JOIN scan_runs run ON run.id=generation.scan_run_id
+                   GROUP BY file.source"""
+            ).fetchall()
+        }
+
+        def interleave(items: Sequence[tuple[str, Path]]) -> list[tuple[str, Path]]:
+            buckets = {
+                source: sorted((item for item in items if item[0] == source), key=lambda item: str(item[1]))
+                for source in sorted({item[0] for item in items})
+            }
+            ordered: list[tuple[str, Path]] = []
+            index = 0
+            while True:
+                added = False
+                for source in sorted(buckets, key=lambda value: (source_recency.get(value, ""), value)):
+                    if index < len(buckets[source]):
+                        ordered.append(buckets[source][index])
+                        added = True
+                if not added:
+                    return ordered
+                index += 1
+
+        return interleave(pending) + interleave(finished)
     def _source_entries(self, sources: Mapping[str, Any] | Iterable[Any]) -> list[tuple[str, Path]]:
         raw: list[tuple[Any, Any]] = []
         if isinstance(sources, Mapping):

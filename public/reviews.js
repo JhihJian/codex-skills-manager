@@ -878,7 +878,8 @@ async function renderQuality(reset = true) {
       renderQuality().catch((error) => setStatus(error.message));
     });
     const primary = element("div", "outcome-row-primary");
-    primary.append(element("strong", "", item.skill_id), element("span", "outcome-mono", shortSha(item.skill_sha256)));
+    primary.append(element("strong", "", item.skill_id), element("span", "outcome-mono", shortSha(item.skill_sha256)),
+      badge(item.is_current_enabled_version ? "当前启用版本" : "历史加载版本", item.is_current_enabled_version ? "green" : "orange"));
     row.append(choose, primary, qualityStatusBadge(item.quality_status), element("span", "", item.direct_case_count || 0),
       element("time", "", dateText(item.last_observed_at)),
       actionButton("查看质量", () => openQuality(item.skill_id, item.skill_sha256 || null), "text-button"));
@@ -889,7 +890,7 @@ async function renderQuality(reset = true) {
     const message = !scope.enabled_skill_count
       ? "当前没有可分析的已启用技能。"
       : !scope.eligible_loaded_version_count
-        ? `当前已启用 ${scope.enabled_skill_count} 个技能，尚无与当前启用版本匹配的成功加载记录。`
+        ? `当前已启用 ${scope.enabled_skill_count} 个技能，尚无成功加载记录。`
         : "没有符合当前筛选条件的已启用成功加载技能。";
     table.append(element("div", "empty-state", message));
   }
@@ -996,6 +997,7 @@ async function renderQualityDetail() {
   ].filter(Boolean).join(" · ");
   const contextItems = [qualityStatusBadge(detail.quality_status),
     element("span", "outcome-mono", detail.subject.skill_sha256 || "版本未知"),
+    badge(detail.subject.is_current_enabled_version ? "当前启用版本" : "历史加载版本", detail.subject.is_current_enabled_version ? "green" : "orange"),
     element("span", "", `覆盖 ${coverageLabel(detail.coverage.coverage_status)}`),
     element("span", "", `索引 ${detail.coverage.indexed_files || 0}/${detail.coverage.discovered_files || 0}`)];
   if (scopeText) contextItems.push(element("span", "outcome-muted", scopeText));

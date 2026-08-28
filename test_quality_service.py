@@ -368,14 +368,15 @@ class SkillQualityServiceTests(unittest.TestCase):
         disabled = self._invocation("disabled-skill", "b" * 64, "direct")
         pending = self._invocation("pending-skill", "c" * 64, "direct", load_status="pending")
         maintenance = self._invocation("maintenance-skill", "d" * 64, "direct", invocation_kind="skill-maintenance")
+        unknown = self._invocation("unknown-skill", None, "direct")
         scoped = SkillQualityService(
             self.store, None, self.feedback,
-            eligible_skill_versions={"quality-skill": "a" * 64, "pending-skill": "c" * 64},
+            eligible_skill_versions={"quality-skill": "a" * 64, "pending-skill": "c" * 64, "unknown-skill": "e" * 64},
         )
         self.assertEqual([item["skill_id"] for item in scoped.directory()["items"]], ["quality-skill"])
         with self.assertRaises(KeyError):
             scoped.detail("disabled-skill", "b" * 64)
-        for invocation in (disabled, pending, maintenance):
+        for invocation in (disabled, pending, maintenance, unknown):
             with self.assertRaises((KeyError, EffectStoreError)):
                 scoped.assign(invocation, actor_id=self.trial["id"], assigned_by_actor_id=self.admin["id"])
         scoped.assign(self.invocation, actor_id=self.trial["id"], assigned_by_actor_id=self.admin["id"])
@@ -390,6 +391,30 @@ class SkillQualityServiceTests(unittest.TestCase):
             scoped.decide_referral(
                 judgment["referral"]["id"], actor_id=self.admin["id"], action="close", reason_code="reviewed",
             )
+
+    def test_enabled_skill_keeps_historical_loaded_versions(self) -> None:
+        scoped = SkillQualityService(
+            self.store, None, self.feedback, eligible_skill_versions={"quality-skill": "z" * 64},
+        )
+        directory = scoped.directory()
+        item = next(row for row in directory["items"] if row["skill_id"] == "quality-skill")
+        self.assertEqual((item["skill_sha256"], item["current_enabled_sha"], item["is_current_enabled_version"]),
+                         ("a" * 64, "z" * 64, False))
+
+    def test_enabled_skill_historical_version_is_retained_in_quality_snapshot(self) -> None:
+        scoped = SkillQualityService(
+            self.store, None, self.feedback, eligible_skill_versions={"quality-skill": "z" * 64},
+        )
+        self._complete_scan()
+        scoped.assign(self.invocation, actor_id=self.trial["id"], assigned_by_actor_id=self.admin["id"])
+        judgment = scoped.submit_judgment(
+            self.invocation, actor_id=self.trial["id"], expected_revision=0,
+            verdict="helpful", attribution_relation="direct-skill-use",
+        )
+        self.store.execute("UPDATE skill_use_judgments SET contract_version_id='contract-history' WHERE id=?", (judgment["id"],))
+        self.store.execute("UPDATE use_evidence_snapshots SET contract_version_id='contract-history' WHERE id=?", (judgment["evidence_snapshot_id"],))
+        snapshot = scoped.seal_snapshot(expected_scope_fingerprint="quality-scope")
+        self.assertEqual(snapshot["items"][0]["skill_sha256"], "a" * 64)
 
 
 if __name__ == "__main__":

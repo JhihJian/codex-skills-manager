@@ -54,13 +54,13 @@ class SkillQualityService:
             return ["1=0"], []
         clauses = []
         params: list[Any] = []
-        for skill_id, skill_sha in sorted(self.eligible_skill_versions.items()):
-            clauses.append(f"({alias}.skill_id=? AND {alias}.skill_sha256=?)")
-            params.extend((skill_id, skill_sha))
+        for skill_id in sorted(self.eligible_skill_versions):
+            clauses.append(f"{alias}.skill_id=?")
+            params.append(skill_id)
         return ["(" + " OR ".join(clauses) + ")"], params
 
     def _require_eligible_subject(self, skill_id: str, skill_sha256: str | None) -> None:
-        if self.eligible_skill_versions is not None and self.eligible_skill_versions.get(skill_id) != skill_sha256:
+        if skill_sha256 is None or (self.eligible_skill_versions is not None and skill_id not in self.eligible_skill_versions):
             raise KeyError(f"quality-subject-not-in-current-scope:{skill_id}")
 
     # -------------------------------------------------------------- read model
@@ -73,7 +73,7 @@ class SkillQualityService:
         limit = min(max(int(limit), 1), 200)
         conditions = [
             "i.validity='valid'", "i.invocation_kind='business-use'", "i.load_status='loaded'",
-            "i.skill_id NOT IN ('', '*', 'unknown')",
+            "i.skill_id NOT IN ('', '*', 'unknown')", "i.skill_sha256 IS NOT NULL",
         ]
         params: list[Any] = []
         scope_conditions, scope_params = self._scope_conditions("i")
@@ -166,7 +166,7 @@ class SkillQualityService:
             f"""SELECT COUNT(DISTINCT i.skill_id || ':' || i.skill_sha256) AS eligible_loaded_version_count
                 FROM skill_invocations i
                 WHERE i.validity='valid' AND i.invocation_kind='business-use'
-                  AND i.load_status='loaded' AND {' AND '.join(scope_conditions)}""",
+                  AND i.load_status='loaded' AND i.skill_sha256 IS NOT NULL AND {' AND '.join(scope_conditions)}""",
             scope_params,
         ).fetchone()
         return {
@@ -182,6 +182,9 @@ class SkillQualityService:
         subject = self._subject(skill_id, skill_sha256)
         if subject is None:
             raise KeyError(f"{skill_id}@{skill_sha256 or 'unknown'}")
+        if self.eligible_skill_versions is not None:
+            subject["current_enabled_sha"] = self.eligible_skill_versions.get(skill_id)
+            subject["is_current_enabled_version"] = subject["current_enabled_sha"] == skill_sha256
         coverage = self._coverage()
         funnel = self._funnel(
             skill_id, skill_sha256, task_type=task_type, attribution=attribution,
@@ -622,7 +625,9 @@ class SkillQualityService:
         items: list[dict[str, Any]] = []
         selected_samples: set[tuple[Any, ...]] = set()
         for row in rows:
-            if self.eligible_skill_versions is not None and self.eligible_skill_versions.get(row["skill_id"]) != row["skill_sha256"]:
+            if self.eligible_skill_versions is not None and row["skill_id"] not in self.eligible_skill_versions:
+                continue
+            if row["skill_sha256"] is None:
                 continue
             if row["validity"] != "valid" or row["invocation_kind"] != "business-use" or row["load_status"] != "loaded":
                 continue
@@ -701,7 +706,8 @@ class SkillQualityService:
             (snapshot_id,),
         ).fetchall()]
         if self.eligible_skill_versions is not None and any(
-            self.eligible_skill_versions.get(item["skill_id"]) != item["skill_sha256"]
+            item["skill_id"] not in self.eligible_skill_versions
+            or item["skill_sha256"] is None
             or item["invocation_validity"] != "valid"
             or item["invocation_kind"] != "business-use"
             or item["invocation_load_status"] != "loaded"
@@ -730,12 +736,17 @@ class SkillQualityService:
                 coverage=coverage,
             ),
         )
-        return {**dict(row), "quality_status": status, "blocking_reasons": reasons}
+        current_sha = self.eligible_skill_versions.get(row["skill_id"]) if self.eligible_skill_versions is not None else None
+        return {
+            **dict(row), "quality_status": status, "blocking_reasons": reasons,
+            "current_enabled_sha": current_sha,
+            "is_current_enabled_version": current_sha == row.get("skill_sha256"),
+        }
 
     def _subject(self, skill_id: str, skill_sha256: str | None) -> dict[str, Any] | None:
         if skill_id in {"", "*", "unknown"}:
             return None
-        if self.eligible_skill_versions is not None and self.eligible_skill_versions.get(skill_id) != skill_sha256:
+        if skill_sha256 is None or (self.eligible_skill_versions is not None and skill_id not in self.eligible_skill_versions):
             return None
         condition = "i.skill_sha256 IS NULL" if skill_sha256 is None else "i.skill_sha256=?"
         params: tuple[Any, ...] = (skill_id,) if skill_sha256 is None else (skill_id, skill_sha256)
@@ -743,7 +754,7 @@ class SkillQualityService:
             f"""SELECT i.skill_id, i.skill_sha256, MAX(i.created_at) AS last_observed_at,
                        COUNT(DISTINCT i.id) AS invocation_count
                 FROM skill_invocations i WHERE i.skill_id=? AND {condition}
-                  AND i.validity='valid' AND i.invocation_kind='business-use' AND i.load_status='loaded'
+                  AND i.validity='valid' AND i.invocation_kind='business-use' AND i.load_status='loaded' AND i.skill_sha256 IS NOT NULL
                 GROUP BY i.skill_id, i.skill_sha256""", params,
         ).fetchone()
         return _decode(row) if row else None
@@ -781,7 +792,7 @@ class SkillQualityService:
         to_at: str | None = None,
     ) -> dict[str, int]:
         self._require_eligible_subject(skill_id, skill_sha256)
-        conditions = ["i.skill_id=?", "i.validity='valid'", "i.invocation_kind='business-use'", "i.load_status='loaded'"]
+        conditions = ["i.skill_id=?", "i.validity='valid'", "i.invocation_kind='business-use'", "i.load_status='loaded'", "i.skill_sha256 IS NOT NULL"]
         params: list[Any] = [skill_id]
         if skill_sha256 is None:
             conditions.append("i.skill_sha256 IS NULL")
@@ -1089,7 +1100,7 @@ class SkillQualityService:
             (invocation_id,),
         ).fetchone()
         result = _decode(rows) if rows else None
-        if result is not None and self.eligible_skill_versions is not None and self.eligible_skill_versions.get(result["skill_id"]) != result["skill_sha256"]:
+        if result is not None and (result["skill_sha256"] is None or (self.eligible_skill_versions is not None and result["skill_id"] not in self.eligible_skill_versions)):
             return None
         return result
 
