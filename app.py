@@ -4028,6 +4028,7 @@ def outcome_service() -> Any:
             OutcomeContractStore(SKILLS_DB_FILE),
             skill_roots=(LIBRARY_DIR, CODEX_SKILLS_DIR, PI_AGENT_DIR / "skills", Path.home() / ".agents" / "skills"),
             quality_eligible_skill_versions=current_quality_skill_versions(),
+            quality_scope_fingerprint=configured_session_scope_fingerprint(),
         )
 
 
