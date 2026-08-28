@@ -268,10 +268,11 @@ class AppAuthOutcomeApiTests(unittest.TestCase):
         enabled.rmdir()
         status, after, _headers = self.request("GET", "/api/skill-quality?skillId=scope-quality", headers={"Cookie": cookie})
         self.assertEqual((status, after["items"]), (200, []))
-        status, _detail, _headers = self.request(
+        status, detail, _headers = self.request(
             "GET", f"/api/skill-quality/detail?skillId=scope-quality&sha={sha}", headers={"Cookie": cookie},
         )
         self.assertEqual(status, 404)
+        self.assertIn("不在当前启用范围", detail["error"])
 
     def test_cleanup_rejects_invalid_criteria_before_creating_run(self):
         cookie, csrf = self.login()

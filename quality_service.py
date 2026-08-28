@@ -186,6 +186,7 @@ class SkillQualityService:
         attribution: str | None = None, source: str | None = None,
         from_at: str | None = None, to_at: str | None = None,
     ) -> dict[str, Any]:
+        self._require_eligible_subject(skill_id, skill_sha256)
         subject = self._subject(skill_id, skill_sha256)
         if subject is None:
             raise KeyError(f"{skill_id}@{skill_sha256 or 'unknown'}")
@@ -210,11 +211,17 @@ class SkillQualityService:
             source=source, from_at=from_at, to_at=to_at,
         )
         status, reasons = self._quality_status(coverage, funnel, result)
+        if attribution == "shared":
+            status = "context-only"
+            reasons = ["shared-context-only", *[reason for reason in reasons if reason != "formal-snapshot-missing"]]
+        publication = self._publication_projection(status, reasons)
         return {
             "subject": subject,
             "coverage": coverage,
             "quality_status": status,
             "blocking_reasons": reasons,
+            "blocking_reason_details": self._blocking_reason_details(reasons),
+            "publication": publication,
             "funnel": funnel,
             "formal_results": result,
             "feedback": feedback,
@@ -743,6 +750,9 @@ class SkillQualityService:
                 coverage=coverage,
             ),
         )
+        if attribution == "shared":
+            status = "context-only"
+            reasons = ["shared-context-only", *[reason for reason in reasons if reason != "formal-snapshot-missing"]]
         current_sha = self.eligible_skill_versions.get(row["skill_id"]) if self.eligible_skill_versions is not None else None
         return {
             **dict(row), "quality_status": status, "blocking_reasons": reasons,
@@ -1092,6 +1102,84 @@ class SkillQualityService:
         if results.get("threshold_status") == "not-met":
             return "threshold-not-met", []
         return "directional", ["contract-quality-threshold-unconfigured"]
+
+    @staticmethod
+    def _publication_projection(status: str, reasons: Sequence[str]) -> dict[str, Any]:
+        if status == "context-only":
+            return {
+                "status": "context-only",
+                "title": "共享参与仅作上下文",
+                "explanation": "这条调用与任务共同出现，但不能用于单技能质量结论、体验比例或版本比较。",
+                "actions": ["查看关联 Case 了解上下文", "为可独立归因的任务建立 direct 调用链"],
+            }
+        if status == "not-publishable":
+            return {
+                "status": "blocked",
+                "title": "当前证据不可发布",
+                "explanation": "这不表示技能无效或任务失败，只表示当前范围、合同或证据不足以发布质量结论。",
+                "actions": SkillQualityService._actions_for_reasons(reasons),
+            }
+        if status == "evidence-insufficient":
+            return {
+                "status": "evidence-insufficient",
+                "title": "当前证据不足",
+                "explanation": "已有调用或 Case，但样本、合同或评审证据不足以判断技能质量。",
+                "actions": SkillQualityService._actions_for_reasons(reasons) or ["补齐合同、任务证据和可评审 Case"],
+            }
+        if status == "threshold-not-met":
+            return {
+                "status": "threshold-not-met",
+                "title": "证据支持未达到合同阈值",
+                "explanation": "这是当前合同和完整范围下的统计结论，不等同于所有任务失败。",
+                "actions": ["查看合同结果分组和代表 Case"],
+            }
+        if status == "judgment-supported":
+            return {
+                "status": "published",
+                "title": "证据支持达到合同阈值",
+                "explanation": "结论基于完整范围、精确版本、合同和可纳入样本。",
+                "actions": ["查看合同结果分组和代表 Case"],
+            }
+        fallback_actions = SkillQualityService._actions_for_reasons(reasons)
+        return {
+            "status": status,
+            "title": "当前质量结论仍在观察中",
+            "explanation": "加载记录和质量结论使用不同证据口径。",
+            "actions": fallback_actions or ["查看样本漏斗和阻断原因"],
+        }
+
+    @staticmethod
+    def _blocking_reason_details(reasons: Sequence[str]) -> list[dict[str, str]]:
+        labels = {
+            "no-valid-business-use": "尚无有效业务使用记录",
+            "no-task-case": "尚无可追溯任务 Case",
+            "coverage-partial": "扫描范围尚未完整",
+            "version-unknown": "调用版本未知",
+            "contract-missing": "该版本尚未绑定合同",
+            "assessment-evidence-missing": "缺少可评审的产物或检查证据",
+            "formal-snapshot-missing": "尚无完整范围的正式结果快照",
+            "multiple-statistical-keys": "统计键不一致",
+            "sample-under-20": "同口径样本少于 20",
+            "contract-quality-threshold-unconfigured": "合同未配置质量阈值",
+            "shared-context-only": "共享参与仅作上下文",
+        }
+        return [{"code": reason, "label": labels.get(reason, "当前结论存在未满足的前置条件")} for reason in reasons]
+
+    @staticmethod
+    def _actions_for_reasons(reasons: Sequence[str]) -> list[str]:
+        actions = {
+            "no-valid-business-use": "在真实任务中记录有效业务使用",
+            "no-task-case": "为该调用关联可追溯任务 Case",
+            "coverage-partial": "完成 configured-catalog 全目录扫描",
+            "version-unknown": "使用完整技能读取记录补齐调用版本",
+            "contract-missing": "为该版本发布结果评审合同",
+            "assessment-evidence-missing": "采集产物或检查证据并评审关联 Case",
+            "formal-snapshot-missing": "在完整覆盖后创建正式结果快照",
+            "multiple-statistical-keys": "按合同、任务类型和归因拆分后分别查看",
+            "sample-under-20": "积累至少 20 个同口径 direct 样本",
+            "contract-quality-threshold-unconfigured": "在已发布合同中配置质量阈值",
+        }
+        return list(dict.fromkeys(actions[reason] for reason in reasons if reason in actions))
 
     def _contract_summary(self, skill_id: str, skill_sha256: str | None) -> dict[str, Any]:
         rows = self.store.execute(

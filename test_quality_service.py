@@ -271,6 +271,38 @@ class SkillQualityServiceTests(unittest.TestCase):
         self.assertFalse(compared["comparable"])
         self.assertIn("comparison-requires-complete-shared-scope", compared["reasons"])
 
+    def test_shared_quality_filter_is_context_only_not_a_missing_snapshot(self) -> None:
+        shared = self._invocation("quality-skill", "a" * 64, "shared", suffix="shared-context")
+        detail = self.service.detail("quality-skill", "a" * 64, attribution="shared")
+        self.assertTrue(shared)
+        self.assertEqual((detail["quality_status"], detail["publication"]["status"]), ("context-only", "context-only"))
+        self.assertIn("shared-context-only", detail["blocking_reasons"])
+        self.assertNotIn("formal-snapshot-missing", detail["blocking_reasons"])
+        self.assertIn("不能用于单技能质量结论", detail["publication"]["explanation"])
+
+    def test_not_publishable_explains_data_boundary_not_skill_failure(self) -> None:
+        partial = self.store.create_scan_run("pi", metadata={"scopeKind": "configured-catalog", "scopeFingerprint": "quality-scope"})
+        self.store.finish_scan_run(partial["id"], coverage_status="partial")
+        detail = self.service.detail("quality-skill", "a" * 64)
+        self.assertEqual(detail["publication"]["title"], "当前证据不可发布")
+        self.assertIn("不表示技能无效", detail["publication"]["explanation"])
+        self.assertIn("完成 configured-catalog 全目录扫描", detail["publication"]["actions"])
+
+    def test_reason_details_and_actions_are_projected_by_the_service(self) -> None:
+        self.store.execute("DELETE FROM attribution_links WHERE skill_invocation_id=?", (self.invocation,))
+        detail = self.service.detail("quality-skill", "a" * 64)
+        self.assertEqual(detail["blocking_reasons"], ["no-task-case"])
+        self.assertEqual(detail["blocking_reason_details"], [{"code": "no-task-case", "label": "尚无可追溯任务 Case"}])
+        self.assertEqual(detail["publication"]["actions"], ["为该调用关联可追溯任务 Case"])
+
+    def test_current_scope_loaded_version_without_case_is_listed_and_detail_is_reachable(self) -> None:
+        self.service.eligible_skill_versions = {"quality-skill": "a" * 64}
+        self.store.execute("DELETE FROM attribution_links WHERE skill_invocation_id=?", (self.invocation,))
+        items = self.service.directory(skill_id="quality-skill")["items"]
+        self.assertEqual((len(items), items[0]["quality_status"]), (1, "only-loaded"))
+        detail = self.service.detail("quality-skill", "a" * 64)
+        self.assertEqual(detail["blocking_reason_details"][0]["code"], "no-task-case")
+
     def test_formal_results_do_not_mix_contract_versions(self) -> None:
         scan = self._complete_scan()
         snapshot_id = "formal-quality-snapshot"

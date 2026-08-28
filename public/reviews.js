@@ -51,7 +51,7 @@ function label(value) {
   return {
     loaded: "加载成功", pending: "等待结果", "result-missing": "结果缺失", error: "加载错误",
     unobserved: "尚未观察", "only-loaded": "仅检测到加载", "evidence-insufficient": "证据不足",
-    directional: "方向性结论", "judgment-supported": "证据支持达到合同阈值", "threshold-not-met": "证据支持未达到合同阈值", "not-publishable": "不可发布",
+    directional: "方向性结论", "judgment-supported": "证据支持达到合同阈值", "threshold-not-met": "证据支持未达到合同阈值", "not-publishable": "不可发布", "context-only": "仅共同参与上下文",
     helpful: "有帮助", "not-helpful": "没帮助", "cannot-judge": "无法判断",
     "not-applicable": "不适用", "direct-skill-use": "该技能调用直接相关",
     "task-result-only": "仅与任务结果相关", "cannot-attribute": "无法归因",
@@ -751,7 +751,7 @@ function openQuality(skillId, sha) {
 function qualityStatusBadge(status) {
   const tone = status === "judgment-supported" ? "green"
     : status === "threshold-not-met" ? "red"
-      : status === "not-publishable" ? "orange" : "";
+      : ["not-publishable", "context-only"].includes(status) ? "orange" : "";
   return badge(label(status), tone);
 }
 
@@ -1008,10 +1008,15 @@ async function renderQualityDetail() {
   context.append(...contextItems);
   const reasons = element("section", "quality-reasons");
   reasons.append(element("h2", "", "判断依据与限制"));
-  if (detail.blocking_reasons?.length) detail.blocking_reasons.forEach((reason) => reasons.append(badge(reason, "orange")));
+  if (detail.blocking_reason_details?.length) detail.blocking_reason_details.forEach((reason) => reasons.append(badge(reason.label, "orange")));
   else reasons.append(element("p", "outcome-muted", "当前统计键满足发布前置条件。"));
-  const guidance = qualityGuidance(detail);
-  if (guidance.length) reasons.append(element("p", "outcome-muted", guidance.join("。")));
+  if (detail.publication) {
+    reasons.append(element("p", "quality-publication-title", detail.publication.title));
+    reasons.append(element("p", "outcome-muted", detail.publication.explanation));
+    if (detail.publication.actions?.length) {
+      reasons.append(element("p", "outcome-muted", `建议顺序：${detail.publication.actions.join(" → ")}`));
+    }
+  }
   const panel = element("section", "quality-detail-panel");
   if (state.qualityTab === "overview") {
     panel.append(element("h2", "", "样本漏斗"), funnelTable(detail.funnel));
@@ -1075,17 +1080,6 @@ async function renderQualityDetail() {
     panel.append(element("p", "outcome-muted", "统计键固定为技能 ID、SHA、合同、任务类型、归因、scope 和时间范围。"));
   }
   content.replaceChildren(head, context, qualityTabs(detail), reasons, panel);
-}
-
-function qualityGuidance(detail) {
-  const reasons = new Set(detail.blocking_reasons || []);
-  const steps = [];
-  if (reasons.has("coverage-partial")) steps.push("先完成 configured-catalog 全目录扫描");
-  if (reasons.has("contract-missing")) steps.push("为该历史版本发布结果评审合同");
-  if (reasons.has("assessment-evidence-missing")) steps.push("采集产物或检查证据并评审关联 Case");
-  if (reasons.has("formal-snapshot-missing")) steps.push("在完整覆盖后创建正式结果快照");
-  if (!detail.funnel.direct_cases && detail.funnel.cases) steps.push("共享参与仅作上下文，单技能结论需要直接归因 Case");
-  return steps;
 }
 
 function qualityCaseTable(items, trialUsers = []) {

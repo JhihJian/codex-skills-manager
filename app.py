@@ -5221,6 +5221,12 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json({"error": exc.message}, exc.status)
             return True
         except KeyError as exc:
+            if str(exc.args[0]).startswith("quality-subject-not-in-current-scope:"):
+                self.send_json(
+                    {"error": "该技能已不在当前启用范围，不能纳入质量结论。请返回目录选择当前启用技能。"},
+                    HTTPStatus.NOT_FOUND,
+                )
+                return True
             self.send_json({"error": f"未找到对象：{exc.args[0]}"}, HTTPStatus.NOT_FOUND)
             return True
         except Exception as exc:  # noqa: BLE001

@@ -3032,6 +3032,12 @@ input:disabled {
   margin: 0 8px 0 0;
 }
 
+.quality-publication-title {
+  width: 100%;
+  margin: 6px 0 0;
+  font-weight: 600;
+}
+
 .quality-funnel {
   display: grid;
   grid-template-columns: repeat(7, minmax(96px, 1fr));
